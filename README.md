@@ -1,6 +1,6 @@
 # 智能道路标线机器人（Intelligent-Road-Marking-Robot）
 
-基于 STM32F103C8T6 的智能道路标线机器人，分上下位机两部分。上位机跑在树莓派上（Python / PyQt5 + OpenCV），做视觉检测和决策；下位机是 STM32，管四轮步进底盘、舵机喷臂、水泵喷漆这些执行机构。
+基于 STM32F103ZET6 的智能道路标线机器人，分上下位机两部分。上位机跑在树莓派上（Python / PyQt5 + OpenCV），做视觉检测和决策；下位机是 STM32，管四轮步进底盘、舵机喷臂、水泵喷漆这些执行机构。
 
 引脚分配、轮径与细分（`calib.h`）、步进方向（`StepMotor_New.h` 的 `M1_FWD` ~ `M4_REV`）、加减速斜坡（`RAMP_SOFT_ARR` 等）、舵机角度范围（`Servo.c`，0~180° → 500~2500us）、车位尺寸（`system.c` 的 `PAINT_LEN_DEFAULT_MM` / `PAINT_WID_DEFAULT_MM`），以及上位机 `SPRAY_INTERVAL_S` 与下位机补喷段长的节拍配合，全部是拿这台车量出来的数，没有一个是通用值。
 
@@ -30,15 +30,20 @@
 
 | 项目 | 参数 |
 |---|---|
-| 下位机 MCU | STM32F103C8T6（LQFP48，64KB Flash，72MHz）· 计划换 RCT6（LQFP64），见下 |
+| 下位机 MCU | STM32F103ZET6（LQFP144，512KB Flash，64KB RAM，72MHz） |
 | 上位机 | 树莓派 4B + Python3 + PyQt5 + OpenCV |
 | 下位机开发环境 | Keil MDK（ARMCC） |
 | 串口 | USART1（蓝牙）/ USART2（树莓派），9600 8N1 |
 | 陀螺仪 | MPU6050，软件 I2C 接 PB10 / PB11 |
 
-换 RCT6 是因为 C8T6 的引脚已经用满了（下表里每一个脚都有主），再想加东西只能复用。
-陀螺仪能挤进来，是因为 PB10/PB11 恰好是最后两个空闲脚 —— 换板之后这两个脚仍然可用，
-所以 `mpu6050.c` 里那四个引脚宏一个字都不用改。
+从 C8T6 换到 ZET6 是因为 C8T6 的引脚已经用满了（下表里每一个脚都有主），再想加东西
+只能复用。工程已经整体切到 ZET6：Device 改为 `STM32F103ZE`、Flash 512KB、RAM 64KB，
+启动文件由 `startup_stm32f10x_md.s` 换成 `startup_stm32f10x_hd.s`（HD 覆盖 256K~512K）。
+C8 版的最后状态打在 `v1.0-c8` 这个 tag 上，需要时
+`git checkout v1.0-c8` 就能编回去。
+
+换板之后 PB10/PB11 仍然可用，所以 `mpu6050.c` 里那四个引脚宏一个字都没改 —— 陀螺仪
+当初能挤进来，靠的就是这两个最后剩下的空闲脚。
 
 ## 两套固件（麦轮 / 四轮差速）
 
@@ -352,7 +357,7 @@ MPU6050 给角速度，10ms 采一次、按实测 dt 积分成角度。积分精
 **下位机**
 
 1. 用 Keil MDK 打开 `marking-firmware/Project.uvprojx`。
-2. 确认目标器件为 STM32F103C8（64KB Flash）。
+2. 确认目标器件为 STM32F103ZE（512KB Flash，64KB RAM）。
 3. 在工具栏的 Target 下拉框里选车型：`Mec_Car`（麦轮）或 `4WD_Car`（四轮差速）。
    两个 Target 用的文件完全相同，只有 Define 差一个宏，见上文「两套固件」。
 4. 编译（Build），通过 ST-Link / J-Link 下载。两套固件分别输出到
