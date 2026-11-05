@@ -1,21 +1,65 @@
 #include "stm32f10x.h"
 #include "system.h"
-// 画长方形脉冲数（标准车位 5.3m × 2.5m）
-#define PAINT_LONG_PULSE   26500
-#define PAINT_SHORT_PULSE  12500
-#define PAINT_TURN_PULSE   3000
+#include "proto.h"      /* 帧协议：CRC8 / 组帧 / 验帧 */
+#include "motion.h"     /* 毫米、度 -> 脉冲 */
+#include "chassis.h"    /* 底盘车型：麦轮 / 四轮差速，由 Target 的 Define 决定 */
+#include "heading.h"    /* 陀螺仪航向估计与直线闭环 */
+#include "mpu6050.h"    /* 只为了拿错误计数给状态帧用 */
+/* 画车位的尺寸和转角。
+ *
+ * 改造前这里是三个脉冲数（26500 / 12500 / 3000）—— 它们等于多少米、多少度，
+ * 只有拿 calib 参数反解才知道，而 calib 参数本身又没写在同一个文件里。
+ * 现在写毫米和度：换轮子、改细分只动 calib.h，这三个数不用跟着改。
+ *
+ * 默认值就是标准车位 5.3m × 2.5m，和改造前的三个脉冲数严格等价
+ * （26500 脉冲 / 4.998 脉冲每毫米 = 5302mm）。CMD_PAINT 可以在现场覆盖。 */
+#define PAINT_LEN_DEFAULT_MM   5300.0f
+#define PAINT_WID_DEFAULT_MM   2500.0f
+#define PAINT_TURN_DEG         90.0f
 
-// 整机自检前进脉冲数（约 0.4m，视轮径标定调整）
-#define SELFCHECK_MOVE_PULSE  2000
+// 整机自检前进距离（约 0.4m）
+#define SELFCHECK_MOVE_MM      400.0f
 
-// 二次喷涂一段的长度（'C'）。相机看到标线破损时上位机发一条 C，下位机
-// 泵开直行这么多脉冲、跑完自动停。一段是有界的 —— 串口断了最多喷完这段。
-// 按 0.2mm/脉冲算（PAINT_LONG_PULSE 26500 ≈ 车位长边 5.3m）：5000 脉冲
-// ≈ 1.0m，默认速度（speed_arr=300，TIM3 1MHz → 3.3kHz）下约 1.5s。
-// 现场按实际喷幅改这一个数；改完把上位机的 SPRAY_INTERVAL_S 一起改，
-// 那个要略大于这里的跑完时间，短了也不会失控（上面那条判断会挡住重进），
-// 只是喷得断断续续。注意 pulse 是 uint16_t，别超 65535。
-#define RESPRAY_PULSE  5000
+/* 当前这一轮画车位用的尺寸。CMD_PAINT 会改它，画完不复位 ——
+ * 下一条 'P' 沿用上次的尺寸，符合"设一次画一排"的现场用法。 */
+static float paint_len_mm = PAINT_LEN_DEFAULT_MM;
+static float paint_wid_mm = PAINT_WID_DEFAULT_MM;
+
+/* 二次喷涂长度分档：'1'~'5' 设定 0.2 / 0.4 / 0.6 / 0.8 / 1.0 m，
+ * 'C' 按当前档位喷。按标定值 4.998 脉冲/毫米算，
+ * 第 5 档 5000 脉冲 ≈ 1.0m，默认 speed_arr=300（TIM3 1MHz → 3.3kHz）下约 1.5s。
+ *
+ * 为什么值得为这个加五条命令：
+ * 原来 'C' 写死补 1 米 —— 相机说"补"车补一米，相机说"不补"车不动。
+ * 视觉的输出是一个布尔值，动作是一个常数，中间没有任何"看到了多少"
+ * 流向"走多远"。这样的视觉，换成每 2 秒自己发一次的定时器，行为完全一样
+ * —— 这就是"它像个蓝牙遥控壳子"的准确来源。
+ * 有了档位，缺口比例第一次真正参与决策：缺口大补得多，缺口小补得少。
+ *
+ * 上电默认第 5 档（1.0m），和改造前的固定值一致，上位机不改也能跑。 */
+/* 补喷长度只有一个真值：毫米。
+ * 改造前是 kResprayPulse[5] 一张表，长度只能是 0.2 的整数倍。
+ * 帧命令 PROTO_CMD_RESPRAY 直接给毫米，300mm 就是 300mm，不受档位约束。
+ * respray_level 退化成「显示用的档位」，由毫米反算，不再参与执行。 */
+static uint16_t respray_mm = 1000;
+static uint8_t  respray_level = 4;
+
+/* ---- 看护时限 ----
+ * 上电静默：timer_counter 从上电起 1ms 递增，头 3 秒里除急停外什么都不执行。
+ *   对着 README 里那条真实风险：上电瞬间串口电平不稳、蓝牙模块启动吐字节，
+ *   被当成 'P' 车就自己开始画车位。3 秒够蓝牙模块完成初始化（HC-05 约 1~2s）。 */
+#define BOOT_SILENCE_MS     3000
+
+/* 画车位总时限：正常画一个车位 20~40s（4 段 5.3m + 4 次转向）。
+ * 超过 120s 还没跑完，说明电机没停（驱动器报警、机械卡死）或者状态机没推进
+ * —— 这时候泵还开着，漆会在原地积成一滩。 */
+#define PAINT_TIMEOUT_MS    120000
+
+/* 补喷总时限：一段最长 1.0m，正常 1.5s 内结束。10s 是 6 倍余量。 */
+#define RESPRAY_TIMEOUT_MS  10000
+
+/* 帧命令 CMD_MOVE 的总时限：最长 5 米，最慢档 0.13m/s 约 38 秒。 */
+#define MOVE_TIMEOUT_MS     60000
 
 // 遥控看门狗超时（ms）：U/R/Y/Z/A/X 是手机蓝牙的点动指令，必须重复发送续命。
 // 超时不刷新 = 蓝牙断了、或人已经松手 -> 自动停车。上位机走有线，不受影响。
@@ -37,6 +81,52 @@ typedef enum {
 } PaintStep;
 static PaintStep paint_step = PAINT_IDLE;
 static uint8_t selfcheck_step = 0;
+
+/* STATE_MOVE 的参数：走哪个方向、走多少毫米。
+ * 由帧命令 PROTO_CMD_MOVE 填，进入状态时读一次。 */
+static uint8_t  move_dir = PROTO_MOVE_FWD;
+static uint16_t move_mm  = 0;     /* 左轮距离；横移时是两轮共同距离 */
+static uint16_t move_right_mm = 0;/* 右轮距离；等于 move_mm 时是普通直行 */
+
+/* ---- 陀螺仪航向闭环 ----
+ *
+ * 这一段是"车走不了直线"的正面回答。
+ *
+ * 视觉纠偏（CMD_TRIM）和陀螺仪闭环解决的不是同一件事：
+ *   CMD_TRIM   纠「横向位置」—— 车离标线偏了 30mm，是位置误差，
+ *              靠相机看得见，但相机受光照影响，而且有 200ms 级的延迟。
+ *   陀螺仪闭环 纠「航向角度」—— 车头朝左偏了 2 度，是姿态误差，
+ *              10ms 一次，不受光照影响，但有零偏漂移。
+ * 两者互补，但**不能同时往同一个差速上叠**（见 proto.h 的 PROTO_ERR_BUSY）。
+ * 所以陀螺仪闭环开着的时候，CMD_TRIM 直接回 BUSY，让上位机停手。 */
+static uint8_t gyro_measure;              /* 1 = 正在标轮距，段内不纠偏 */
+static uint8_t gyro_measure_prev_en;      /* 标定前闭环是不是开着的 */
+static float   gyro_measure_start_deg;    /* 标定开始时的累计航向 */
+static uint8_t move_trim_exhausted;       /* 本段纠偏累计到顶，后面别再调 */
+
+/* 轮距自标定时单侧走的距离。
+ * 300mm 的取法：若轮距 500mm，车会转 300/500 = 0.6 rad ≈ 34 度。
+ * 角度够大，读数的相对误差就小；又不会大到让车转出测试场地。
+ * 太小（比如 50mm 只有 5 度）时，角度测量里那 0.2 度的误差
+ * 会变成 4% 的轮距误差，标了等于没标。 */
+#define GYRO_MEASURE_DIFF_MM    300.0f
+
+/* 续段（视觉伺服专用）
+ * ------------------------------------------------------------------
+ * 视觉纠偏是"每 200mm 重新对齐一次"：段结束四路 CNT 归零、目标重设，
+ * 上一段攒下的左右差就此清空 —— 这是它不会像"整条 5.3m 只纠一次"
+ * 那样一路累积到车身横过来的原因。
+ *
+ * 但段与段之间不能等：等状态回到 WAIT、等上位机看到 STATUS 再发下一段，
+ * 中间是 200ms 的空档，而这 200ms 里泵还在出漆，车不动 —— 每一个接头
+ * 就是一坨漆。所以下一段的参数先存着，这一段一结束立刻接上。
+ *
+ * 只缓冲一段：缓冲更多没有意义，上位机就算连着发十段，中间任何一段
+ * 出错都会让后面全部作废，不如让"发得太快"直接在 ACK 里暴露出来。 */
+static uint8_t  next_move_valid = 0;
+static uint8_t  next_move_dir   = PROTO_MOVE_FWD;
+static uint16_t next_move_left  = 0;
+static uint16_t next_move_right = 0;
 // 全局变量用于记录定时器中断次数
 volatile uint32_t timer_counter = 0;
 static uint16_t led_tick = 0;   // 心跳灯计数（1ms 一次，500 次翻转 = 500ms）
@@ -118,14 +208,539 @@ StepMotor_SetPulse(MOTOR1, 1);
 StepMotor_SetPulse(MOTOR2, 1);
 StepMotor_SetPulse(MOTOR3, 1);
 StepMotor_SetPulse(MOTOR4, 1);
+
+    /* 换算系数在这里算一次（一次浮点除法），之后全是乘法。
+     * F103 没有 FPU，运行时的浮点除法一次要几十微秒，放在状态机里
+     * 会让脉冲启停明显滞后。 */
+    Motion_Init();
+
+    /* 陀螺仪放在最后初始化：MPU6050_Init 里有 200 多毫秒的上电等待
+     * （手册 tPOWERUP + 软复位恢复时间），放在前面会把串口、舵机、电机
+     * 的上电时序一起往后推，上电瞬间那几路电平是悬空的。
+     * 返回码不管 —— Heading_Poll 会在车停着的时候自己重连，
+     * 传感器没插也不影响其它任何功能。 */
+    Heading_Init();
+}
+
+/* 指令来源。
+ *   USART1 (PA9/PA10) = 蓝牙手机     -> SOURCE_BT
+ *   USART2 (PA2/PA3)  = 树莓派上位机 -> SOURCE_PI
+ * 以前这两处判断写的是 from == 1，而 1 到底对应哪个口，只能靠 USART.c 里的
+ * 接线注释去对。搞反了不会报错，只是 '+'/'-'（蓝牙专用调速）的门开在了
+ * 错误的一侧 —— 变成上位机反而能提速、手机反而不能。换成命名常量之后，
+ * 看门控逻辑不需要再背接线表。 */
+typedef enum {
+    SOURCE_BT = 1,      /* USART1 */
+    SOURCE_PI = 2       /* USART2 */
+} CmdSource;
+
+/* 向指令的来源端口回一个字节：谁发的回给谁，两边日志不会互相串。 */
+static void ReplyTo(uint8_t from, uint8_t byte) {
+    if (from == SOURCE_BT) {
+        Serial1_SendByte(byte);
+    } else {
+        Serial2_SendByte(byte);
+    }
+}
+
+/* ==========================================================================
+ * 帧协议接入
+ *
+ * 解析在【主循环】里做，不在中断里做。中断只负责把字节塞进环形缓冲
+ * （见 USART.c），主循环用 Peek/Drop 做滚动解析。
+ * 对比割草机固件：它是在中断里直接往 11 字节缓冲填、用 __disable_irq()
+ * 包住整个填帧过程。那样能用，但中断里做校验和状态判断，延迟不可控，
+ * 而且一旦哪里算错就是死机。这里分开之后，中断延迟是常数。
+ * ========================================================================== */
+
+/* 每路一份解析状态。下标按 CmdSource，所以数组开 3 个（0 不用）。 */
+typedef struct {
+    uint8_t  resync;        /* 坏帧之后、重新找到合法帧之前，裸字节不执行 */
+    uint8_t  have_last;     /* last_seq / last_cmd 是否有效 */
+    uint8_t  last_seq;
+    uint8_t  last_cmd;
+    uint8_t  last_result;
+    uint32_t last_ms;       /* 上一条帧命令的执行时刻，用于去重时间窗 */
+    uint32_t last_rx_ms;    /* 最近一次消费字节的时刻，用于静默期判定 */
+    uint32_t wait_ms;       /* 队首卡着一个不完整帧的起始时刻，0 = 没在等 */
+    uint16_t dropped;       /* 丢掉的字节数（CRC 错 + 静默期） */
+} PortStat;
+
+static PortStat port_stat[3];
+
+/* 坏帧之后静默多久没新字节就认为"这段数据流结束了"。
+ * 9600 下一个字节 1.04ms，10 字节的帧尾 10ms 内一定到齐。
+ * 取 20ms：足够跨过一帧的残余，又短于人手再按一次按钮的间隔。 */
+#define PROTO_RESYNC_IDLE_MS    20
+
+/* 队首卡着一个凑不齐的帧，等多久就放弃。
+ * 一个孤立的 0x7B（噪声）会永久堵住这一路：后面每条命令进来都变成
+ * 「帧的第 2、3…个字节」，永远等不齐 10 字节，整条链路静默失效。
+ * 300ms 的取法：OLED 刷一屏要 80~100ms，这期间主循环是停的，超时值
+ * 必须比它长，否则一次刷屏就会把正在到达的正常帧判死；
+ * 又要比人手重发的间隔短得多，卡住之后能自己恢复。 */
+#define PROTO_PARTIAL_MS        300
+
+/* 重发去重的时间窗。同 SEQ 同 CMD 在这个窗口内再来一次 = 对面没收到 ACK
+ * 在重发：ACK 要再回（它就是因为没收到才重发的），但命令不能再执行 ——
+ * 我们的命令没有一个是幂等的，'P' 执行两次就画两个车位。
+ * 窗口不能太大：串口助手上手动发同一帧（SEQ 都是 0）间隔超过 1 秒就该真执行。 */
+#define PROTO_DEDUP_MS          1000
+
+/* 上行状态帧周期。200ms = 5Hz，9600 下一帧 10 字节约 10.4ms，
+ * 占空比 5%。再快没有意义，2 秒的补喷节拍用不到。 */
+#define PROTO_STATUS_PERIOD_MS  200
+
+static uint8_t PortPeek(uint8_t from, uint16_t offset, uint8_t *out)
+{
+    if (from == SOURCE_BT) {
+        return Serial1_Peek(offset, out);
+    }
+    return Serial2_Peek(offset, out);
+}
+
+static uint16_t PortCount(uint8_t from)
+{
+    if (from == SOURCE_BT) {
+        return Serial1_RxCount();
+    }
+    return Serial2_RxCount();
+}
+
+static void PortDrop(uint8_t from, uint16_t n)
+{
+    if (from == SOURCE_BT) {
+        Serial1_Drop(n);
+    } else {
+        Serial2_Drop(n);
+    }
+}
+
+/* 整帧发出去。9600 下 10 字节约 10.4ms 的阻塞 —— 状态帧 5Hz 的话占空比 5%，
+ * 期间舵机插值和脉冲完成判断会晚 10ms。舵机是 1.5~2 秒的平滑插值，
+ * 脉冲停止在 TIM3 中断里，都不受影响，所以这点阻塞可以接受。
+ * 如果哪天要提到 50Hz，这里必须先改成 DMA 或中断发送。 */
+static void SendFrame(uint8_t from, uint8_t cmd, uint8_t seq, const uint8_t *data)
+{
+    uint8_t buf[PROTO_FRAME_LEN];
+    uint8_t i;
+
+    Proto_Build(buf, cmd, seq, data);
+
+    for (i = 0; i < PROTO_FRAME_LEN; i++) {
+        ReplyTo(from, buf[i]);
+    }
+}
+
+/* ACK：SEQ 原样回显，上位机靠它把"发出去的"和"被接受的"配对。
+ * 这是这套协议里唯一能证明"命令真的到达并且被执行"的东西。 */
+static void ProtoSendAck(uint8_t from, uint8_t cmd, uint8_t seq, uint8_t result)
+{
+    uint8_t d[PROTO_DATA_LEN];
+
+    d[0] = cmd;
+    d[1] = result;
+    d[2] = 0;
+    d[3] = 0;
+    d[4] = 0;
+
+    SendFrame(from, PROTO_CMD_ACK, seq, d);
+}
+
+/* 毫米 -> 显示档位（0..4）。只用于 OLED 和旧命令，
+ * 执行长度一律用 respray_mm，不再经过档位。 */
+static uint8_t ResprayLevelOfMm(uint16_t mm)
+{
+    uint8_t lv = (uint8_t)((mm + 99) / 200);
+
+    if (lv < 1) {
+        lv = 1;
+    }
+    if (lv > 5) {
+        lv = 5;
+    }
+
+    return (uint8_t)(lv - 1);
+}
+
+static void HandleFrame(const uint8_t *f, uint8_t from)
+{
+    const uint8_t *d = &f[3];
+    uint8_t  cmd    = f[1];
+    uint8_t  seq    = f[2];
+    uint8_t  result = PROTO_OK;
+    uint8_t  level;
+    uint16_t mm;
+    uint16_t right_mm;
+    uint16_t len_mm, wid_mm;
+    int16_t  trim_mm;
+
+    /* 上电静默同样管帧。帧头和 CRC 只能证明"这串字节没被打乱"，
+     * 证明不了"它是给现在的" —— 上电瞬间对面可能正在启动。 */
+    if (timer_counter < BOOT_SILENCE_MS) {
+        ProtoSendAck(from, cmd, seq, PROTO_ERR_STATE);
+        return;
+    }
+
+    /* 重发去重。见 PROTO_DEDUP_MS 的说明。 */
+    if (port_stat[from].have_last
+        && port_stat[from].last_seq == seq
+        && port_stat[from].last_cmd == cmd
+        && (uint32_t)(timer_counter - port_stat[from].last_ms) < PROTO_DEDUP_MS) {
+        ProtoSendAck(from, cmd, seq, port_stat[from].last_result);
+        return;
+    }
+
+    switch (cmd) {
+
+    case PROTO_CMD_RESPRAY:
+        /* 这是"视觉算出来要补多少"真正落地的地方：一个 uint16 毫米值。
+         * 改造前要发两条命令（设档 + 开喷），字节之间被打断就静默失败。 */
+        mm = (uint16_t)(((uint16_t)d[0] << 8) | d[1]);
+
+        if (mm < PROTO_RESPRAY_MIN_MM || mm > PROTO_RESPRAY_MAX_MM) {
+            result = PROTO_ERR_RANGE;
+        } else if (sys_ctrl.state != STATE_WAIT) {
+            result = PROTO_ERR_STATE;    /* 画着车位时不许插队，和 'C' 同一条规矩 */
+        } else {
+            respray_mm = mm;
+            respray_level = ResprayLevelOfMm(mm);
+            sys_ctrl.state = STATE_RESPRAY;
+        }
+        break;
+
+    case PROTO_CMD_MOVE:
+        mm       = (uint16_t)(((uint16_t)d[1] << 8) | d[2]);
+        right_mm = (uint16_t)(((uint16_t)d[3] << 8) | d[4]);
+
+        /* 右轮填 0 = 左右同距。老格式只填了 DATA[1:3]，这里补上，
+         * 串口助手手敲帧时不用关心第四个字段。 */
+        if (right_mm == 0) {
+            right_mm = mm;
+        }
+
+        if (d[0] > PROTO_MOVE_RIGHT || mm == 0 || mm > PROTO_MOVE_MAX_MM
+            || right_mm > PROTO_MOVE_MAX_MM) {
+            result = PROTO_ERR_RANGE;
+#if CHASSIS_HAS_MECANUM
+        } else if ((d[0] == PROTO_MOVE_LEFT || d[0] == PROTO_MOVE_RIGHT)
+                   && !Motion_HasMecanum()) {
+            /* 麦轮版理论上永远进不来（CHASSIS_HAS_MECANUM 恒为 1），
+             * 留着是为了将来出现"麦轮机构但没装横移轮"的半成品车时，
+             * 还能靠运行时那句话回绝，而不是直接撞进 Motion_MoveLeft。 */
+            result = PROTO_ERR_HW;
+#else
+        } else if (d[0] == PROTO_MOVE_LEFT || d[0] == PROTO_MOVE_RIGHT) {
+            /* 差速底盘：横移在编译期就不存在。
+             *
+             * 这条分支编出来只有一个常量赋值，没有函数调用 ——
+             * 反汇编里看不到 Motion_MoveLeft，链接器也不会把它带进来。
+             * 上位机收到 ERR_HW 就知道"这台车不能横移"，而不是
+             * "收下了但没动"（后者是现场最难查的一类故障）。 */
+            result = PROTO_ERR_HW;
+#endif
+        } else if (sys_ctrl.state == STATE_MOVE) {
+            /* 车正在这一段上走：把下一段存起来，段一结束立刻接上。
+             * 不回绝 —— 回绝的话上位机只能等段尾，中间那 200ms 空档
+             * 就是漆线上的一处疙瘩。 */
+            next_move_valid = 1;
+            next_move_dir   = d[0];
+            next_move_left  = mm;
+            next_move_right = right_mm;
+        } else if (sys_ctrl.state != STATE_WAIT) {
+            result = PROTO_ERR_STATE;
+        } else {
+            move_dir      = d[0];
+            move_mm       = mm;
+            move_right_mm = right_mm;
+            sys_ctrl.state = STATE_MOVE;
+        }
+        break;
+
+    case PROTO_CMD_TRIM:
+        /* 段内增量纠偏：不改"这段走多远"，只改"左右两边各自还差多少"。
+         *
+         * 和 CMD_MOVE 左右轮独立的关系：MOVE 是每段重新对齐（推荐，误差不
+         * 累积），TRIM 是段内微调（连续、响应快，适合陀螺仪闭环这种高频源）。
+         * 两条都能用，但别在同一段里同时用 —— 一个在重设目标，一个在加减
+         * 目标，谁后到谁覆盖，行为取决于时序，没法调试。 */
+        trim_mm = (int16_t)(((uint16_t)d[0] << 8) | (uint16_t)d[1]);
+
+        if (trim_mm > PROTO_TRIM_MAX_MM || trim_mm < -PROTO_TRIM_MAX_MM) {
+            result = PROTO_ERR_RANGE;
+        } else if (sys_ctrl.state != STATE_MOVE) {
+            /* 只有车在走的时候纠偏才有落点。静止时调目标，改的是下一段，
+             * 而下一段会重新设定 —— 这一下就白丢了，还必须明确告诉上位机。 */
+            result = PROTO_ERR_STATE;
+        } else if (Heading_IsEnabled()) {
+            /* 下位机的航向闭环已经接管差速。这不是故障，是分工 ——
+             * 但必须明确回绝，否则上位机会以为"纠了但没效果"，
+             * 然后加大增益，两个控制器就开始互相打架。 */
+            result = PROTO_ERR_BUSY;
+        } else {
+            /* Motion_Trim 三种返回：1 = 调了，0 = 车没在走，2 = 累计到顶。
+             * 0 和 2 都不能回 OK —— 前者是"车不动了"，后者是"这段纠到头了，
+             * 该重新对齐"。上位机看到 2 应该发一条新的 MOVE 段。 */
+            uint8_t trim_ret = Motion_Trim((float)trim_mm);
+
+            if (trim_ret == 0) {
+                result = PROTO_ERR_STATE;
+            } else if (trim_ret == 2) {
+                result = PROTO_ERR_RANGE;
+            }
+        }
+        break;
+
+    case PROTO_CMD_PUMP:
+        /* 泵以前只能靠 'K' / 'G' 两个裸字节开关，而裸字节在帧化之后
+         * 只能由蓝牙那条路走。画线时要"边走边喷"，泵必须能跟 MOVE 一起下。 */
+        if (d[0] > 1) {
+            result = PROTO_ERR_RANGE;
+        } else if (sys_ctrl.state != STATE_WAIT && sys_ctrl.state != STATE_MOVE) {
+            result = PROTO_ERR_STATE;
+        } else if (d[0]) {
+            Pump_On();
+        } else {
+            Pump_Off();
+        }
+        break;
+
+    case PROTO_CMD_GYRO:
+        /* 陀螺仪航向闭环的开关和现场标定。四个子命令都在这里落地。 */
+        switch (d[0]) {
+
+        case PROTO_GYRO_OFF:
+            Heading_SetEnabled(0);
+            break;
+
+        case PROTO_GYRO_ON:
+            /* 没标零就开，等于拿一个可能是任意值的零偏去纠偏 ——
+             * 回绝，而不是"先打开再说"。上位机拿到 ERR_STATE 就知道
+             * 得先修传感器，而不是去调增益。 */
+            if (!Heading_SetEnabled(1)) {
+                result = PROTO_ERR_STATE;
+            }
+            break;
+
+        case PROTO_GYRO_RECAL:
+        {
+            uint8_t r = Heading_Recalibrate();
+            if (r == 1) {
+                result = PROTO_ERR_STATE;    /* 车在动，采到的"零偏"里混着转动 */
+            } else if (r == 2) {
+                result = PROTO_ERR_HW;       /* 传感器不在线 */
+            }
+            break;
+        }
+
+        case PROTO_GYRO_MEASURE:
+            /* 轮距自标定：单侧走 300mm，用实际转过的角度反算左右轮中心距。
+             *
+             * 为什么必须先关闭环：不关的话，车一转，航向闭环就开始
+             * 往反方向纠，测出来的角度是"300mm 的差速"和"闭环的修正"
+             * 叠加的结果 —— 反算出来的轮距会偏大或偏小，而且看不出来。
+             *
+             * 为什么必须在 WAIT：这条命令会直接驱动电机，和 CMD_MOVE 一样
+             * 是"会动起来"的命令，不能在画车位、补喷中途插进去。 */
+            if (sys_ctrl.state != STATE_WAIT) {
+                result = PROTO_ERR_STATE;
+            } else if (!Heading_IsReady()) {
+                result = PROTO_ERR_HW;
+            } else {
+                gyro_measure_prev_en = Heading_IsEnabled();
+                Heading_SetEnabled(0);
+
+                gyro_measure = 1;
+                gyro_measure_start_deg = Heading_GetAbsoluteDeg();
+
+                move_dir      = PROTO_MOVE_FWD;
+                move_mm       = (uint16_t)GYRO_MEASURE_DIFF_MM;
+                move_right_mm = 0;          /* 右轮不走 = 单侧差速 */
+                sys_ctrl.state = STATE_MOVE;
+            }
+            break;
+
+        default:
+            result = PROTO_ERR_RANGE;
+            break;
+        }
+        break;
+
+    case PROTO_CMD_PAINT:
+        len_mm = (uint16_t)(((uint16_t)d[0] << 8) | d[1]);
+        wid_mm = (uint16_t)(((uint16_t)d[2] << 8) | d[3]);
+
+        if (len_mm == 0) { len_mm = (uint16_t)PAINT_LEN_DEFAULT_MM; }
+        if (wid_mm == 0) { wid_mm = (uint16_t)PAINT_WID_DEFAULT_MM; }
+
+        if (len_mm < PROTO_PAINT_MIN_MM || len_mm > PROTO_PAINT_MAX_MM
+            || wid_mm < PROTO_PAINT_MIN_MM || wid_mm > PROTO_PAINT_MAX_MM) {
+            result = PROTO_ERR_RANGE;
+        } else if (sys_ctrl.state != STATE_WAIT) {
+            result = PROTO_ERR_STATE;
+        } else {
+            paint_len_mm = (float)len_mm;
+            paint_wid_mm = (float)wid_mm;
+            sys_ctrl.state = STATE_PAINT;
+        }
+        break;
+
+    case PROTO_CMD_LEVEL:
+        level = d[0];
+
+        if (level < 1 || level > 5) {
+            result = PROTO_ERR_RANGE;
+        } else if (sys_ctrl.state != STATE_WAIT && sys_ctrl.state != STATE_TING) {
+            result = PROTO_ERR_STATE;
+        } else {
+            respray_level = (uint8_t)(level - 1);
+            respray_mm = (uint16_t)(level * 200);
+        }
+        break;
+
+    case PROTO_CMD_PING:
+        /* 只回 ACK，什么都不动。用来测链路是否单向往通。 */
+        break;
+
+    default:
+        result = PROTO_ERR_TYPE;
+        break;
+    }
+
+    port_stat[from].have_last   = 1;
+    port_stat[from].last_seq    = seq;
+    port_stat[from].last_cmd    = cmd;
+    port_stat[from].last_result = result;
+    port_stat[from].last_ms     = timer_counter;
+
+    ProtoSendAck(from, cmd, seq, result);
+}
+
+/**
+  * 函    数：往树莓派发一帧状态
+  * 说    明：改造前下位机是【零状态上行】，只回显收到的字节。上位机那个
+  *           "spray x5" 计数器只能证明"我发了五次"，不能证明"它动了五次"。
+  *           有了这一帧，上位机第一次能知道：现在什么状态、画到第几段、
+  *           电机在不在跑、这一段已经走了多少脉冲。
+  *
+  *           PULSE 是 16 位，65535 脉冲 ≈ 13.1 米，够覆盖单段最长行程
+  *           （5.3 米 = 26500 脉冲）。它是"这一段"的进度，不是累计里程。
+  *
+  *           只发给上位机，不发蓝牙 —— 手机端是串口助手，收到二进制帧
+  *           只会显示成一堆乱码。
+  */
+void SendStatusFrame(void)
+{
+    static uint32_t last_ms = 0;
+
+    uint8_t  d[PROTO_DATA_LEN];
+    uint8_t  flags = 0;
+    uint32_t pulse;
+
+    if ((uint32_t)(timer_counter - last_ms) < PROTO_STATUS_PERIOD_MS) {
+        return;
+    }
+    last_ms = timer_counter;
+
+    pulse = StepMotor_GetPulse();
+
+    if (StepMotor_IsAnyRunning())          flags |= 0x01;   /* 电机在输出脉冲 */
+    if (timer_counter < BOOT_SILENCE_MS)   flags |= 0x02;   /* 还在上电静默 */
+    if (port_stat[SOURCE_PI].dropped > 0)  flags |= 0x04;   /* 丢过字节，链路可疑 */
+    /* 0x08 = 陀螺仪可用（在线且已标零）。上位机据此决定要不要发 CMD_TRIM：
+     * 不可用的时候视觉纠偏是唯一的直线手段，可用的时候归下位机管。 */
+    if (Heading_IsReady())                 flags |= 0x08;
+    if (Heading_IsEnabled())               flags |= 0x10;   /* 航向闭环正在跑 */
+    /* 0x20 = 陀螺仪掉过线。跑着跑着冒出来，说明接线松了或者干扰变大，
+     * 角度精度已经开始下降 —— 赶在车走歪之前就能看见。 */
+    if (MPU6050_ErrorCount() > 0)          flags |= 0x20;
+
+    d[0] = (uint8_t)sys_ctrl.state;
+    d[1] = (uint8_t)((sys_ctrl.state == STATE_PAINT) ? paint_step : selfcheck_step);
+    d[2] = flags;
+    d[3] = (uint8_t)(pulse & 0xFF);
+    d[4] = (uint8_t)((pulse >> 8) & 0xFF);
+
+    SendFrame(SOURCE_PI, PROTO_CMD_STATUS, 0, d);
+}
+
+/**
+  * 函    数：往树莓派发一帧航向
+  * 说    明：和状态帧同频（5Hz），但内容独立。
+  *
+  *           为什么不能塞进状态帧：那 5 个字节已经排满了（状态/段号/标志/
+  *           两个字节的脉冲进度），而航向本身就要 2 个字节。挤掉脉冲进度
+  *           等于拿"走到哪了"换"偏了多少"，两者现场都要看。
+  *
+  *           航向用 0.01 度为单位（int16 覆盖 ±327 度）：画线时一段的
+  *           航向偏差是几度到几十度，0.01 度的分辨率远超需要，
+  *           但多出来的位宽不花钱 —— 定长帧的 5 个字节本来就在那。
+  *
+  *           角速度用 0.1 dps（int16 覆盖 ±3276 dps，量程只有 ±500）：
+  *           它的唯一用途是在上位机上画一条曲线看"车是不是在抖"，
+  *           精度够用就行。
+  *
+  *           未就绪时整帧不发，而不是发一帧 0：发 0 的话上位机会画出一条
+  *           贴着零线的完美直线，看起来像"走得非常直"。
+  */
+static void SendHeadingFrame(void)
+{
+    static uint32_t last_ms = 0;
+
+    uint8_t d[PROTO_DATA_LEN];
+    float   deg;
+    float   dps;
+    int16_t deg100;
+    int16_t dps10;
+    uint8_t st;
+    uint16_t err;
+
+    if ((uint32_t)(timer_counter - last_ms) < PROTO_STATUS_PERIOD_MS) {
+        return;
+    }
+    last_ms = timer_counter;
+
+    if (!Heading_IsReady()) {
+        return;
+    }
+
+    deg = Heading_GetDeg();
+    if (deg >  327.0f) deg =  327.0f;
+    if (deg < -327.0f) deg = -327.0f;
+    deg100 = (int16_t)(deg * 100.0f);
+
+    dps = Heading_RateDps();
+    if (dps >  3276.0f) dps =  3276.0f;
+    if (dps < -3276.0f) dps = -3276.0f;
+    dps10 = (int16_t)(dps * 10.0f);
+
+    err = MPU6050_ErrorCount();
+    if (err > 15) err = 15;
+
+    st = (uint8_t)(((uint8_t)Heading_GetState() & 0x0F) << 4);
+    st = (uint8_t)(st | (uint8_t)err);
+
+    d[0] = (uint8_t)((uint16_t)deg100 >> 8);
+    d[1] = (uint8_t)((uint16_t)deg100 & 0xFF);
+    d[2] = (uint8_t)((uint16_t)dps10 >> 8);
+    d[3] = (uint8_t)((uint16_t)dps10 & 0xFF);
+    d[4] = st;
+
+    SendFrame(SOURCE_PI, PROTO_CMD_HEADING, 0, d);
 }
 
 static void HandleCmd(uint8_t cmd, uint8_t from) {
-    if(from == 1) {
-        Serial1_SendByte(cmd);
-    } else {
-        Serial2_SendByte(cmd);
+    /* 上电静默：头 3 秒只放行急停。
+     * 'T' 必须例外 —— 急停在任何时刻都得有效，包括上电那一瞬间。 */
+    if (timer_counter < BOOT_SILENCE_MS && cmd != 'T') {
+        ReplyTo(from, '?');
+        return;
     }
+
+    /* 回显证明"这个字节到了 MCU 串口"。它证明不了命令被执行，但能把故障
+     * 分成两半 —— 没回显是链路问题，有回显但车不动是逻辑问题。
+     * 这是单字节协议里唯一的一点可观测性，别删。 */
+    ReplyTo(from, cmd);
     // 手机点动指令（U/R/Y/Z/A/X）刷新遥控看门狗的时间戳，见 System_StateMachine。
     if (cmd=='U'||cmd=='R'||cmd=='Y'||cmd=='Z'||cmd=='A'||cmd=='X') {
         sys_ctrl.state_timestamp = timer_counter;
@@ -176,17 +791,36 @@ static void HandleCmd(uint8_t cmd, uint8_t from) {
         sys_ctrl.state = STATE_TING;
 				break;
 		case '+':   // 蓝牙专用：提速一档（上位机发来忽略）
-			if(from == 1) {
+			if(from == SOURCE_BT) {
 				StepMotor_SpeedUp();
 				OLED_ShowString(3, 1, "Speed Up        ");
+			} else {
+			    ReplyTo(from, '?');   /* 上位机发来：明确回绝，别让它以为生效了 */
 			}
 			break;
 		case '-':   // 蓝牙专用：降速一档（上位机发来忽略）
-			if(from == 1) {
+			if(from == SOURCE_BT) {
 				StepMotor_SpeedDown();
 				OLED_ShowString(3, 1, "Speed Down      ");
+			} else {
+			    ReplyTo(from, '?');
 			}
 			break;
+		case '1': case '2': case '3': case '4': case '5':
+		    /* 设定补喷长度。只在 WAIT / TING 里改 —— 跑着的时候改，正在喷的
+		     * 那一段长度和 OLED 上显示的档位就对不上了。
+		     * 对应关系：'1'->0.2m ... '5'->1.0m。 */
+		    if (sys_ctrl.state == STATE_WAIT || sys_ctrl.state == STATE_TING) {
+		        respray_level = (uint8_t)(cmd - '1');
+		        respray_mm = (uint16_t)((respray_level + 1) * 200);
+		        OLED_ShowString(3, 1, "Spray Lvl ");
+		        OLED_ShowNum(3, 11, respray_level + 1, 1);
+		        OLED_ShowString(3, 12, "    ");
+		    } else {
+		        ReplyTo(from, '?');     /* 跑着的时候不许改，明确回绝 */
+		    }
+		    break;
+
 		case 'C':// 二次喷涂
 		    // 只在 WAIT 接，一条判断管三件事：
 		    //  1) 已经在喷就别重进 —— 重进会把这一段从头开始，而上位机是周期重发的
@@ -199,28 +833,200 @@ static void HandleCmd(uint8_t cmd, uint8_t from) {
 		case 'P'://画车位
     sys_ctrl.state = STATE_PAINT;
     break;
+
+		default:
+		    /* 不认识的字节：改回一个 '?'，而不是静默丢弃。
+		     * 这条直接对着两个真实故障：
+		     *   1) 蓝牙模块断开/重连时会吐 "+DISC"、"+CONNECT" 这类 AT 响应，
+		     *      里面的 'C'、'D'、'T' 恰好都是合法命令（补喷/自检/急停），
+		     *      以前照执行。现在虽挡不住"乱码刚好等于合法字符"，但至少
+		     *      不认识的字节有了明确回执，调试时能看见"这个字节我收到了，
+		     *      但我不认"。
+		     *   2) 波特率漂移、线上噪声产生的假字节，同样落进这里。
+		     * 要真正挡住第一种，得靠帧头 + CRC 或者蓝牙口令前缀，
+		     * 那是协议改造那一步的事。 */
+		    ReplyTo(from, '?');
+		    break;
         }
 }
 
-void ProcessCommand(void) {
-    // 蓝牙优先：两边同时有字节时先处理蓝牙；上位机那条字节还在，下一轮循环照常处理。
-    // 必须用 TakeRxData：标志位和数据要在一个临界区里取，分两次读会丢字节或重执行。
-    uint8_t cmd;
-    if (Serial1_TakeRxData(&cmd)) HandleCmd(cmd, 1);        // 蓝牙
-    else if (Serial2_TakeRxData(&cmd)) HandleCmd(cmd, 2);   // 上位机
+/* 按 move_dir / move_mm / move_right_mm 起动一段。
+ * 进入 STATE_MOVE 和「续段」两处都调它，保证两条路径行为一致 ——
+ * 以前这类"起动逻辑抄两遍"的地方，改一处忘一处是常态。
+ * 放在 HandleFrame 之前，因为 HandleFrame 只填参数，不直接驱动。 */
+static void StartMove(void)
+{
+#if CHASSIS_HAS_MECANUM
+    if (move_dir == PROTO_MOVE_LEFT) {
+        Motion_MoveLeft((float)move_mm);
+    } else if (move_dir == PROTO_MOVE_RIGHT) {
+        Motion_MoveRight((float)move_mm);
+    } else
+#endif
+    {
+        /* 前后都用左右独立接口：右轮 == 左轮时就是直行，不等时是差速。
+         * 统一走一条路，免得"直行"和"纠偏"在代码里是两个实现、两套行为。
+         *
+         * 一律不起坡：CMD_MOVE 是机器指令，不是人按着走。视觉伺服会按
+         * 200mm 一段连着发几百条，条条起坡的话速度在 555Hz~3.3kHz 之间
+         * 跳，漆厚跟着跳 —— 纠偏反而把线画坏了。 */
+        Motion_DriveLR((float)move_mm, (float)move_right_mm,
+                       (move_dir == PROTO_MOVE_BACK) ? 0 : 1);
+    }
+}
+
+/* 每轮主循环、每路最多处理几个【裸字节】（帧单独算，一轮最多一帧）。
+ * 不能一次把缓冲里积压的 63 个字节全处理完：万一收到一串噪声或手机连发的
+ * 长串，一轮之内状态会被改几十次，而中间那些状态的"进入动作"一个都不会
+ * 执行（进入块只在状态变了的那一轮跑），表现出来就是"乱跳"。
+ * 分批的另一个好处是每批之后都回状态机推进一次，电机完成判断、舵机插值、
+ * 超时检测不会被长时间饿着。
+ * 4 个/轮：主循环一圈几十微秒，远快于 9600 下 1.04ms/字节的到达速度。 */
+#define CMD_PER_CYCLE   4
+
+/**
+  * 函    数：从一路串口里解析消息
+  * 参    数：from 端口（SOURCE_BT / SOURCE_PI）
+  * 说    明：这是整个协议的核心。规则只有三条：
+  *
+  *   1) 首字节不是帧头 -> 当成一条单字节命令交出去，丢 1 个字节。
+  *      "重同步"和"兼容老的单字节协议"是同一个动作，不是两件事。
+  *   2) 首字节是帧头但不够 10 字节 -> 什么都不做，下一轮再来。
+  *      绝不能把半帧丢掉 —— 串口是一个字节一个字节送过来的。
+  *   3) 够了 10 字节但 CRC 不对 -> 只丢 1 个字节，重新找帧头。
+  *      丢整帧会把紧跟其后的真帧一起吞掉，然后永久失步；而失步是静默的，
+  *      看起来像"协议不兼容"，是这类 bug 里最难查的一种。
+  *
+  *   第 3 条之后还有一步：进入静默期，后面的裸字节一律丢弃不执行。
+  *   否则坏帧的 payload 会被逐字节当成命令执行（payload 里出现 0x50
+  *   就是"开始画车位"），CRC 就白加了。静默期在数据流断开 20ms 后结束。
+  */
+static void ServicePort(uint8_t from)
+{
+    uint8_t frame[PROTO_FRAME_LEN];
+    uint8_t b;
+    uint8_t i;
+    uint8_t budget = CMD_PER_CYCLE;   /* 裸字节额度 */
+    uint8_t frames = 0;               /* 本轮已处理的帧数 */
+
+    /* 一段数据流结束，退出静默期。人再按一次按钮的间隔远大于 20ms，
+     * 所以不会把后面的正常命令吞掉。 */
+    if (port_stat[from].resync
+        && (uint32_t)(timer_counter - port_stat[from].last_rx_ms) > PROTO_RESYNC_IDLE_MS) {
+        port_stat[from].resync = 0;
+    }
+
+    while (budget > 0 && frames < 1) {
+
+        if (!PortPeek(from, 0, &b)) {
+            return;                       /* 没数据了，回去推进状态机 */
+        }
+
+        if (b != PROTO_SOF) {
+            PortDrop(from, 1);
+            port_stat[from].last_rx_ms = timer_counter;
+            port_stat[from].wait_ms = 0;
+            budget--;
+
+            if (port_stat[from].resync) {
+                port_stat[from].dropped++;    /* 坏帧的残余：丢，不执行 */
+            } else {
+                HandleCmd(b, from);
+            }
+            continue;
+        }
+
+        /* 半帧：等。串口是一个字节一个字节送过来的，绝不能在这里把
+         * 半帧丢掉。但不能无限等 —— 见 PROTO_PARTIAL_MS。 */
+        if (PortCount(from) < PROTO_FRAME_LEN) {
+            uint16_t avail = PortCount(from);
+
+            if (port_stat[from].wait_ms == 0) {
+                port_stat[from].wait_ms = timer_counter;
+                return;
+            }
+
+            if ((uint32_t)(timer_counter - port_stat[from].wait_ms) < PROTO_PARTIAL_MS) {
+                return;
+            }
+
+            /* 超时。整段丢掉，重新找帧头。 */
+            PortDrop(from, avail);
+            port_stat[from].dropped += avail;
+            port_stat[from].wait_ms = 0;
+            port_stat[from].last_rx_ms = timer_counter;
+
+            /* 这里【不】进静默。能卡到超时，说明后面已经没有连续的字节
+             * 正在到达了，没有残余需要防；此刻进来的下一条命令是新的一次
+             * 发送，照常执行。进静默反而会把那条命令吞掉。 */
+            budget--;
+            continue;
+        }
+
+        /* 帧凑齐了，等待状态清零 */
+        port_stat[from].wait_ms = 0;
+
+        for (i = 0; i < PROTO_FRAME_LEN; i++) {
+            PortPeek(from, i, &frame[i]);
+        }
+
+        if (!Proto_Check(frame)) {
+            PortDrop(from, 1);
+            port_stat[from].dropped++;
+            port_stat[from].resync = 1;
+            port_stat[from].last_rx_ms = timer_counter;
+            budget--;
+            continue;
+        }
+
+        PortDrop(from, PROTO_FRAME_LEN);
+        port_stat[from].last_rx_ms = timer_counter;
+        port_stat[from].resync = 0;
+        frames++;
+        HandleFrame(frame, from);
+    }
+}
+
+void ProcessCommand(void)
+{
+    /* 两路都要服务。原来是 if / else if，一圈只取一个字节，
+     * 蓝牙有事的时候上位机的字节就一直排在后面 —— 现在两路各走一遍，
+     * 互不饿死。 */
+    ServicePort(SOURCE_BT);
+    ServicePort(SOURCE_PI);
 }
 
 uint32_t GetTick(void) {
     return timer_counter;  
 }
 void System_StateMachine(void) {
+    /* 陀螺仪采样放在最前面：它内部按 10ms 节流，调用频率高一点没关系。
+     * 放在状态机之后的话，某一轮如果状态机里做了长活（OLED 刷新、
+     * 舵机插值），采样就会被推迟，而 dt 是实测的 —— 角度不会因此算错，
+     * 但采样间隔越大，转弯时的角度就越像"折线"。 */
+    Heading_Poll();
+
     ProcessCommand();
+    SendStatusFrame();     /* 5Hz 上行状态，只发给树莓派 */
+    SendHeadingFrame();    /* 5Hz 上行航向，未就绪时不发 */
     uint32_t current_time = GetTick();
 	 // 检测状态是否改变
     if (sys_ctrl.state != sys_ctrl.last_state) {
         // 状态退出处理：停止所有电机（无论之前是什么状态）
         // 注意：如果新状态本身需要电机运动，稍后会重新启动
         
+        /* 排队的下一段必须跟着当前段一起作废：留着的话，下次再进
+         * STATE_MOVE（可能是完全另一条线）会先跑上一轮残留的那 200mm。 */
+        next_move_valid = 0;
+
+        /* 轮距标定只在那一段里有效。放在"离开 MOVE"清，而不是"进入 MOVE"清：
+         * CMD_GYRO 的 MEASURE 子命令正是先置标志、再把状态切到 MOVE，
+         * 进去就清等于永远开始不了。而急停/超时离开 MOVE 时，
+         * last_state 还是 MOVE，标志在这里被清掉，不会带到下一段去。 */
+        if (sys_ctrl.last_state == STATE_MOVE) {
+            gyro_measure = 0;
+        }
+
         Pump_Off();   // 泵只由下面每个状态的进入动作决定，别让它跟着上个状态活下来
         Buzzer_Off(); // 同理。原来 Buzzer_Off() 只有 RETREAT_BEEP 的未变分支在调，
                       // 所以按了 F 再在 2 秒内按别的键，蜂鸣器就一直响 ——
@@ -276,14 +1082,36 @@ void System_StateMachine(void) {
 		case STATE_RESPRAY:// 二次喷涂：泵开直行一段
 		{
 		        Pump_On();
-		        StepMotor_GoForwardFlat(RESPRAY_PULSE);
+		        Motion_ForwardFlat((float)respray_mm);   /* 毫米是真值，档位只用于显示 */
 		        OLED_ShowString(3, 1, "Respray         ");
+		        OLED_ShowNum(3, 9, respray_mm, 4);
+		        OLED_ShowString(3, 13, "mm ");
+		    break;
+		}
+		case STATE_MOVE:   /* 帧命令 CMD_MOVE：按毫米走一段 */
+		{
+		    OLED_ShowString(3, 1, "Move            ");
+
+		    /* 段起点对齐：这一段的"直"以此刻的车头方向为准。
+		     *
+		     * 只在这里做，续段那条路（下面 next_move_valid 分支）不做 ——
+		     * 续的是同一条线，重新对齐等于把这一段已经修掉的偏差又当成 0，
+		     * 闭环就白跑了。
+		     *
+		     * 标定轮距时跳过：那一段是故意走弯的，把弯的终点记成"直"，
+		     * 后面每一段都会带着 34 度的偏差开始。 */
+		    if (!gyro_measure) {
+		        Heading_MarkReference();
+		    }
+		    move_trim_exhausted = 0;
+
+		    StartMove();
 		    break;
 		}
 		case STATE_PAINT:
 {// 每次进入画线状态都从头开始
             Pump_On();
-            StepMotor_GoForwardFlat(PAINT_LONG_PULSE);
+            Motion_ForwardFlat(paint_len_mm);
             paint_step = PAINT_EDGE1;
             OLED_ShowString(3, 1, "Paint:1/4       ");
             
@@ -354,7 +1182,7 @@ void System_StateMachine(void) {
                     case 1:   // 等舵臂到位
                         Servo_UpdateAllMotions();
                         if (!Servo_IsMoving(0) && !Servo_IsMoving(1)) {
-                            StepMotor_GoForward(SELFCHECK_MOVE_PULSE);
+                            Motion_Forward(SELFCHECK_MOVE_MM);
                             selfcheck_step = 2;
                             OLED_ShowString(3, 1, "Check Move      ");
                         }
@@ -386,19 +1214,114 @@ void System_StateMachine(void) {
                 }
                 break;
 
+            case STATE_MOVE:
+                /* 和别的运动状态一样，靠「电机真的停了」推进，不是靠延时。
+                 *
+                 * 停了先看有没有排队的下一段：有就接上，状态不离开
+                 * STATE_MOVE —— 离开一次就走一遍退出块（Pump_Off +
+                 * StopAll），泵停一下再开，画出来的线就是一段段的。 */
+                if (!StepMotor_IsAnyRunning()) {
+
+                    /* --- 轮距标定跑完了：用转过的角度反算 --- */
+                    if (gyro_measure) {
+                        float turned = Heading_GetAbsoluteDeg() - gyro_measure_start_deg;
+                        float width;
+
+                        gyro_measure = 0;
+
+                        /* 只取大小：往哪边转由单侧差速的方向决定，
+                         * 轮距是个几何尺寸，和转向正负无关。 */
+                        if (turned < 0.0f) {
+                            turned = -turned;
+                        }
+
+                        width = Heading_EstimateTrackWidth(GYRO_MEASURE_DIFF_MM, turned);
+
+                        if (width > 0.0f && Heading_SetTrackWidth(width)) {
+                            /* 显示到第 4 行。这个数要抄进 calib.h 才算固化，
+                             * 掉电就没了 —— 见 Heading_SetTrackWidth 的说明。 */
+                            OLED_ShowString(4, 1, "W=");
+                            OLED_ShowNum(4, 3, (uint32_t)(width + 0.5f), 4);
+                            OLED_ShowString(4, 7, "mm  ");
+                        } else {
+                            /* 转的角度太小或者算出来离谱：多半是打滑，
+                             * 或者左轮根本没走（轮子卡住）。不采用。 */
+                            OLED_ShowString(4, 1, "W-MEAS FAILED   ");
+                        }
+
+                        if (gyro_measure_prev_en) {
+                            Heading_SetEnabled(1);
+                        }
+                        sys_ctrl.state = STATE_WAIT;
+                        break;
+                    }
+
+                    if (next_move_valid) {
+                        move_dir        = next_move_dir;
+                        move_mm         = next_move_left;
+                        move_right_mm   = next_move_right;
+                        next_move_valid = 0;
+                        /* 超时是按"整条线"算的，续一段就重新计时，
+                         * 否则连续伺服跑到 60 秒会被判卡死。 */
+                        sys_ctrl.state_timestamp = current_time;
+                        StartMove();
+                    } else {
+                        sys_ctrl.state = STATE_WAIT;
+                    }
+                } else if (current_time - sys_ctrl.state_timestamp > MOVE_TIMEOUT_MS) {
+                    /* 5 米最慢档要 38 秒，60 秒还没走完说明卡住了。
+                     * 没有这条，一次卡死就是状态永远出不去。 */
+                    gyro_measure = 0;      /* 标定中途超时，这一次作废 */
+                    sys_ctrl.state = STATE_WAIT;
+                } else if (!gyro_measure) {
+                    /* --- 车在走：跑一次航向闭环 ---
+                     *
+                     * Heading_TrimDeltaMm 内部已经做了三件事：判断是否就绪、
+                     * 10ms 采样之外的 100ms 动作节流、死区和单次限幅。
+                     * 这里拿到的 0 就是"这次不用动"，非 0 就交给 Motion_Trim。
+                     *
+                     * 为什么不在进入块里就纠：车刚起步时脉冲还没发几个，
+                     * 改目标只会让斜坡和差速互相干扰；而且那一刻的航向
+                     * 本身就是刚才对齐的 0，纠也纠不出东西来。 */
+                    float delta = Heading_TrimDeltaMm();
+
+                    if (delta != 0.0f && !move_trim_exhausted) {
+                        uint8_t r = Motion_Trim(delta);
+
+                        if (r == 2) {
+                            /* 段内累计纠偏到顶（MOTION_TRIM_ACCUM_MAX_MM）。
+                             * 再纠下去内侧轮会提前停太多，车开始原地打转，
+                             * 而每一步单独看都只是小修正。
+                             * 本段剩下的路让它走完，下一段重新对齐。 */
+                            move_trim_exhausted = 1;
+                        }
+                    }
+                }
+                break;
             case STATE_RESPRAY:
                 if (!StepMotor_IsAnyRunning()) {
                     Pump_Off();
+                    sys_ctrl.state = STATE_WAIT;
+                } else if (current_time - sys_ctrl.state_timestamp > RESPRAY_TIMEOUT_MS) {
+                    /* 电机没停但时间超了：驱动器报警、机械卡死、或者脉冲根本
+                     * 没发出去。泵还在转，漆会在一处积成一滩。
+                     * 强制回 WAIT —— 退出块会统一 Pump_Off + StopAll。 */
                     sys_ctrl.state = STATE_WAIT;
                 }
                 break;
             case STATE_PAINT:
             {
+                /* 总时限看护：画一个车位正常 20~40s，超过 120s 说明卡住了。
+                 * 没有这条，一次机械卡死就是泵一直开、车不动、地上一滩漆。 */
+                if (current_time - sys_ctrl.state_timestamp > PAINT_TIMEOUT_MS) {
+                    sys_ctrl.state = STATE_WAIT;
+                    break;
+                }
                 switch (paint_step) {
                     case PAINT_EDGE1:
                         if (!StepMotor_IsAnyRunning()) {
                             Pump_Off();
-                            StepMotor_TurnRight(PAINT_TURN_PULSE);
+                            Motion_TurnRight(PAINT_TURN_DEG);
                             paint_step = PAINT_TURN1;
                             OLED_ShowString(3, 1, "Turn1           ");
                         }
@@ -406,7 +1329,7 @@ void System_StateMachine(void) {
                     case PAINT_TURN1:
                         if (!StepMotor_IsAnyRunning()) {
                             Pump_On();
-                            StepMotor_GoForwardFlat(PAINT_SHORT_PULSE);
+                            Motion_ForwardFlat(paint_wid_mm);
                             paint_step = PAINT_EDGE2;
                             OLED_ShowString(3, 1, "Paint:2/4       ");
                         }
@@ -414,7 +1337,7 @@ void System_StateMachine(void) {
                     case PAINT_EDGE2:
                         if (!StepMotor_IsAnyRunning()) {
                             Pump_Off();
-                            StepMotor_TurnRight(PAINT_TURN_PULSE);
+                            Motion_TurnRight(PAINT_TURN_DEG);
                             paint_step = PAINT_TURN2;
                             OLED_ShowString(3, 1, "Turn2           ");
                         }
@@ -422,7 +1345,7 @@ void System_StateMachine(void) {
                     case PAINT_TURN2:
                         if (!StepMotor_IsAnyRunning()) {
                             Pump_On();
-                            StepMotor_GoForwardFlat(PAINT_LONG_PULSE);
+                            Motion_ForwardFlat(paint_len_mm);
                             paint_step = PAINT_EDGE3;
                             OLED_ShowString(3, 1, "Paint:3/4       ");
                         }
@@ -430,7 +1353,7 @@ void System_StateMachine(void) {
                     case PAINT_EDGE3:
                         if (!StepMotor_IsAnyRunning()) {
                             Pump_Off();
-                            StepMotor_TurnRight(PAINT_TURN_PULSE);
+                            Motion_TurnRight(PAINT_TURN_DEG);
                             paint_step = PAINT_TURN3;
                             OLED_ShowString(3, 1, "Turn3           ");
                         }
@@ -438,7 +1361,7 @@ void System_StateMachine(void) {
                     case PAINT_TURN3:
                         if (!StepMotor_IsAnyRunning()) {
                             Pump_On();
-                            StepMotor_GoForwardFlat(PAINT_SHORT_PULSE);
+                            Motion_ForwardFlat(paint_wid_mm);
                             paint_step = PAINT_EDGE4;
                             OLED_ShowString(3, 1, "Paint:4/4       ");
                         }

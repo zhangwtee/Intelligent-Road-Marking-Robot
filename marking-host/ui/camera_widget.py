@@ -1,21 +1,89 @@
+"""摄像头窗口：标线检测 -> 三态判定 -> 多帧投票 -> 下发。
+
+三种用途，用 mode 区分（以前只有"发不发 C"一个布尔，画车位取景和补喷共用
+同一个控件，只能靠一个 auto_paint 开关区分，脆得很）：
+
+    MODE_VIEW     只看。一个字节都不发。
+    MODE_RESPRAY  车停着，看到破损发一帧补喷（走一段、停、再看）。
+    MODE_TRACK    车在走，按帧下发纠偏（CMD_TRIM）和泵开关（CMD_PUMP）。
+                  这是"真正能干活"的那个模式：走到哪喷到哪，边走边纠。
+
+为什么要有投票
+--------------
+单帧判定会抖。一段 30 帧里有一帧被反光糊住，coverage 从 0.7 掉到 0.3，
+判据当场给出"磨损、补 400mm"。改造前就是这样：一帧噪点 = 车喷出去一米。
+
+现场看到的不是"偶尔多喷"，是"它在乱喷" —— 因为 30fps 下 3% 的误判率
+意味着每秒钟一次。改成连续 5 帧里至少 3 帧同意才行动，误判率降到
+C(5,3)*0.03^3 量级，而真实破损会连续几十帧都成立，丝毫不受影响。
+
+    P(5 帧里 ≥3 帧误判) ≈ 10 * 0.03^3 ≈ 2.7e-4
+
+代价是响应慢 2~3 帧（约 100ms）。车走 0.16m/s，100ms 是 16mm —— 补喷
+本来就有几百毫米的量级，这点延迟无所谓。
+
+为什么要"看不清"这一态
+--------------------
+线被阴影盖住、镜头脏了、车开出了标线区域 —— 这些都是"没看到"，不是
+"看到了、很好"。二值判据把它们混成一件，表现是"它不工作，但日志正常"。
+现在 QUALITY_UNSURE 会单独显示，也会让泵关掉（看不到就别喷）。
+"""
+
 import time
+from collections import deque
 
 import cv2
 import numpy as np
-from collections import deque
 
 from PyQt5.QtWidgets import QLabel
 from PyQt5.QtCore import QTimer, Qt
 from PyQt5.QtGui import QImage, QPixmap
 
+from core import frame, lane_control
 from core.line_quality import (
-    close_cracks, extract_line_pixels, evaluate_line_quality,
+    close_cracks,
+    extract_line_pixels,
+    classify_line_quality,
+    QUALITY_OK,
+    QUALITY_WORN,
+    QUALITY_BREAK,
+    QUALITY_UNSURE,
+    QUALITY_NAMES,
+    SPRAY_LEVELS,
+    SPRAY_MM_PER_LEVEL,
 )
 
 
 class CameraWidget(QLabel):
 
-    def __init__(self, serial_mgr=None, auto_paint=False):
+    MODE_VIEW = "view"
+    MODE_RESPRAY = "respray"
+    MODE_TRACK = "track"
+
+    # ---------------- 投票 ----------------
+    VOTE_WINDOW = 5          # 看最近几帧
+    VOTE_MAJORITY = 3        # 至少几帧同意
+
+    # ---------------- 补喷模式 ----------------
+    # 下位机收到一条 CMD_RESPRAY 会泵开直行一段然后自己停。这个周期略大于
+    # 一段的时间，喷出来才连得上。改下位机的 RESPRAY 范围这里一起改。
+    SPRAY_INTERVAL_S = 2.0
+
+    # ---------------- 巡线模式 ----------------
+    # 纠偏下发周期。100ms = 10Hz，9600 下一帧 10.4ms，占空比约 10%。
+    # 再快没有意义：车的机械响应跟不上，而且会和 5Hz 的状态帧抢带宽。
+    TRIM_INTERVAL_S = 0.10
+
+    # 泵的滞回。判破损要连续几帧才开，判完好要连续几帧才关 ——
+    # 开和关的阈值不一样，避免在一段漆的边界上来回跳，把泵当继电器打。
+    PUMP_ON_AFTER = 2
+    PUMP_OFF_AFTER = 6
+
+    # 一段走多长。5000mm 是固件的上界（PROTO_MOVE_MAX_MM），
+    # 默认速度下约 31 秒。段越长，段与段之间的空档越少。
+    SEGMENT_MM = 5000
+
+    def __init__(self, serial_mgr=None, mode=None, auto_paint=None, ack_tracker=None):
         super().__init__()
 
         self.setAlignment(Qt.AlignCenter)
@@ -23,24 +91,50 @@ class CameraWidget(QLabel):
 
         self.cap = None
 
-        # 检测到破损就往下位机发 'C' 补一段的闭环。默认关着：这个控件
-        # 也被"画车位（路沿）"拿去取景，那种场合一个字节都不该发。
-        self.serial_mgr = serial_mgr
-        self.auto_paint = auto_paint
+        # auto_paint 是改造前的参数（True = 补喷闭环）。保留是为了不让
+        # 老的调用方静默失效 —— 传了它就映射到 mode，但会明确提示一遍。
+        if mode is None:
+            if auto_paint is None:
+                mode = self.MODE_VIEW
+            else:
+                mode = self.MODE_RESPRAY if auto_paint else self.MODE_VIEW
 
-        # 下位机收到一条 'C' 会泵开直行一段（RESPRAY_PULSE 5000 ≈ 1.0m，
-        # 默认速度下约 1.5s）跑完自己停。这个周期略大于一段的时间，
-        # 喷出来才连得上；短了也安全（下位机只在 WAIT 接 'C'，一段跑着
-        # 的时候发过去是被丢掉的），只是白费字节。改下位机那个常量这里一起改。
-        self.SPRAY_INTERVAL_S = 2.0
+        self.mode = mode
+        self.serial_mgr = serial_mgr
+        self.ack_tracker = ack_tracker
+
         self.last_spray = 0.0
         self.spray_count = 0
+        self.last_level = 0
+        self._seq = 0
+
+        # ---------------- 检测状态 ----------------
+        self.center_queue = deque(maxlen=5)
+        self.votes = deque(maxlen=self.VOTE_WINDOW)
+        self.quality = QUALITY_UNSURE
+        self.quality_note = ""
+
+        # ---------------- 巡线状态 ----------------
+        self.tracking = False
+        self.param_trim = 0.0              # 上一段实际发出去的差速
+        self.last_trim_time = 0.0
+        self.heading_deg = 0.0
+        self.lateral_ratio = 0.0
+        self.pump_on = False
+        self._bad_streak = 0
+        self._good_streak = 0
+        self._segments_sent = 0
+        self._last_segment_time = 0.0
+        self._fw_state = "?"
+        # 下位机状态帧里带回来的标志位（和固件 SendStatusFrame 的 flags 同义）
+        self.fw_flags = 0
+        # 陀螺仪航向闭环是否接管了差速。为真时视觉不再发 TRIM ——
+        # 不是"少发一点"，是"一个都不发"：两个控制器抢同一个执行器
+        # 只会互相抵消，而且双方都认为自己没错。
+        self.gyro_closed = False
 
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_frame)
-
-        # ================= 平滑队列 =================
-        self.center_queue = deque(maxlen=5)
 
         # ================= HSV 黄色范围 =================
         self.HSV_YELLOW_LOW = np.array([15, 50, 150])
@@ -54,7 +148,7 @@ class CameraWidget(QLabel):
         # 现场标定只改那一处，别在这儿再放一份。
 
     # ==========================================================
-    # 摄像头开启
+    # 摄像头
     # ==========================================================
     def start_camera(self):
 
@@ -69,7 +163,7 @@ class CameraWidget(QLabel):
         if not self.cap.isOpened():
             # 失败必须把句柄扔掉。留着一个没打开的 VideoCapture，开头那句
             # `if self.cap is not None: return` 会让之后每次 start_camera()
-            # 都直接返回 —— 摄像头再也起不来（插上摄像头也没用），还漏个句柄。
+            # 都直接返回 —— 摄像头再也起不来，还漏个句柄。
             self.cap.release()
             self.cap = None
             self.setText("摄像头打开失败")
@@ -77,9 +171,6 @@ class CameraWidget(QLabel):
 
         self.timer.start(30)
 
-    # ==========================================================
-    # 摄像头关闭
-    # ==========================================================
     def stop_camera(self):
 
         self.timer.stop()
@@ -90,28 +181,243 @@ class CameraWidget(QLabel):
         self.cap = None
 
         self.clear()
-
         self.setText("摄像头已关闭")
+
+    # ==========================================================
+    # 串口发送
+    # ==========================================================
+    def _next_seq(self):
+        self._seq = (self._seq + 1) & 0xFF
+        return self._seq
+
+    def _send(self, raw):
+        """发一帧，顺手登记 ACK。没有串口就什么都不做 —— 但调用方要能看出来。"""
+        if self.serial_mgr is None:
+            return None
+
+        self.serial_mgr.send(raw)
+
+        if self.ack_tracker is not None:
+            return self.ack_tracker.register(raw)
+
+        return None
+
+    # ==========================================================
+    # 投票
+    # ==========================================================
+    def _voted_quality(self):
+        """最近几帧的多数结论。凑不够多数就报"看不清"。
+
+        为什么门槛是 VOTE_MAJORITY(3) 而不是"窗口必须满 5 帧"：
+        要求窗口填满的话，摄像头刚开的那 5 帧（150ms）一律是 UNSURE，
+        泵关着、纠偏不发 —— 表现是"按了开始，车先愣一下"。而 3 帧一致
+        其实比"5 帧里 3 帧"更强：3 帧全一样，没有任何分歧。
+
+        报 UNSURE 而不是沿用上一帧的结论：宁可不喷，也不要拿着一个过期的
+        "完好"当依据继续往前走。
+        """
+        if len(self.votes) < self.VOTE_MAJORITY:
+            return QUALITY_UNSURE
+
+        counts = {}
+        for value in self.votes:
+            counts[value] = counts.get(value, 0) + 1
+
+        state, hits = max(counts.items(), key=lambda kv: kv[1])
+
+        if hits < self.VOTE_MAJORITY:
+            return QUALITY_UNSURE
+
+        return state
+
+    # ==========================================================
+    # 补喷模式
+    # ==========================================================
+    def maybe_send_respray(self, level=5):
+        """破损还在就每 SPRAY_INTERVAL_S 补一帧 CMD_RESPRAY。
+
+        改造前这里是两次独立 write（先 b'2' 设档、再 b'C' 开喷），两次之间
+        没有任何原子性：中间插进任何一次发送，下位机就只收到设档、没收到
+        开喷 —— 档位变了、车没动，日志上看着两条都发了，完全静默。
+        现在一条命令一次 write，帧自带 CRC。
+        """
+        if self.mode != self.MODE_RESPRAY or self.serial_mgr is None:
+            return
+
+        now = time.monotonic()
+
+        if now - self.last_spray < self.SPRAY_INTERVAL_S:
+            return
+
+        level = max(1, min(SPRAY_LEVELS, int(level)))
+        self.last_spray = now
+        self.spray_count += 1
+        self.last_level = level
+
+        self._send(frame.build_respray(level * SPRAY_MM_PER_LEVEL, self._next_seq()))
+
+    # ==========================================================
+    # 巡线模式
+    # ==========================================================
+    def start_track(self, segment_mm=None):
+        """开始边走边喷边纠。"""
+        if self.mode != self.MODE_TRACK:
+            return False
+
+        if segment_mm is None:
+            segment_mm = self.SEGMENT_MM
+
+        self.tracking = True
+        self._segments_sent = 0
+        self.param_trim = 0.0
+        self.last_trim_time = 0.0
+        self._bad_streak = 0
+        self._good_streak = 0
+
+        self._send_segment(segment_mm)
+        return True
+
+    def stop_track(self):
+        """停车。先关泵再发命令 —— 顺序反了的话，车停了泵还在出漆。"""
+        self.tracking = False
+
+        self._send(frame.build_pump(False, self._next_seq()))
+
+        # 'T' 是固件的急停，任何状态都接受。这里用它而不是 CMD_MOVE(0)：
+        # MOVE 0 会被判参数越界回绝（proto.h 里 mm == 0 是非法值）。
+        if self.serial_mgr is not None:
+            self.serial_mgr.send(b"T")
+
+    def _send_segment(self, segment_mm=None):
+        if segment_mm is None:
+            segment_mm = self.SEGMENT_MM
+
+        self._segments_sent += 1
+        self._last_segment_time = time.monotonic()
+
+        self._send(frame.build_move(frame.MOVE_FWD, int(segment_mm), int(segment_mm),
+                                    self._next_seq()))
+
+    def _track_tick(self, heading_deg, lateral_ratio):
+        """每帧调一次。按 TRIM_INTERVAL_S 节流下发纠偏。
+
+        为什么用 CMD_TRIM（增量）而不是每段重发 MOVE（重设）：
+        重设要等一段走完，5000mm 一段就是 31 秒一次，等于没有反馈。
+        TRIM 在段内直接改左右轮的目标脉冲数，31 秒里能纠 300 次。
+
+        代价是差速会在段内累积（内侧轮一路提前停）。所以固件那边给
+        Motion_Trim 加了累计上限，上位机这边有限幅 + 速率限制，
+        两边一起把"越纠越歪"挡在外面。
+        """
+        # 陀螺仪闭环接管了差速，视觉这条就不发言了。
+        #
+        # 为什么是"完全闭嘴"而不是"少发一点"：两条控制律都在改同一组
+        # 目标脉冲，一个按角度算、一个按像素算，谁后到谁覆盖。表现上会
+        # 是车周期性左一下右一下，而两边日志都是"已下发、已确认"。
+        # 分工才是对的：航向归下位机（10ms 环、不受光照影响），
+        # 视觉只管"这块漆破没破"（判破损、开关泵）。
+        if self.gyro_closed:
+            return
+
+        now = time.monotonic()
+
+        if now - self.last_trim_time < self.TRIM_INTERVAL_S:
+            return
+
+        self.last_trim_time = now
+
+        trim = lane_control.trim_mm(heading_deg, lateral_ratio,
+                                    previous=self.param_trim)
+        self.param_trim = trim
+
+        # 死区之内不发。发了也是 0，白白占 10.4ms 的串口带宽，
+        # 还会让 ACK 表里全是"OK"，真正出问题的那条混在里面看不出来。
+        if abs(trim) >= lane_control.GAINS["DEADBAND_MM"]:
+            self._send(frame.build_trim(int(round(trim)), self._next_seq()))
+
+    def _update_pump(self, quality):
+        """按三态控制泵，带滞回。
+
+        UNSURE 一律关泵：看不到就不喷。这条比"多喷一点"重要得多 ——
+        镜头糊了、车开出线外了，继续喷就是在空地上倒漆。
+        """
+        if quality in (QUALITY_WORN, QUALITY_BREAK):
+            self._bad_streak += 1
+            self._good_streak = 0
+        elif quality == QUALITY_OK:
+            self._good_streak += 1
+            self._bad_streak = 0
+        else:
+            self._good_streak += 1
+            self._bad_streak = 0
+
+        if not self.pump_on and self._bad_streak >= self.PUMP_ON_AFTER:
+            self.pump_on = True
+            self._send(frame.build_pump(True, self._next_seq()))
+
+        elif self.pump_on and self._good_streak >= self.PUMP_OFF_AFTER:
+            self.pump_on = False
+            self._send(frame.build_pump(False, self._next_seq()))
+
+    def on_status(self, state_char, pulse=0, flags=None):
+        """接收下位机上行的状态帧，由主窗口转发进来。
+
+        做两件事：
+          1. 一段走完了就接下一段。没有这条的话，发完 5000mm 车就停在
+             原地了，而界面还显示"正在巡线"。
+          2. 记下"陀螺仪闭环有没有接管差速"，据此决定还要不要发 TRIM。
+
+        必须看到过 'M' 才允许续段。只判断"现在是 W"是不够的：MOVE 被回绝
+        （上电静默、状态不对、串口没通）时状态一直是 W，那样这里会每 0.5 秒
+        刷一帧 MOVE，日志瞬间刷满，真正的问题被埋在中间。
+        """
+        previous = self._fw_state
+        self._fw_state = state_char
+
+        if flags is not None:
+            self.fw_flags = flags
+            # bit 0x10 = 固件那边航向闭环正在跑（见 SendStatusFrame）
+            self.gyro_closed = bool(flags & 0x10)
+
+        if not self.tracking:
+            return
+
+        if state_char != "W":
+            return
+
+        if previous != "M":
+            return
+
+        # 状态是 W 也可能是急停回来的。加一道时间闸：上一段刚发出去不到
+        # 半秒就"已结束"，那是被别的东西打断了，不该接着发下一段。
+        if time.monotonic() - self._last_segment_time < 0.5:
+            return
+
+        self._send_segment()
 
     # ==========================================================
     # PCA 主方向
     # ==========================================================
     def get_orientation_pca(self, points):
+        """返回 (中心, 角度, vx, vy)。
 
+        vx/vy 也一起返回，因为纠偏要的是"线的倾斜方向"，而 angle 把圆的
+        另一半折叠掉了（-90~90），用它算航向会丢掉符号。见
+        core/lane_control.heading_error_deg 的说明。
+        """
         mean = np.mean(points, axis=0)
 
         centered = points - mean
 
         cov = np.cov(centered.T)
 
-        eig_vals, eig_vecs = np.linalg.eig(cov)
+        # eigh 而不是 eig：协方差是对称阵，eigh 保证实数且更快；
+        # eig 在这里偶尔会返回复数，后面 atan2 直接崩。
+        eig_vals, eig_vecs = np.linalg.eigh(cov)
 
-        main_dir = eig_vecs[:, np.argmax(eig_vals)]
+        main_dir = eig_vecs[:, int(np.argmax(eig_vals))]
 
-        angle = np.arctan2(
-            main_dir[1],
-            main_dir[0]
-        ) * 180.0 / np.pi
+        angle = np.arctan2(main_dir[1], main_dir[0]) * 180.0 / np.pi
 
         if angle > 90:
             angle -= 180
@@ -119,11 +425,8 @@ class CameraWidget(QLabel):
         elif angle < -90:
             angle += 180
 
-        return mean, angle
+        return mean, angle, float(main_dir[0]), float(main_dir[1])
 
-    # ==========================================================
-    # 判断是否为线状
-    # ==========================================================
     def is_line_shape(self, contour):
 
         rect = cv2.minAreaRect(contour)
@@ -137,45 +440,11 @@ class CameraWidget(QLabel):
 
         return aspect_ratio >= self.LINEAR_ASPECT_RATIO_THRESH
 
-    # 破损判据在 core/line_quality.evaluate_line_quality()。
-    # 移出去是因为那边不依赖 Qt，能单独跑 vision_test.py；
-    # 而且要求喂【原始黄像素】—— 原来这里喂填实的剪影，
-    # 量的其实是剪影的形状，跟漆面完好程度没关系。
-
-    # ==========================================================
-    # 破了 -> 发 'C' 让下位机补一段
-    # ==========================================================
-    def maybe_send_respray(self):
-        """破损还在就每 SPRAY_INTERVAL_S 补发一条 'C'。
-
-        一段是有界的（泵开直行固定脉冲后自动停），所以链路断了最多喷完
-        当前这一段，不会失控 —— 上位机看不见下位机状态，只能靠这个。
-        """
-        if not self.auto_paint or self.serial_mgr is None:
-            return
-
-        now = time.monotonic()
-
-        if now - self.last_spray < self.SPRAY_INTERVAL_S:
-            return
-
-        self.last_spray = now
-        self.spray_count += 1
-        self.serial_mgr.send(b'C')
-
     # ==========================================================
     # 绘制定向矩形
     # ==========================================================
-    def draw_oriented_rect(
-            self,
-            image,
-            center,
-            angle,
-            length,
-            width,
-            color,
-            thickness=2
-    ):
+    def draw_oriented_rect(self, image, center, angle, length, width,
+                           color, thickness=2):
 
         rect = np.array([
             [-length / 2, -width / 2],
@@ -195,59 +464,30 @@ class CameraWidget(QLabel):
 
         rect_rot = rect_rot.astype(np.int32)
 
-        cv2.polylines(
-            image,
-            [rect_rot],
-            True,
-            color,
-            thickness
-        )
+        cv2.polylines(image, [rect_rot], True, color, thickness)
 
     # ==========================================================
-    # 更新画面
+    # 每帧
     # ==========================================================
     def update_frame(self):
 
         if self.cap is None:
             return
 
-        ret, frame = self.cap.read()
+        ret, frame_in = self.cap.read()
 
         if not ret:
             return
 
-        result = frame.copy()
+        result = frame_in.copy()
 
-        # ======================================================
-        # HSV 黄色提取
-        # ======================================================
+        hsv = cv2.cvtColor(frame_in, cv2.COLOR_BGR2HSV)
 
-        hsv = cv2.cvtColor(
-            frame,
-            cv2.COLOR_BGR2HSV
-        )
-
-        yellow_mask = cv2.inRange(
-            hsv,
-            self.HSV_YELLOW_LOW,
-            self.HSV_YELLOW_HIGH
-        )
-
-        # ======================================================
-        # 开运算去噪
-        # ======================================================
+        yellow_mask = cv2.inRange(hsv, self.HSV_YELLOW_LOW, self.HSV_YELLOW_HIGH)
 
         kernel_open = np.ones((3, 3), np.uint8)
 
-        yellow_mask = cv2.morphologyEx(
-            yellow_mask,
-            cv2.MORPH_OPEN,
-            kernel_open
-        )
-
-        # ======================================================
-        # 轮廓检测
-        # ======================================================
+        yellow_mask = cv2.morphologyEx(yellow_mask, cv2.MORPH_OPEN, kernel_open)
 
         # 找轮廓要用闭运算补过裂缝的那份：破损处的黄漆被裂缝切成碎块，
         # 不补的话长宽比会塌到 1.x，is_line_shape 一个都选不中 ——
@@ -263,11 +503,7 @@ class CameraWidget(QLabel):
 
         if contours:
 
-            contours_sorted = sorted(
-                contours,
-                key=cv2.contourArea,
-                reverse=True
-            )
+            contours_sorted = sorted(contours, key=cv2.contourArea, reverse=True)
 
             line_contour = None
 
@@ -288,16 +524,11 @@ class CameraWidget(QLabel):
 
                 points = line_contour.reshape(-1, 2)
 
-                center, angle = self.get_orientation_pca(points)
-
-                # ================= 计算矩形 =================
+                center, angle, vx, vy = self.get_orientation_pca(points)
 
                 rad = np.deg2rad(angle)
 
-                dir_vec = np.array([
-                    np.cos(rad),
-                    np.sin(rad)
-                ])
+                dir_vec = np.array([np.cos(rad), np.sin(rad)])
 
                 projections = np.dot(points, dir_vec)
 
@@ -306,21 +537,14 @@ class CameraWidget(QLabel):
                 rect_length = max(line_length + 20, 80)
 
                 # ================= 平滑 =================
-
                 cx, cy = int(center[0]), int(center[1])
 
                 self.center_queue.append((cx, cy))
 
-                smooth_x = int(np.mean(
-                    [p[0] for p in self.center_queue]
-                ))
+                smooth_x = int(np.mean([p[0] for p in self.center_queue]))
+                smooth_y = int(np.mean([p[1] for p in self.center_queue]))
 
-                smooth_y = int(np.mean(
-                    [p[1] for p in self.center_queue]
-                ))
-
-                # ================= 喷涂判断 =================
-
+                # ================= 判据 =================
                 # 抠出矩形范围内的【原始黄像素】再判。不能拿闭过的那份，
                 # 也不能拿填实的剪影 —— 两者都把掉漆填平了，判出来永远是"完好"。
                 line_pixels = extract_line_pixels(
@@ -331,115 +555,114 @@ class CameraWidget(QLabel):
                     self.RECT_WIDTH
                 )
 
-                need_paint, reason = evaluate_line_quality(line_pixels)
+                quality, spray_level, reason = classify_line_quality(line_pixels)
+
+                self.votes.append(quality)
+                voted = self._voted_quality()
+
+                self.quality = voted
+                self.quality_note = reason
+
+                # ================= 误差 =================
+                image_width = frame_in.shape[1]
+
+                heading = lane_control.heading_error_deg(vx, vy)
+                lateral = lane_control.lateral_error_ratio(smooth_x, image_width)
+
+                self.heading_deg = heading
+                self.lateral_ratio = lateral
 
                 # ================= 闭环 =================
+                if self.mode == self.MODE_RESPRAY:
+                    if voted in (QUALITY_WORN, QUALITY_BREAK):
+                        self.maybe_send_respray(spray_level)
 
-                if need_paint:
-                    self.maybe_send_respray()
+                elif self.mode == self.MODE_TRACK and self.tracking:
+                    self._update_pump(voted)
+                    self._track_tick(heading, lateral)
 
-                rect_color = (
-                    (0, 0, 255)
-                    if need_paint
-                    else
-                    (0, 255, 0)
-                )
-
-                label = (
-                    "NEED PAINT"
-                    if need_paint
-                    else
-                    "NO PAINT"
-                )
-
-                # ================= 绘制矩形 =================
+                # ================= 画 =================
+                color = self._quality_color(voted)
 
                 self.draw_oriented_rect(
-                    result,
-                    (smooth_x, smooth_y),
-                    angle,
-                    rect_length,
-                    self.RECT_WIDTH,
-                    rect_color,
-                    thickness=3
-                )
-
-                # ================= 显示文字 =================
-
-                cv2.putText(
-                    result,
-                    label,
-                    (smooth_x - 50, smooth_y - 20),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    rect_color,
-                    2
+                    result, (smooth_x, smooth_y), angle, rect_length,
+                    self.RECT_WIDTH, color, thickness=3
                 )
 
                 cv2.putText(
                     result,
-                    reason,
-                    (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (255, 255, 255),
-                    2
+                    f"{QUALITY_NAMES.get(voted, '?')} L{spray_level}",
+                    (max(0, smooth_x - 60), max(20, smooth_y - 20)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2
                 )
+
+                # 指向画面中心的方向标：纠偏向哪边一眼能看出来
+                h, w = result.shape[:2]
+                cv2.line(result, (w // 2, h - 20),
+                         (w // 2 + int(-heading * 6), h - 20), (0, 255, 255), 2)
 
         if not found_line:
             # 这一帧没认出线（压根没轮廓，或者轮廓都不像线状）就把平滑队列清掉。
-            # 不清的话，线跳走再回来、或者换到旁边那条线，队列里最多 5 帧的旧中心
+            # 不清的话，线跳走再回来、或者换到旁边那条，队列里最多 5 帧的旧中心
             # 会被和新中心一起平均，ROI 落在上一处 —— 判出来的破损也是那一处的。
-            # 方向是安全的（量不到就不喷），但喷的位置是错的。
             self.center_queue.clear()
 
-        # ======================================================
-        # 喷涂计数（闭环到底发出去没有，看这个数）
-        # ======================================================
+            # 认不到线也要进投票：连续几帧看不到，结论就该变成"看不清"，
+            # 而不是一直沿用最后一帧的"完好"。泵那边靠这个关掉。
+            self.votes.append(QUALITY_UNSURE)
+            self.quality = self._voted_quality()
+            self.quality_note = "No line"
 
-        # 一直画：撤下来（按了面板上别的键）得看得见，不然人以为还在自动喷。
-        # 注意这个数只说明"我发了"，不说明下位机动了 —— 串口没打开时它也涨，
-        # 那种情况看下位机的发送失败提示。
-        cv2.putText(
-            result,
-            f"spray x{self.spray_count}" if self.auto_paint else "spray OFF",
-            (10, 60),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 255) if self.auto_paint else (128, 128, 128),
-            2
-        )
+            if self.mode == self.MODE_TRACK and self.tracking:
+                self._update_pump(self.quality)
+
+        self._draw_hud(result)
 
         # ======================================================
         # Qt 显示
         # ======================================================
-
-        result = cv2.cvtColor(
-            result,
-            cv2.COLOR_BGR2RGB
-        )
+        result = cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
 
         h, w, ch = result.shape
 
-        bytes_per_line = ch * w
-
-        image = QImage(
-            result.data,
-            w,
-            h,
-            bytes_per_line,
-            QImage.Format_RGB888
-        )
+        image = QImage(result.data, w, h, ch * w, QImage.Format_RGB888)
 
         pixmap = QPixmap.fromImage(image)
 
-        self.setPixmap(
-            pixmap.scaled(
-                self.size(),
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation
+        self.setPixmap(pixmap.scaled(self.size(), Qt.KeepAspectRatio,
+                                     Qt.SmoothTransformation))
+
+    # ==========================================================
+    # 画面上的状态字
+    # ==========================================================
+    def _quality_color(self, quality):
+        if quality in (QUALITY_WORN, QUALITY_BREAK):
+            return (0, 0, 255)
+        if quality == QUALITY_OK:
+            return (0, 255, 0)
+        return (0, 200, 255)      # UNSURE：黄，表示"我没看清，不是在报好"
+
+    def _draw_hud(self, image):
+        lines = [self.quality_note]
+
+        if self.mode == self.MODE_RESPRAY:
+            lines.append(f"respray x{self.spray_count} L{self.last_level}")
+
+        elif self.mode == self.MODE_TRACK:
+            lines.append(
+                f"head {self.heading_deg:+.1f}deg  lat {self.lateral_ratio:+.2f}"
             )
-        )
+            lines.append(
+                f"trim {self.param_trim:+.1f}mm  pump={'ON' if self.pump_on else 'off'}"
+            )
+            lines.append(
+                f"{'TRACK' if self.tracking else 'idle'} seg#{self._segments_sent} "
+                f"fw={self._fw_state}"
+            )
+
+        for index, text in enumerate(lines):
+            cv2.putText(image, text, (10, 30 + index * 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
 
     # ==========================================================
     # 关闭事件

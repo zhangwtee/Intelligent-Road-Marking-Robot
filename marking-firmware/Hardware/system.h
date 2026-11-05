@@ -29,6 +29,7 @@ typedef enum {
 	  STATE_MOVE_LEFT = 'A',    // 左移
     STATE_MOVE_RIGHT = 'X',    // 右移
 		STATE_TING='T',//急停,
+	  STATE_MOVE = 'M',    // 帧命令 CMD_MOVE：按毫米走一段（前进/后退）
 	  STATE_PAINT = 'P',   //
 	  STATE_RESPRAY = 'C'  // 二次喷涂补线（相机检测到破损时上位机发）
 } SystemState;
@@ -46,6 +47,7 @@ void TIM1_Init(void);
 void GPIO15_Init(void);
 void TIM1_UP_IRQHandler(void);
 void ProcessCommand(void) ;
+void SendStatusFrame(void) ;
 
 
 

@@ -3,10 +3,14 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QTextEdit, QLabel,
     QComboBox, QCheckBox, QSlider, QStackedLayout, QSpacerItem, QSizePolicy
 )
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QTextCursor
+
 from ui.camera_widget import CameraWidget
+from core import frame
+from core.ack import AckTracker
 from core.protocol import PANEL_BUTTONS, CAMERA_BUTTONS, CAMERA_OFF_BUTTONS
+
 
 class MainWindow(QWidget):
     append_send_signal = pyqtSignal(str)
@@ -17,25 +21,80 @@ class MainWindow(QWidget):
         self.serial_mgr = serial_mgr
         self.protocol = protocol
 
+        # ACK 配对表：改造前 ACK 只进日志，人眼看着"有一个 ACK"，
+        # 但分不清"链路断了"和"命令被回绝"。现在按 SEQ 配起来。
+        self.ack = AckTracker()
+
         self.append_send_signal.connect(self._append_send)
         self.append_recv_signal.connect(self._append_recv)
 
         self.init_ui()
-        #self.serial_mgr.callback = self.on_data_received
-        self.serial_mgr.data_received.connect(
-            self.on_data_received
-        )
+
+        self.serial_mgr.data_received.connect(self.on_data_received)
         # error_signal 原来一个槽都没接：串口没打开时 send() 是静默失败，
-        # 发送日志照记、摄像头上的 spray 计数照涨，看着像在干活，
+        # 发送日志照记、摄像头上的计数照涨，看着像在干活，
         # 其实一个字节都没上总线。
         self.serial_mgr.error_signal.connect(self.on_serial_error)
         self.serial_mgr.open()
 
+        # 超时检查。100ms 一次：ACK_TIMEOUT_S 是 300ms，检查得比它密，
+        # 才不会出现"其实 200ms 就超了，但要等到 400ms 才被发现"。
+        self.tick_timer = QTimer()
+        self.tick_timer.timeout.connect(self._tick)
+        self.tick_timer.start(100)
+
     def on_serial_error(self, msg):
         self.append_send_signal.emit(f"串口错误: {msg} —— 字节没发出去")
 
+    # ---------------- 链路健康 ----------------
+    def _tick(self):
+        dead, _ = self.ack.expire(resend=self.serial_mgr.send)
+
+        for item in dead:
+            name = frame.CMD_NAMES.get(item.cmd, f"0x{item.cmd:02X}")
+            self.append_send_signal.emit(
+                f"无响应 {name} seq={item.seq}（300ms 内没收到 ACK）"
+            )
+
+        self._update_link_label()
+
+    def _update_link_label(self):
+        h = self.ack.health()
+
+        if h["sent"] == 0:
+            self.link_label.setText("链路：还没发过帧")
+            self.link_label.setStyleSheet("")
+            return
+
+        self.link_label.setText(
+            f"链路  确认 {h['acked']}/{h['sent']}   超时 {h['timed_out']}   "
+            f"回绝 {h['rejected']}   RTT {h['rtt']}"
+        )
+
+        if h["rejected"]:
+            # 链路是通的，命令被下位机回绝了 —— 这是逻辑问题，不是线的问题，
+            # 用橙色而不是红色，免得跟"断线"混在一起。
+            color = "#c07000"
+        elif h["loss_pct"] >= 30:
+            color = "#c00000"
+        elif h["loss_pct"] > 0:
+            color = "#c07000"
+        else:
+            color = "#008000"
+
+        self.link_label.setStyleSheet(f"color:{color}; font-size:14px;")
+
+    # ---------------- 帧发送 ----------------
+    def send_frame(self, raw, label=""):
+        """发一帧并登记 ACK。所有走帧协议的动作都要经过这里 ——
+        绕过它发送，链路健康度就少了这一条，而且永远不会被发现。"""
+        self.serial_mgr.send(raw)
+        self.ack.register(raw)
+        self.append_send_log(raw, label)
+        self._update_link_label()
+
     def init_ui(self):
-        self.resize(1000, 500)
+        self.resize(1000, 560)
         self.setWindowTitle("道路画线机控制面板")
         self.stack_layout = QStackedLayout()
         self.setLayout(self.stack_layout)
@@ -54,7 +113,30 @@ class MainWindow(QWidget):
         self.status_label.setStyleSheet("font-size:32px; font-weight:bold;")
         left_layout.addSpacerItem(QSpacerItem(20, 40, QSizePolicy.Minimum, QSizePolicy.Fixed))
         left_layout.addWidget(self.status_label)
-        left_layout.addStretch()
+
+        self.link_label = QLabel("链路：还没发过帧")
+        self.link_label.setAlignment(Qt.AlignCenter)
+        left_layout.addWidget(self.link_label)
+
+        # 航向。单独一行大字：它是"车到底直不直"的唯一直接读数，
+        # 比状态栏里那串脉冲数有用得多。
+        self.heading_label = QLabel("航向  --")
+        self.heading_label.setAlignment(Qt.AlignCenter)
+        self.heading_label.setStyleSheet("font-size:24px; font-weight:bold; color:#555;")
+        left_layout.addWidget(self.heading_label)
+
+        self.gyro_label = QLabel("陀螺仪：等状态帧")
+        self.gyro_label.setAlignment(Qt.AlignCenter)
+        self.gyro_label.setStyleSheet("font-size:14px; color:#777;")
+        left_layout.addWidget(self.gyro_label)
+
+        # 闭环开关。勾选状态由下位机的状态帧回填，不是"点了就认为成功"——
+        # 传感器没标零时固件会回绝，勾选必须弹回去，否则界面在骗人。
+        self.gyro_check = QCheckBox("陀螺仪闭环接管直线")
+        self.gyro_check.setStyleSheet("font-size:16px;")
+        self.gyro_check.setEnabled(False)      # 没收到状态帧之前不知道能不能开
+        self.gyro_check.toggled.connect(self.on_gyro_toggle)
+        left_layout.addWidget(self.gyro_check)
 
         # 按钮表在 core/protocol.py 里，和指令表放在一起，避免标签写两遍对不上
         self.control_buttons = []
@@ -65,6 +147,15 @@ class MainWindow(QWidget):
             btn.setStyleSheet("font-size:20px;")
             left_layout.addWidget(btn)
             self.control_buttons.append(btn)
+
+        # 这一条不走单字节协议：它要连发几百帧（每段 MOVE + 10Hz 纠偏 + 泵开关），
+        # 一个字节表达不了。做成开关式，按下去开始，再按一次停。
+        self.btn_track = QPushButton("自动巡线喷涂（开始 / 停止）")
+        self.btn_track.setCheckable(True)
+        self.btn_track.setMinimumHeight(40)
+        self.btn_track.setStyleSheet("font-size:20px; background:#dff0d8;")
+        self.btn_track.clicked.connect(self.toggle_track)
+        left_layout.addWidget(self.btn_track)
 
         self.btn_settings = QPushButton("设置")
         self.btn_settings.setMinimumHeight(40)
@@ -86,8 +177,6 @@ class MainWindow(QWidget):
         self.btn_clear_send.clicked.connect(self.clear_send_log)
         center_layout.addWidget(self.btn_clear_send)
 
-        # 这里原来有个"发送模式"下拉框，但发送路径根本不读它（指令固定是
-        # 单字节 ASCII），是个死控件，删掉。接收模式那个是真的在用，保留。
         self.send_pause_checkbox = QCheckBox("暂停自动滚动")
         center_layout.addWidget(self.send_pause_checkbox)
 
@@ -130,6 +219,30 @@ class MainWindow(QWidget):
         self.settings_title.setStyleSheet("font-size:32px; font-weight:bold;")
         settings_layout.addWidget(self.settings_title)
 
+        gyro_hint = QLabel(
+            "陀螺仪标定\n\n"
+            "「重新标零」：车必须完全静止。做的事是采 1 秒静止数据求零偏，"
+            "驱动器的振动、风扇、人在旁边走动都会让这次标定失败重来。\n\n"
+            "「标定轮距」：车会自己单侧走 300mm，然后按实际转过的角度反算"
+            "左右轮中心距。场地要留出约 1.5 米见方，车会绕一个弧。"
+            "结果只显示在 OLED 第 4 行和接收日志里，掉电就没了 —— "
+            "想固化就抄进固件的 calib.h。"
+        )
+        gyro_hint.setWordWrap(True)
+        gyro_hint.setStyleSheet("font-size:14px; color:#555;")
+        settings_layout.addWidget(gyro_hint)
+
+        self.btn_gyro_recal = QPushButton("重新标零（车必须静止）")
+        self.btn_gyro_recal.setMinimumHeight(40)
+        self.btn_gyro_recal.clicked.connect(self.on_gyro_recal)
+        settings_layout.addWidget(self.btn_gyro_recal)
+
+        self.btn_gyro_measure = QPushButton("标定轮距（车会自己走 300mm）")
+        self.btn_gyro_measure.setMinimumHeight(40)
+        self.btn_gyro_measure.setStyleSheet("background:#fcf8e3;")
+        self.btn_gyro_measure.clicked.connect(self.on_gyro_measure)
+        settings_layout.addWidget(self.btn_gyro_measure)
+
         self.btn_back_settings = QPushButton("返回主界面")
         self.btn_back_settings.clicked.connect(self.show_main)
         settings_layout.addWidget(self.btn_back_settings)
@@ -167,9 +280,51 @@ class MainWindow(QWidget):
     def on_data_received(self, data):
         results = self.protocol.parse(data)
         for item in results:
+            if item.get("kind") == "frame":
+                self._dispatch_frame(item)
             self.append_recv_signal.emit(item)
 
+    def _dispatch_frame(self, item):
+        """把上行帧分发给该处理它们的地方。
+
+        以前只有状态帧被特判了一下（更新状态栏），ACK 只写进日志。
+        现在 ACK 要进配对表，状态帧还要喂给摄像头控件 —— 它靠"段走完了"
+        这个信号来接下一段。
+        """
+        cmd = item.get("cmd")
+        payload = item.get("data") or b""
+
+        if cmd == frame.CMD_ACK and len(payload) >= 2:
+            # payload[0] = 被确认的原命令，payload[1] = 结果码
+            self.ack.on_ack(item["seq"], payload[0], payload[1])
+            self._update_link_label()
+
+        elif cmd == frame.CMD_STATUS and len(payload) >= 2:
+            state_char = chr(payload[0]) if 32 <= payload[0] < 127 else "?"
+            flags = payload[2] if len(payload) >= 3 else 0
+
+            widget = getattr(self, "camera_widget", None)
+            if widget is not None:
+                widget.on_status(state_char, flags=flags)
+
+            self._apply_gyro_flags(flags)
+
+        elif cmd == frame.CMD_HEADING:
+            self._update_heading(item)
+
     def _append_recv(self, item):
+        # 状态帧是 5Hz 的，全写进日志会把按钮回显、ACK 全刷没。
+        # 它只更新状态栏 —— 这一栏以前是"最后按了哪个键"，现在变成
+        # "下位机现在真实在干什么"，这是接帧之后最直观的一个变化。
+        if item.get("kind") == "frame" and item.get("cmd") == frame.CMD_STATUS:
+            self.status_label.setText(f"状态:\n{item['status']}")
+            return
+
+        # 航向帧同样是 5Hz，只更新界面，不进日志 ——
+        # 进日志的话按钮回显和 ACK 会被它淹没，而那两样才是排障时要看的。
+        if item.get("kind") == "frame" and item.get("cmd") == frame.CMD_HEADING:
+            return
+
         if not self.recv_pause_checkbox.isChecked():
             mode = self.recv_mode_box.currentText()
             if mode == "HEX":
@@ -185,6 +340,71 @@ class MainWindow(QWidget):
             self.recv_log.moveCursor(QTextCursor.End)
         self.status_label.setText(f"状态:\n{item['status']}")
 
+    # ---------------- 陀螺仪 ----------------
+    def _apply_gyro_flags(self, flags):
+        """按状态帧的 flags 回填界面。
+
+        界面的勾选状态和"下位机真的在闭环"必须是同一件事。
+        用户点了勾但固件回绝（没标零、传感器不在）时，这里会把勾弹回去 ——
+        不做这一步的话，界面显示"已接管"，车其实一点没纠，人还会去怪标定。
+        """
+        ready = bool(flags & 0x08)
+        closed = bool(flags & 0x10)
+
+        self.gyro_check.blockSignals(True)
+        self.gyro_check.setChecked(closed)
+        self.gyro_check.blockSignals(False)
+        self.gyro_check.setEnabled(ready)
+
+        if not ready:
+            self.gyro_label.setText("陀螺仪：未就绪（没接 / 标零中 / 掉线）")
+            self.gyro_label.setStyleSheet("font-size:14px; color:#c00000;")
+        elif closed:
+            self.gyro_label.setText("陀螺仪：闭环中 —— 视觉不再纠偏")
+            self.gyro_label.setStyleSheet("font-size:14px; color:#008000;")
+        else:
+            self.gyro_label.setText("陀螺仪：就绪（闭环关）")
+            self.gyro_label.setStyleSheet("font-size:14px; color:#c07000;")
+
+    def _update_heading(self, item):
+        deg = item.get("heading_deg", 0.0)
+        rate = item.get("rate_dps", 0.0)
+        state = frame.GYRO_STATE_NAMES.get(item.get("gyro_state", 0), "?")
+
+        self.heading_label.setText(f"航向 {deg:+.2f}\u00b0")
+        self.gyro_label.setText(f"陀螺仪：{state}   {rate:+.1f} dps")
+
+        # 偏得多就变色：2 度以内算直，5 度以外已经能看出来了
+        if abs(deg) < 2.0:
+            color = "#008000"
+        elif abs(deg) < 5.0:
+            color = "#c07000"
+        else:
+            color = "#c00000"
+        self.heading_label.setStyleSheet(
+            f"font-size:24px; font-weight:bold; color:{color};"
+        )
+
+    def on_gyro_toggle(self, checked):
+        sub = frame.GYRO_ON if checked else frame.GYRO_OFF
+        self.send_frame(frame.build_gyro(sub),
+                        "陀螺仪 开闭环" if checked else "陀螺仪 关闭环")
+
+    def on_gyro_recal(self):
+        self.send_frame(frame.build_gyro(frame.GYRO_RECAL), "陀螺仪 重新标零")
+        self.append_send_signal.emit(
+            "标零期间车必须完全静止，约 1 秒。失败会自动重试。"
+        )
+
+    def on_gyro_measure(self):
+        # 这条会让车自己动起来，先确认一次再发 —— 和别的按钮不一样，
+        # 它不是"发一个字节"，而是"车要绕一个弧走 300mm"。
+        self.send_frame(frame.build_gyro(frame.GYRO_MEASURE), "陀螺仪 标定轮距")
+        self.append_send_signal.emit(
+            f"轮距标定：车将单侧走 {frame.GYRO_MEASURE_DIFF_MM}mm，"
+            "请让开并留出约 1.5 米空间。结果看 OLED 第 4 行或接收日志。"
+        )
+
     # ---------------- 核心按钮功能 ----------------
     def send_button(self):
         label = self.sender().text()
@@ -196,20 +416,45 @@ class MainWindow(QWidget):
         self.append_send_log(data, label)
         self.status_label.setText(f"状态:\n{label}")
 
-        # 按了面板上别的键 = 不想让它自己喷了，先把相机闭环撤下来。
-        # 不撤的话按"停止复位"或者"关水泵"，2 秒后相机又自己开喷 ——
-        # 人按的停停不停得住全看手速，这不能接受。要接着喷就再按一次
-        # "二次喷涂"（下面会重新开一个武装好的窗口）。
-        # 下位机那边也堵了一道：'C' 只在 STATE_WAIT 被接受。
+        # 按了面板上别的键 = 不想让它自己干活了，先把自动流程撤下来。
+        # 不撤的话按"停止复位"或者"关水泵"，摄像头还在按帧下发指令 ——
+        # 人按的停停不停得住全看手速，这不能接受。
+        # 下位机那边也堵了一道：RESPRAY / MOVE 只在 STATE_WAIT 被接受。
         widget = getattr(self, 'camera_widget', None)
         if widget is not None and label not in CAMERA_BUTTONS:
-            widget.auto_paint = False
+            if widget.mode == CameraWidget.MODE_TRACK:
+                widget.stop_track()
+                self.btn_track.setChecked(False)
+            else:
+                widget.mode = CameraWidget.MODE_VIEW
 
         # ---------------- 摄像头弹窗 ----------------
         if label in CAMERA_BUTTONS:
             self.close_camera_window()
-            self.open_camera_window(label)
+            # 自动巡线走的是 toggle_track，不经过这里 —— 它没有对应的
+            # 单字节指令，进不了 PANEL_BUTTONS 这张表。
+            mode = (CameraWidget.MODE_RESPRAY
+                    if label == "二次喷涂"
+                    else CameraWidget.MODE_VIEW)
+            self.open_camera_window(label, mode)
         elif label in CAMERA_OFF_BUTTONS:
+            self.close_camera_window()
+
+    # ---------------- 自动巡线 ----------------
+    def toggle_track(self):
+        if self.btn_track.isChecked():
+            self.close_camera_window()
+            self.open_camera_window("自动巡线喷涂", CameraWidget.MODE_TRACK)
+
+            if self.camera_widget is not None:
+                self.camera_widget.start_track()
+                self.append_send_log(b"(track start)", "自动巡线")
+
+        else:
+            widget = getattr(self, "camera_widget", None)
+            if widget is not None:
+                widget.stop_track()
+                self.append_send_log(b"(track stop)", "自动巡线")
             self.close_camera_window()
 
     # ---------------- 摄像头弹窗 ----------------
@@ -219,21 +464,23 @@ class MainWindow(QWidget):
             return
         self.camera_widget.stop_camera()
         win.close()
-        win.deleteLater()      # 不然每按一次 N/C 就漏一个 QWidget
+        win.deleteLater()      # 不然每按一次就漏一个 QWidget
         self.camera_window = None
         self.camera_widget = None
 
-    def open_camera_window(self, label):
+    def open_camera_window(self, label, mode=None):
+        if mode is None:
+            mode = CameraWidget.MODE_VIEW
+
         self.camera_window = QWidget()
-        self.camera_window.setWindowTitle("摄像头画面")
+        self.camera_window.setWindowTitle(f"摄像头画面 - {label}")
         self.camera_window.resize(800, 600)
         layout = QVBoxLayout()
         self.camera_window.setLayout(layout)
         self.camera_widget = CameraWidget(
             self.serial_mgr,
-            # 只有"二次喷涂"是相机闭环：看到破损就自动发 C。
-            # "画车位（路沿）"只是借这个窗口取景，一个字节都不发。
-            auto_paint=(label == "二次喷涂"),
+            mode=mode,
+            ack_tracker=self.ack,
         )
         layout.addWidget(self.camera_widget)
         self.camera_widget.start_camera()
@@ -243,7 +490,11 @@ class MainWindow(QWidget):
     # ---------------- 主窗口关闭 ----------------
     def closeEvent(self, event):
         # 摄像头窗口是没有父窗口的顶层窗口（camera_window = QWidget()），
-        # 主界面关掉它不会跟着关，还会继续自己发 'C'。
+        # 主界面关掉它不会跟着关，还会继续按帧下发指令。
+        widget = getattr(self, "camera_widget", None)
+        if widget is not None and widget.mode == CameraWidget.MODE_TRACK:
+            widget.stop_track()
+
         self.close_camera_window()
         event.accept()
 
@@ -252,5 +503,8 @@ class MainWindow(QWidget):
         # （父窗口关闭只是把子控件隐藏），所以摄像头必须在这里自己停。
         widget = getattr(self, 'camera_widget', None)
         if widget is not None:
+            if widget.mode == CameraWidget.MODE_TRACK:
+                widget.stop_track()
+                self.btn_track.setChecked(False)
             widget.stop_camera()
         event.accept()

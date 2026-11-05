@@ -35,6 +35,61 @@ THRESHOLDS = {
 }
 
 
+# ---------------- 补喷档位 ----------------
+# 下位机 '1'~'5' 对应 0.2 / 0.4 / 0.6 / 0.8 / 1.0 m。这两个数必须和
+# marking-firmware/Hardware/system.c 的 kResprayPulse[] 对齐：
+#   kResprayPulse[] = {1000, 2000, 3000, 4000, 5000}  脉冲，0.2mm/脉冲
+SPRAY_LEVELS = 5
+SPRAY_MM_PER_LEVEL = 200
+
+
+# ---------------- 检测结论（四态，不是两种） ----------------
+# 改造前 evaluate_line_quality 只回答"补 / 不补"。这个二值输出把两件完全
+# 不同的事混成了一件：
+#
+#   线是完好的      -> 看清楚了，不需要补
+#   根本没看清      -> 什么都没看到，也不知道该不该补
+#
+# 两种情况都返回 False。于是"相机被挡住""线太细""画面全是反光"和"这条线
+# 画得很好"在下位机看来一模一样 —— 都是不发命令。现场的表现是"它不工作"，
+# 但日志里一切正常。
+#
+# 分开之后，上层才能对"看不清"做正确的事：不喷，也不当成正常，而且要报出来。
+QUALITY_OK = "ok"            # 看清了，完好
+QUALITY_WORN = "worn"        # 看清了，磨薄了
+QUALITY_BREAK = "break"      # 看清了，断了
+QUALITY_UNSURE = "unsure"    # 没看清 —— 不下结论
+
+QUALITY_NAMES = {
+    QUALITY_OK: "完好",
+    QUALITY_WORN: "磨损",
+    QUALITY_BREAK: "断裂",
+    QUALITY_UNSURE: "看不清",
+}
+
+
+def recommend_spray_level(coverage, gap):
+    """把"破了多少"折算成"补多长"，返回 1~5（下位机 '1'~'5'）。
+
+    两种损伤各算一个 0~1 的严重度，取大的：
+      Worn  覆盖率从 MIN_COVERAGE(0.55) 掉到 0 —— 刚好该补是 0，掉光才是 1
+      Break 断口比从 MAX_GAP_RATIO(0.10) 涨到 1.0 —— 刚好该补是 0，全断才是 1
+
+    为什么不只用一种：一条线可能覆盖率还高但中间断了一大截，也可能没断
+    但整片磨薄了，是两类损伤。取 max 保证任一种严重都补得够。
+
+    阈值从 THRESHOLDS 读，不在这儿再写一份数字 —— 否则改判据的时候
+    档位换算会悄悄跟着不同步。
+    """
+    th = THRESHOLDS
+    worn = (th["MIN_COVERAGE"] - coverage) / th["MIN_COVERAGE"]
+    broken = (gap - th["MAX_GAP_RATIO"]) / (1.0 - th["MAX_GAP_RATIO"])
+
+    severity = max(0.0, min(1.0, max(worn, broken)))
+
+    return 1 + int(severity * (SPRAY_LEVELS - 1) + 0.5)
+
+
 def close_cracks(yellow_mask):
     """闭运算补裂缝。**找轮廓必须用这份。**
 
@@ -83,8 +138,11 @@ def extract_line_pixels(yellow_mask, center, angle, length, width):
     return cv2.bitwise_and(yellow_mask, yellow_mask, mask=roi)
 
 
-def evaluate_line_quality(line_mask):
-    """返回 (need_paint, 说明)。line_mask 必须是原始黄像素，不是填实剪影。
+def classify_line_quality(line_mask):
+    """返回 (state, spray_level, 说明)。line_mask 必须是原始黄像素。
+
+    state 是 QUALITY_OK / WORN / BREAK / UNSURE 之一。
+    spray_level 只在 WORN / BREAK 时有效（1~5），其它情况是 0。
 
     说明里带 cov/gap/w 三个数，画面直接显示，标定就靠它。
     """
@@ -93,7 +151,7 @@ def evaluate_line_quality(line_mask):
     ys, xs = np.nonzero(line_mask)
 
     if len(xs) < th["MIN_LINE_PIXELS"]:
-        return False, "No line"
+        return QUALITY_UNSURE, 0, "No line"
 
     pts = np.stack([xs, ys], 1).astype(np.float32)
 
@@ -118,7 +176,7 @@ def evaluate_line_quality(line_mask):
         span = float(t.max() - t.min())
 
     if span < th["MIN_LINE_LENGTH"]:
-        return False, "Too short"
+        return QUALITY_UNSURE, 0, "Too short"
 
     # 沿线逐行数黄像素，分母取"典型满行"的像素数 —— 从实际行统计里来。
     # 所以双黄线中间那 12~25px 的空隙不会被算成没漆（两条线都在，每行自然就多），
@@ -130,7 +188,7 @@ def evaluate_line_quality(line_mask):
     full = float(np.percentile(rows[rows > 0], 75))
 
     if full < th["MIN_ROW_PIXELS"]:
-        return False, "Too thin"
+        return QUALITY_UNSURE, 0, "Too thin"
 
     cover = np.clip(rows / full, 0.0, 1.0)
 
@@ -147,10 +205,22 @@ def evaluate_line_quality(line_mask):
 
     note = f"cov={coverage:.2f} gap={gap:.2f} w={full:.0f}"
 
+    level = recommend_spray_level(coverage, gap)
+
     if gap > th["MAX_GAP_RATIO"]:
-        return True, "Break " + note
+        return QUALITY_BREAK, level, "Break " + note
 
     if coverage < th["MIN_COVERAGE"]:
-        return True, "Worn " + note
+        return QUALITY_WORN, level, "Worn " + note
 
-    return False, "OK " + note
+    return QUALITY_OK, 0, "OK " + note
+
+
+def evaluate_line_quality(line_mask):
+    """兼容旧调用：返回 (need_paint, spray_level, 说明)。
+
+    新代码请用 classify_line_quality —— 它能把"看不清"和"完好"分开，
+    这个包装做不到（返回 False 的两种含义本来就不同）。
+    """
+    state, level, note = classify_line_quality(line_mask)
+    return state in (QUALITY_WORN, QUALITY_BREAK), level, note

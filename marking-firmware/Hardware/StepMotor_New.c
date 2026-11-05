@@ -11,7 +11,15 @@ static volatile uint32_t Motor_PUL_CNT[4] = {0, 0, 0, 0};
 #define SPEED_STEP_ARR     100   // 每按一次增减的步长
 #define SPEED_DEFAULT_ARR  300   // 上电默认档（与旧版巡航速度一致）
 
-static volatile uint16_t speed_arr = SPEED_DEFAULT_ARR;   // 当前速度档位
+static volatile uint16_t speed_arr = SPEED_DEFAULT_ARR;   // 当前生效档位
+
+/* 用户档位。蓝牙 '+'/'-' 改的是它，转弯限速不改它。
+ *
+ * 为什么要分成两个：转弯时差速车要把速度临时压到 CHASSIS_TURN_ARR，
+ * 转完必须回到用户设的那个档。如果只有一个变量，转弯直接覆盖它，
+ * 转完之后车就永远停在慢档上，而界面上"档位"显示的还是原来那个 ——
+ * 用户会以为电机衰减了。 */
+static volatile uint16_t speed_base = SPEED_DEFAULT_ARR;
 
 // ---------- 软起软停（固定斜坡，不随行程变） ----------
 // 起步从 RAMP_SOFT_ARR 一档档加到 speed_arr，收尾再一档档退回。
@@ -30,6 +38,39 @@ static volatile uint8_t  ramp_state  = RAMP_ACCEL;  // 加速 / 匀速 / 减速
 static volatile uint16_t ramp_period = 0;           // 斜坡节拍计数
 static volatile uint32_t ramp_decel  = 0;           // 减速段长度（脉冲数）
 static volatile uint8_t  ramp_enable = 1;           // 0 = 本次运动不起坡（画线用）
+
+// ---------- 换向建立时间 ----------
+//
+// 这是"转的时候不顺畅"的第一个原因，和车型无关，两套固件都受益。
+//
+// SetDirection 只做一次 GPIO_WriteBit，紧接着 SetPulse 就开通道发脉冲，
+// 中间隔的是几条指令（72MHz 下约 100ns）。而步进驱动器输入侧是光耦，
+// 方向信号从"变电平"到"被内部逻辑认下来"典型要 5~10us（手册 DIR setup
+// time）。这期间到来的脉冲会被按【旧方向】吃掉。
+//
+// 表现：原地转 90 度时四个 DIR 同时翻转，四个驱动器各丢 1~3 个脉冲，
+// 而且丢的数量不一致 —— 车身先顿一下、再扭一下，然后才转起来。
+// 开环步进丢了步没人补，这 3 个脉冲就是 3 个脉冲的永久误差。
+//
+// 只对"方向真的变了"的情况等待。同向时写 GPIO 也照写（防止外部改过引脚），
+// 但不等待 —— 否则每续一段都要白等 10us，视觉伺服 200mm 一段，一秒五段，
+// 一天下来是无意义的累积。 */
+static uint8_t s_last_dir[4] = {0xFF, 0xFF, 0xFF, 0xFF};   // 0xFF = 还没设过
+static volatile uint8_t s_dir_changed = 0;
+
+static void StepMotor_DirSettleDelay(void)
+{
+    /* 72MHz 下大约 10~12us。__NOP 是一个周期，循环体本身（比较/自增）
+     * 还有几个周期，所以 90 次足够覆盖 720 个周期。
+     *
+     * 不需要精确：驱动器要求的是"至少"5us，多几微秒没有任何代价 ——
+     * 这点时间在 3.3kHz（300us 周期）的脉冲序列面前可以忽略。
+     * 用 volatile 保证优化等级变化时循环不被删掉。 */
+    volatile uint8_t i;
+    for (i = 0; i < 90; i++) {
+        __NOP();
+    }
+}
 
 // ---------- 辅助函数：获取对应通道的使能位 ----------
 static uint16_t GetCCER_EnableBit(uint8_t motor)
@@ -54,6 +95,51 @@ void StepMotor_SetFrequency(uint16_t arr)
     TIM3->CCR3 = (arr - 1) / 2;
     TIM3->CCR4 = (arr - 1) / 2;
     current_arr = arr;
+}
+
+// ---------- 档位：当前生效值的直接设置 / 恢复 ----------
+
+/* 直接把"当前生效档位"设成 arr（夹在最快到最慢之间），不动用户档位。
+ *
+ * 用途只有两个：转弯时临时限速（差速车），以及转完之后恢复。
+ * 业务代码不要拿它当"调速按钮" —— 那是 SpeedUp / SpeedDown 的事，
+ * 它们改的是用户档位，掉电前一直有效。
+ *
+ * ramp_on 时不立刻写 ARR：那一拍写下去，斜坡里「current_arr > speed_arr」
+ * 当场变假，直接从 555Hz 跳到目标频率。开环步进丢的步补不回来。
+ * 让它自己一档档走过去（每 RAMP_SOFT_STEP_PULSE 个脉冲一步）。 */
+void StepMotor_SetSpeedTarget(uint16_t arr)
+{
+    if (arr < SPEED_FAST_ARR) {
+        arr = SPEED_FAST_ARR;
+    }
+    if (arr > SPEED_SLOW_ARR) {
+        arr = SPEED_SLOW_ARR;
+    }
+
+    speed_arr = arr;
+
+    if (!ramp_on) {
+        StepMotor_SetFrequency(arr);
+    }
+}
+
+/* 回到用户档位。转弯结束后由 motion 层调用。
+ *
+ * 没被限过速时直接返回：motion 层每开一段都会调一次（那是唯一能保证
+ * "转过弯之后一定恢复"的位置），如果每次都重写一遍 ARR 和四个 CCR，
+ * 相当于在一个匀速段的开头硬生生插一次频率重设，白白扰动一次。 */
+void StepMotor_RestoreSpeed(void)
+{
+    if (speed_arr == speed_base) {
+        return;
+    }
+    StepMotor_SetSpeedTarget(speed_base);
+}
+
+uint16_t StepMotor_GetSpeedTarget(void)
+{
+    return speed_arr;
 }
 
 // ---------- 开关斜坡：包在运动调用外面用，用完立刻恢复，不留跨指令的状态 ----------
@@ -88,28 +174,26 @@ static void StepMotor_RampStart(uint32_t pulse)
 // ARR 越小越快，所以"加速"是减小 ARR
 void StepMotor_SpeedUp(void)
 {
-    if (speed_arr > SPEED_FAST_ARR + SPEED_STEP_ARR) {
-        speed_arr -= SPEED_STEP_ARR;
+    if (speed_base > SPEED_FAST_ARR + SPEED_STEP_ARR) {
+        speed_base -= SPEED_STEP_ARR;
     } else {
-        speed_arr = SPEED_FAST_ARR;
+        speed_base = SPEED_FAST_ARR;
     }
     // 只在没起坡的时候直接写 ARR。运动中写下去等于把 current_arr 一步设成
     // 目标值，斜坡里那句「current_arr > speed_arr」当场变成假，下一拍就切
     // CRUISE —— 从 1800(=555Hz) 一个周期内跳到 150(=5kHz)，九倍速的突变。
     // 开环步进没有编码器，这一下丢的步再也补不回来。
-    // 只改 speed_arr 当目标，中断里那套斜坡会自己一档档走过去
+    // 只改档位当目标，中断里那套斜坡会自己一档档走过去
     // （每 RAMP_SOFT_STEP_PULSE 个脉冲走 RAMP_SOFT_STEP_ARR）。
-    if (!ramp_on) {
-        StepMotor_SetFrequency(speed_arr);
-    }
+    StepMotor_SetSpeedTarget(speed_base);
 }
 
 void StepMotor_SpeedDown(void)
 {
-    if (speed_arr < SPEED_SLOW_ARR - SPEED_STEP_ARR) {
-        speed_arr += SPEED_STEP_ARR;
+    if (speed_base < SPEED_SLOW_ARR - SPEED_STEP_ARR) {
+        speed_base += SPEED_STEP_ARR;
     } else {
-        speed_arr = SPEED_SLOW_ARR;
+        speed_base = SPEED_SLOW_ARR;
     }
     // 只在没起坡的时候直接写 ARR。运动中写下去等于把 current_arr 一步设成
     // 目标值，斜坡里那句「current_arr > speed_arr」当场变成假，下一拍就切
@@ -119,9 +203,7 @@ void StepMotor_SpeedDown(void)
     // （每 RAMP_SOFT_STEP_PULSE 个脉冲走 RAMP_SOFT_STEP_ARR）。
     // 降速这边只跳一档，本身不危险，但同理：直接写会把正在走的斜坡
     // 打断成 CRUISE，加速段白跑。走斜坡更平滑。
-    if (!ramp_on) {
-        StepMotor_SetFrequency(speed_arr);
-    }
+    StepMotor_SetSpeedTarget(speed_base);
 }
 
 // ---------- 初始化TIM3，产生四路PWM（频率可调，占空比50%） ----------
@@ -209,6 +291,13 @@ void StepMotor_SetDirection(uint8_t motor, uint8_t dir)
         case MOTOR4: port = M4_DIR_PORT; pin = M4_DIR_PIN; break;
         default: return;
     }
+    /* 记录方向变化。真正翻转了才置标志，同向写入不置 ——
+     * 见上面 StepMotor_DirSettleDelay 的说明。 */
+    if (s_last_dir[motor - 1] != dir) {
+        s_last_dir[motor - 1] = dir;
+        s_dir_changed = 1;
+    }
+
     GPIO_WriteBit(port, pin, dir ? Bit_SET : Bit_RESET);
 }
 
@@ -221,6 +310,20 @@ void StepMotor_SetPulse(uint8_t motor, uint32_t pulse)
     }
 
     uint16_t enableBit = GetCCER_EnableBit(motor);
+
+    /* 换向之后先等方向电平稳定，再开通道。
+     *
+     * 放在 SetPulse 而不是 SetDirection 里，是因为四个电机是"先全部设
+     * 方向、再逐个开通道"：只要第一个 SetPulse 等这一次，四个 DIR 就都
+     * 已经稳定了（它们的 WriteBit 都在几十纳秒内完成）。在 SetDirection
+     * 里等的话，一次转弯要等四遍，而且前三个的等待完全多余。
+     *
+     * 必须在 __disable_irq 之前 —— 这段是纯忙等，占了中断的话，
+     * 正在走的那几路会在这 10us 里少发几个脉冲。 */
+    if (s_dir_changed) {
+        StepMotor_DirSettleDelay();
+        s_dir_changed = 0;
+    }
 
     // SET / CNT / 通道使能必须一次写完，不能只锁最后那句 CCER 写。
     // TIM3 中断是「CNT++ >= SET 就关通道并把 SET 清零」，而 CNT 里上一段的
@@ -245,6 +348,65 @@ void StepMotor_SetPulse(uint8_t motor, uint32_t pulse)
 
     TIM3->CCER |= enableBit;
     __enable_irq();
+}
+
+// ---------- 查询当前运动的进度 ----------
+// 用 MOTOR1 作代表：四路总是同时启动、脉冲数只在每轮补偿时才有一两个的差别。
+// CNT 在 SetPulse 里被清零，所以它是"这一段"的进度，不是累计里程。
+uint32_t StepMotor_GetPulse(void)
+{
+    return Motor_PUL_CNT[0];
+}
+
+uint32_t StepMotor_GetTarget(void)
+{
+    return Motor_PUL_SET[0];
+}
+
+/* ---------- 运动中调整本段目标脉冲 ----------
+ * 见头文件里的说明。要点只有两条：
+ *   1) 不清 CNT —— 清了就是停机重来；
+ *   2) SET 不能压到 CNT 上 —— 中断的守卫是 CNT >= SET 就关通道，
+ *      那是"纠偏"变成"急停"。
+ * 整个读改写用 __disable_irq() 包住，和 SetPulse / Stop 保持同一套规矩。 */
+uint8_t StepMotor_AdjustTarget(uint8_t motor, int32_t delta)
+{
+    uint32_t set;
+    uint32_t cnt;
+    int32_t  next;
+
+    if (motor < MOTOR1 || motor > MOTOR4) {
+        return 1;
+    }
+
+    __disable_irq();
+
+    set = Motor_PUL_SET[motor-1];
+    cnt = Motor_PUL_CNT[motor-1];
+
+    /* 空闲；或者正在被遥控点动（无限行程），两种都不该被纠偏改目标 */
+    if (set == 0 || set == JOG_PULSE_INFINITE) {
+        __enable_irq();
+        return 1;
+    }
+
+    next = (int32_t)set + delta;
+
+    /* 至少留 1 个脉冲。CNT 是"已经发出的"，SET 必须比它大。 */
+    if (next <= (int32_t)cnt + 1) {
+        next = (int32_t)cnt + 1;
+    }
+
+    /* 不能顶到 JOG_PULSE_INFINITE，否则这一路会被当成"无限行程"，
+     * StopJog 之外再也没有东西能让它停。 */
+    if ((uint32_t)next >= JOG_PULSE_INFINITE) {
+        next = (int32_t)(JOG_PULSE_INFINITE - 1);
+    }
+
+    Motor_PUL_SET[motor-1] = (uint32_t)next;
+
+    __enable_irq();
+    return 0;
 }
 
 // ---------- 停止单个电机 ----------

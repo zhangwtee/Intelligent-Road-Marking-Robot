@@ -62,7 +62,7 @@ def test_close_cracks_makes_fragmented_line_selectable():
 
 def test_healthy_line_is_ok():
     """完好的线不能报要喷 —— 否则车一路狂喷。"""
-    need, reason = evaluate_line_quality(healthy())
+    need, level, reason = evaluate_line_quality(healthy())
     assert not need, f"完好的线被误报: {reason}"
     assert reason.startswith("OK"), reason
 
@@ -71,7 +71,7 @@ def test_broken_line_is_flagged():
     """断掉一整段 = Break。"""
     m = healthy()
     m[150:250, :] = 0
-    need, reason = evaluate_line_quality(m)
+    need, level, reason = evaluate_line_quality(m)
     assert need, f"断线没报: {reason}"
     assert reason.startswith("Break"), reason
 
@@ -81,7 +81,7 @@ def test_worn_line_is_flagged():
     m = healthy()
     for y in range(0, 400, 40):
         m[y:y + 20, :] = 0
-    need, reason = evaluate_line_quality(m)
+    need, level, reason = evaluate_line_quality(m)
     assert need, f"掉漆没报: {reason}"
 
 
@@ -95,7 +95,7 @@ def test_double_line_not_falsely_worn():
     m[:, 10:35] = 255      # 第一条
     m[:, 55:80] = 255      # 第二条，中间空 20px
 
-    need, reason = evaluate_line_quality(m)
+    need, level, reason = evaluate_line_quality(m)
     assert not need, f"健康的双黄线被误报: {reason}"
     assert cov_of(reason) > 0.9, f"中间空隙被算进没漆了: {reason}"
 

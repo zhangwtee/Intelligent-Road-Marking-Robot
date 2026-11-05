@@ -1,34 +1,52 @@
 #include "stm32f10x.h"                  // Device header
 #include <stdio.h>
 #include <stdarg.h>
+#include "uart_ring.h"
 
+/* --------------------------------------------------------------------------
+ * 两路串口的接收缓冲
+ *
+ * 原来是【一个字节变量 + 一个标志位】，中断写、主循环读，同时只能记住一个
+ * 字节。主循环一圈只有几十微秒，但 OLED 刷一屏（软件 I2C，80~100ms）、
+ * 舵机插值时都会停住；这期间到两个字节，第二个直接把第一个覆盖掉。
+ *
+ * 换成环形缓冲之后：
+ *   - 中断只做一件事：把字节塞进缓冲，立刻退出（不碰任何共享状态）
+ *   - 主循环批量取，一次能取走积压的全部字节
+ *   - 两路轮转取，不再"蓝牙优先"把上位机饿死（见 system.c 的 ProcessCommand）
+ *
+ * 具体为什么这样是线程安全的，见 uart_ring.h 顶部。
+ * -------------------------------------------------------------------------- */
+static UartRing rx1;    /* USART1 = 蓝牙（PA9/PA10） */
+static UartRing rx2;    /* USART2 = 树莓派（PA2/PA3） */
 
-	uint8_t Serial1_RxData;		//���崮�ڽ��յ����ݱ���
-  uint8_t Serial1_RxFlag;		//���崮�ڽ��յı�־λ����
 void Serial1_Init(void)
 {
-    /*����ʱ��*/
-    RCC_APB2PeriphClockCmd(RCC_APB2Periph_USART1, ENABLE);    // USART1ʱ����APB2��
-    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);     // GPIOAʱ��
+    /* 先清缓冲，再开中断 —— 反过来的话，开中断到清缓冲之间收到的字节会被抹掉 */
+    UartRing_Init(&rx1);
 
-    /*GPIO��ʼ��*/
+    /*开启时钟*/
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_USART1, ENABLE);    // USART1时钟在APB2上
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);     // GPIOA时钟
+
+    /*GPIO初始化*/
     GPIO_InitTypeDef GPIO_InitStructure;
-    
-    // PA9��ΪUSART1_TX���������������
+
+    // PA9作为USART1_TX（复用推挽输出）
     GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AF_PP;
     GPIO_InitStructure.GPIO_Pin = GPIO_Pin_9;                 // PA9
     GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
     GPIO_Init(GPIOA, &GPIO_InitStructure);
 
-    // PA10��ΪUSART1_RX���������룩
-    // �������룬���Ǹ��ա��Զˣ�����ģ�� / ��ݮ�ɣ�û�ϵ����û���ʱ��
-    // ���յ� RX �ű�������������ĸ���һ��Ͼ��ܺϳ�һ����ʼλ��HandleCmd
-    // �õ�һ�������ֽ���ִ�� ���� 'U' ��ǰ����'P' �ǿ�ʼ����λ��
-    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IPU;             // ��������
+    // PA10作为USART1_RX（浮空输入）
+    // 上拉输入，不是浮空。对端（蓝牙模块 / 树莓派）没上电或者没插的时候，
+    // 悬空的 RX 脚被电机和驱动器的干扰一耦合就能合成一个起始位，HandleCmd
+    // 拿到一个任意字节照执行 —— 'U' 是前进，'P' 是开始画车位。
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IPU;             // 上拉输入
     GPIO_InitStructure.GPIO_Pin = GPIO_Pin_10;                // PA10
     GPIO_Init(GPIOA, &GPIO_InitStructure);
 
-    /*USART��ʼ��*/
+    /*USART初始化*/
     USART_InitTypeDef USART_InitStructure;
     USART_InitStructure.USART_BaudRate = 9600;
     USART_InitStructure.USART_HardwareFlowControl = USART_HardwareFlowControl_None;
@@ -38,26 +56,27 @@ void Serial1_Init(void)
     USART_InitStructure.USART_WordLength = USART_WordLength_8b;
     USART_Init(USART1, &USART_InitStructure);                 // USART1
 
-    /*�ж�����*/
-    USART_ITConfig(USART1, USART_IT_RXNE, ENABLE);            // USART1�����ж�
+    /*中断配置*/
+    USART_ITConfig(USART1, USART_IT_RXNE, ENABLE);            // USART1接收中断
 
-    /*NVIC����*/
+    /*NVIC配置*/
     NVIC_PriorityGroupConfig(NVIC_PriorityGroup_2);
-    
+
     NVIC_InitTypeDef NVIC_InitStructure;
-    NVIC_InitStructure.NVIC_IRQChannel = USART1_IRQn;         // USART1�ж�ͨ��
+    NVIC_InitStructure.NVIC_IRQChannel = USART1_IRQn;         // USART1中断通道
     NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;
     NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 1;
     NVIC_InitStructure.NVIC_IRQChannelSubPriority = 1;
     NVIC_Init(&NVIC_InitStructure);
 
-    /*USARTʹ��*/
+    /*USART使能*/
     USART_Cmd(USART1, ENABLE);                                // USART1
 }
+
 void Serial1_SendByte(uint8_t Byte)
 {
-    USART_SendData(USART1, Byte);        // ��ΪUSART1
-    while (USART_GetFlagStatus(USART1, USART_FLAG_TXE) == RESET);  // ��ΪUSART1
+    USART_SendData(USART1, Byte);        // 改为USART1
+    while (USART_GetFlagStatus(USART1, USART_FLAG_TXE) == RESET);  // 改为USART1
 }
 
 uint32_t Serial1_Pow(uint32_t X, uint32_t Y)
@@ -80,70 +99,84 @@ void Serial1_SendNumber(uint32_t Number, uint8_t Length)
 }
 
 /**
-  * ��    ����ȡһ�����յ����ֽڣ���־λ������һ�����ԭ�ӣ�
-  * ��    ����out ������������
-  * �� �� ֵ��1 = ȡ���ˣ�0 = û�����ֽ�
+  * 函    数：取一个已收到的字节
+  * 参    数：out 用来带回数据
+  * 返 回 值：1 = 取到了，0 = 没有新字节
+  * 说    明：数据源从"一个变量 + 一个标志位"换成了环形缓冲。
+  *           原来必须在临界区里"读数据 + 清标志"打包，否则同一个字节会被
+  *           执行两次（'P' 画两次车位）；现在 Get 只挪一个读指针，
+  *           中断只挪一个写指针，两者互不覆盖，临界区自然就不需要了。
+  *           接口名不变，system.c 一行都不用改就能跑。
   */
 uint8_t Serial1_TakeRxData(uint8_t *out)
 {
-    uint8_t got = 0;
-    // ԭ������ GetRxFlag() + GetRxData() �����ε��ã��м���Ա���ϣ���־λ����
-    // 1 �������Ѿ�����һ���ֽڸǵ��� ���� ǰһ���ֽھ�Ĭ��ʧ����������־λ��û
-    // ���Ͼ��ȶ������ݣ�ͬһ���ֽڻᱻִ�����Σ�'P' �����γ�λ����
-    // ���߶�Ȧ���ٽ�������������ݺ����־һ�����ס�
-    __disable_irq();
-    if (Serial1_RxFlag) {
-        *out = Serial1_RxData;
-        Serial1_RxFlag = 0;
-        got = 1;
-    }
-    __enable_irq();
-    return got;
+    return UartRing_Get(&rx1, out);
 }
-void USART1_IRQHandler(void)  // ��ΪUSART1�жϴ�������
+
+/* 积压字节数，调试时看主循环有没有被卡住 */
+uint16_t Serial1_RxCount(void)
+{
+    return UartRing_Count(&rx1);
+}
+
+/* 因缓冲满而丢弃的字节数。正常运行时应该恒为 0 */
+uint16_t Serial1_RxOverflow(void)
+{
+    return UartRing_Overflow(&rx1);
+}
+
+/* 看第 offset 个待处理字节，不消费 —— 帧协议解析用，见 proto.c */
+uint8_t Serial1_Peek(uint16_t offset, uint8_t *out)
+{
+    return UartRing_Peek(&rx1, offset, out);
+}
+
+/* 丢弃 n 个字节。只有主循环改 tail，所以和 Get 一样不需要临界区 */
+void Serial1_Drop(uint16_t n)
+{
+    UartRing_Drop(&rx1, n);
+}
+
+void USART1_IRQHandler(void)  // 改为USART1中断处理函数
 {
     if (USART_GetITStatus(USART1, USART_IT_RXNE) == SET)  // USART1
     {
-        Serial1_RxData = USART_ReceiveData(USART1);         //USART1
-        Serial1_RxFlag = 1;
-        USART_ClearITPendingBit(USART1, USART_IT_RXNE);    // USART1
+        // 无条件读一次 DR：同时清 RXNE 和 ORE（溢出）。
+        // 不清 ORE 的话，一旦发生过一次溢出，RXNE 会被 ORE 顶住反复进中断，
+        // 主循环被饿死。所以这里必须"先读、再判断用不用"。
+        uint8_t b = (uint8_t)USART_ReceiveData(USART1);
+        UartRing_Put(&rx1, b);
     }
 }
 
 
- uint8_t Serial2_RxData;		//���崮�ڽ��յ����ݱ���
- uint8_t Serial2_RxFlag;		//���崮�ڽ��յı�־λ����
-
-/**
-  * ��    �������ڳ�ʼ��
-  * ��    ������
-  * �� �� ֵ����
-  */
 void Serial2_Init(void)
 {
-    /*����ʱ��*/
-    RCC_APB1PeriphClockCmd(RCC_APB1Periph_USART2, ENABLE);    
-    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);     
+    /* 先清缓冲，再开中断 */
+    UartRing_Init(&rx2);
 
-    /*GPIO��ʼ��*/
+    /*开启时钟*/
+    RCC_APB1PeriphClockCmd(RCC_APB1Periph_USART2, ENABLE);
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
+
+    /*GPIO初始化*/
     GPIO_InitTypeDef GPIO_InitStructure;
-    
-    // PA2��ΪUSART2_TX���������������
+
+    // PA2作为USART2_TX（复用推挽输出）
     GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AF_PP;
     GPIO_InitStructure.GPIO_Pin = GPIO_Pin_2;                 // PA2
     GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
     GPIO_Init(GPIOA, &GPIO_InitStructure);
 
-    // PA3��ΪUSART2_RX���������룩
-    // �������룬���Ǹ��ա��Զˣ�����ģ�� / ��ݮ�ɣ�û�ϵ����û���ʱ��
-    // ���յ� RX �ű�������������ĸ���һ��Ͼ��ܺϳ�һ����ʼλ��HandleCmd
-    // �õ�һ�������ֽ���ִ�� ���� 'U' ��ǰ����'P' �ǿ�ʼ����λ��
-    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IPU;             // ��������
+    // PA3作为USART2_RX（浮空输入）
+    // 上拉输入，不是浮空。对端（蓝牙模块 / 树莓派）没上电或者没插的时候，
+    // 悬空的 RX 脚被电机和驱动器的干扰一耦合就能合成一个起始位，HandleCmd
+    // 拿到一个任意字节照执行 —— 'U' 是前进，'P' 是开始画车位。
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IPU;             // 上拉输入
     GPIO_InitStructure.GPIO_Pin = GPIO_Pin_3;                 // PA3
-		//GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
     GPIO_Init(GPIOA, &GPIO_InitStructure);
 
-    /*USART��ʼ��*/
+    /*USART初始化*/
     USART_InitTypeDef USART_InitStructure;
     USART_InitStructure.USART_BaudRate = 9600;
     USART_InitStructure.USART_HardwareFlowControl = USART_HardwareFlowControl_None;
@@ -153,106 +186,109 @@ void Serial2_Init(void)
     USART_InitStructure.USART_WordLength = USART_WordLength_8b;
     USART_Init(USART2, &USART_InitStructure);                 // USART2
 
-    /*�ж�����*/
+    /*中断配置*/
     USART_ITConfig(USART2, USART_IT_RXNE, ENABLE);            //USART2
 
-    /*NVIC����*/
+    /*NVIC配置*/
     NVIC_PriorityGroupConfig(NVIC_PriorityGroup_2);
-    
+
     NVIC_InitTypeDef NVIC_InitStructure;
-    NVIC_InitStructure.NVIC_IRQChannel = USART2_IRQn;         // USART2�ж�ͨ��
+    NVIC_InitStructure.NVIC_IRQChannel = USART2_IRQn;         // USART2中断通道
     NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;
     NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 1;
     NVIC_InitStructure.NVIC_IRQChannelSubPriority = 1;
     NVIC_Init(&NVIC_InitStructure);
 
-    /*USARTʹ��*/
+    /*USART使能*/
     USART_Cmd(USART2, ENABLE);                                // USART2
 }
+
 /**
-  * ��    �������ڷ���һ���ֽ�
-  * ��    ����Byte Ҫ���͵�һ���ֽ�
-  * �� �� ֵ����
+  * 函    数：串口发送一个字节
+  * 参    数：Byte 要发送的一个字节
+  * 返 回 值：无
   */
 void Serial2_SendByte(uint8_t Byte)
 {
-	USART_SendData(USART2, Byte);		//���ֽ�����д�����ݼĴ�����д���USART�Զ�����ʱ����
-	while (USART_GetFlagStatus(USART2, USART_FLAG_TXE) == RESET);	//�ȴ��������
-	/*�´�д�����ݼĴ������Զ����������ɱ�־λ���ʴ�ѭ�������������־λ*/
+	USART_SendData(USART2, Byte);		//将字节数据写入数据寄存器，写入后USART自动生成时序波形
+	while (USART_GetFlagStatus(USART2, USART_FLAG_TXE) == RESET);	//等待发送完成
+	/*下次写入数据寄存器会自动清除发送完成标志位，故此循环后，无需清除标志位*/
 }
 
-
-
-
 /**
-  * ��    �����η��������ڲ�ʹ�ã�
-  * �� �� ֵ������ֵ����X��Y�η�
+  * 函    数：次方函数（内部使用）
+  * 返 回 值：返回值等于X的Y次方
   */
 uint32_t Serial2_Pow(uint32_t X, uint32_t Y)
 {
-	uint32_t Result = 1;	//���ý����ֵΪ1
-	while (Y --)			//ִ��Y��
+	uint32_t Result = 1;	//设置结果初值为1
+	while (Y --)			//执行Y次
 	{
-		Result *= X;		//��X�۳˵����
+		Result *= X;		//将X累乘到结果
 	}
 	return Result;
 }
 
 /**
-  * ��    �������ڷ�������
-  * ��    ����Number Ҫ���͵����֣���Χ��0~4294967295
-  * ��    ����Length Ҫ�������ֵĳ��ȣ���Χ��0~10
-  * �� �� ֵ����
+  * 函    数：串口发送数字
+  * 参    数：Number 要发送的数字，范围：0~4294967295
+  * 参    数：Length 要发送数字的长度，范围：0~10
+  * 返 回 值：无
   */
 void Serial2_SendNumber(uint32_t Number, uint8_t Length)
 {
 	uint8_t i;
-	for (i = 0; i < Length; i ++)		//�������ֳ��ȱ������ֵ�ÿһλ
+	for (i = 0; i < Length; i ++)		//根据数字长度遍历数字的每一位
 	{
-		Serial2_SendByte(Number / Serial2_Pow(10, Length - i - 1) % 10 + '0');	//���ε���Serial_SendByte����ÿλ����
+		Serial2_SendByte(Number / Serial2_Pow(10, Length - i - 1) % 10 + '0');	//依次调用Serial_SendByte发送每位数字
 	}
 }
 
-
-
 /**
-  * ��    ����ȡһ�����յ����ֽڣ���־λ������һ�����ԭ�ӣ�
-  * ��    ����out ������������
-  * �� �� ֵ��1 = ȡ���ˣ�0 = û�����ֽ�
+  * 函    数：取一个已收到的字节
+  * 参    数：out 用来带回数据
+  * 返 回 值：1 = 取到了，0 = 没有新字节
+  * 说    明：与 Serial1_TakeRxData 同构，见上面的说明。
   */
 uint8_t Serial2_TakeRxData(uint8_t *out)
 {
-    uint8_t got = 0;
-    // ԭ������ GetRxFlag() + GetRxData() �����ε��ã��м���Ա���ϣ���־λ����
-    // 1 �������Ѿ�����һ���ֽڸǵ��� ���� ǰһ���ֽھ�Ĭ��ʧ����������־λ��û
-    // ���Ͼ��ȶ������ݣ�ͬһ���ֽڻᱻִ�����Σ�'P' �����γ�λ����
-    // ���߶�Ȧ���ٽ�������������ݺ����־һ�����ס�
-    __disable_irq();
-    if (Serial2_RxFlag) {
-        *out = Serial2_RxData;
-        Serial2_RxFlag = 0;
-        got = 1;
-    }
-    __enable_irq();
-    return got;
+    return UartRing_Get(&rx2, out);
 }
+
+uint16_t Serial2_RxCount(void)
+{
+    return UartRing_Count(&rx2);
+}
+
+uint16_t Serial2_RxOverflow(void)
+{
+    return UartRing_Overflow(&rx2);
+}
+
+uint8_t Serial2_Peek(uint16_t offset, uint8_t *out)
+{
+    return UartRing_Peek(&rx2, offset, out);
+}
+
+void Serial2_Drop(uint16_t n)
+{
+    UartRing_Drop(&rx2, n);
+}
+
 /**
-  * ��    ����USART2�жϺ���
-  * ��    ������
-  * �� �� ֵ����
-  * ע������˺���Ϊ�жϺ�����������ã��жϴ������Զ�ִ��
-  *           ������ΪԤ����ָ�����ƣ����Դ������ļ�����
-  *           ��ȷ����������ȷ���������κβ��죬�����жϺ��������ܽ���
+  * 函    数：USART2中断函数
+  * 参    数：无
+  * 返 回 值：无
+  * 注意事项：此函数为中断函数，无需调用，中断触发后自动执行
+  *           函数名为预留的指定名称，可以从启动文件复制
+  *           请确保函数名正确，不能有任何差异，否则中断函数将不能进入
   */
 void USART2_IRQHandler(void)
 {
-	if (USART_GetITStatus(USART2, USART_IT_RXNE) == SET)		//�ж��Ƿ���USART2�Ľ����¼��������ж�
+	if (USART_GetITStatus(USART2, USART_IT_RXNE) == SET)		//判断是否是USART2的接收事件触发的中断
 	{
-		Serial2_RxData = USART_ReceiveData(USART2);				//��ȡ���ݼĴ���������ڽ��յ����ݱ���
-		Serial2_RxFlag = 1;										//�ý��ձ�־λ����Ϊ1
-		USART_ClearITPendingBit(USART2, USART_IT_RXNE);			//���USART2��RXNE��־λ
-																//��ȡ���ݼĴ������Զ�����˱�־λ
-																//����Ѿ���ȡ�����ݼĴ�����Ҳ���Բ�ִ�д˴���
+		// 无条件读一次 DR：同时清 RXNE 和 ORE，理由同 USART1。
+		uint8_t b = (uint8_t)USART_ReceiveData(USART2);
+		UartRing_Put(&rx2, b);
 	}
 }
-

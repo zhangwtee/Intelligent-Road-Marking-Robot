@@ -56,8 +56,11 @@ class SerialManager(QObject):
 
                 if self.ser:
 
-                    # 尽量保持帧完整
-                    data = self.ser.read(1024)
+                    # read(1024) 会在 timeout 模式下「等到收满 1024 字节或超时」
+                    # 才返回。下位机一次只回 1~10 个字节，永远凑不满 1024，
+                    # 于是每次都要等足 100ms —— 100ms 就是接收延迟的硬上限。
+                    # 有积压就只读积压量，没有就阻塞等 1 个字节。
+                    data = self.ser.read(self.ser.in_waiting or 1)
 
                     if data:
 
@@ -74,11 +77,18 @@ class SerialManager(QObject):
     # ================= 发送 =================
     def send(self, data: bytes):
 
+        # 串口没开（或已断开）时，原来这里 if self.ser 为假就直接返回，
+        # 不 emit 任何东西 —— 用户按了按钮、日志写着「已发送」，车一动不动，
+        # 而且没有任何提示。静默失败比报错更难查，所以这条必须走 error_signal。
+        if not self.ser:
+            self.error_signal.emit("串口未打开，发送被丢弃")
+            print("[串口] 未打开，丢弃发送:", data)
+            return
+
         try:
 
-            if self.ser:
-                self.ser.write(data)
-                print("[发送]", data)
+            self.ser.write(data)
+            print("[发送]", data)
 
         except Exception as e:
 
