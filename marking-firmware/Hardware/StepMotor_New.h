@@ -102,6 +102,13 @@ void     StepMotor_SetSpeedTarget(uint16_t arr);
 void     StepMotor_RestoreSpeed(void);
 uint16_t StepMotor_GetSpeedTarget(void);
 
+/* 用户档位（speed_base），即"没被转弯临时限速覆盖的那个"。
+ *
+ * 差速算同步 ARR 时必须以它为基准：上一段如果是原地转，四路 ARR 已经被
+ * 压到 CHASSIS_TURN_ARR，拿 GetSpeedTarget() 当基准的话，下一段直线的
+ * 速度会被转弯的限速污染，越转越慢。 */
+uint16_t StepMotor_GetSpeedBase(void);
+
 /* ---------- 分路设速度：四路独立之后才有的能力 ----------
  *
  * SetSpeedLR   左右两组分开设。差速转弯用它：内侧 ARR 调大（变慢），
@@ -111,7 +118,9 @@ uint16_t StepMotor_GetSpeedTarget(void);
  * SetSpeedOf   单路设。四轮各自补轮径时用（差速模式下同侧两轮必须同速，
  *              这个只在麦轮或特殊标定时才调）。
  *
- * 两者都不动用户档位（speed_base），SetSpeedTarget / RestoreSpeed 会覆盖它们。 */
+ * 两者都不动用户档位（speed_base），SetSpeedTarget / RestoreSpeed 会覆盖它们。
+ * 注意 SetSpeedLR 会把"当前档位"（speed_arr）记成左组的值：左右不同速时
+ * GetSpeedTarget() 没有唯一答案，它只用于界面上显示"大概多快"。 */
 void     StepMotor_SetSpeedLR(uint16_t left_arr, uint16_t right_arr);
 void     StepMotor_SetSpeedOf(uint8_t motor, uint16_t arr);
 uint16_t StepMotor_GetSpeedOf(uint8_t motor);
@@ -123,6 +132,16 @@ uint16_t StepMotor_GetSpeedOf(uint8_t motor);
 uint32_t StepMotor_GetPulse(void);
 uint32_t StepMotor_GetTarget(void);
 uint32_t StepMotor_GetPulseOf(uint8_t motor);
+
+/* 本段还剩多少脉冲（可能为负 —— 纠偏把目标减到"已经走过头"时，
+ * 中断会尽快收尾，不是错误）。
+ *
+ * 给 motion 层算左右同步比例用：段首按总脉冲算好的 ARR 比例，在段中间
+ * 被 Motion_Trim 改过目标之后就过期了，必须按"剩余"重算，否则一次纠偏
+ * 就把同步打回"一侧先停"。
+ *
+ * 遥控点动（无限行程）返回 0x7FFFFFFF，调用方按"忽律比例"处理。 */
+int32_t  StepMotor_GetRemainOf(uint8_t motor);
 
 /* ---------- 运动中调整本段目标脉冲（不清进度） ----------
  *

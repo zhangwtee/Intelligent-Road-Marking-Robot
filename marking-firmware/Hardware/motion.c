@@ -24,6 +24,15 @@
 #define MOTION_TRIM_SIGN     1
 #endif
 
+/* 段内重新同步的最小剩余行程（脉冲）。约 40mm。
+ *
+ * 低于这个数就别重算 ARR 了：剩余脉冲太小的时候，"按比例分速度"算出来
+ * 的比值完全被量化噪声主导（剩 12 个对 7 个就是 1.7 倍，而真实比例未必），
+ * 而那点行程改不改都听不出来。 */
+#ifndef MOTION_SYNC_MIN_REMAIN
+#define MOTION_SYNC_MIN_REMAIN   200
+#endif
+
 /* ---------- 预计算系数 ----------
  * F103 没有 FPU，float 乘除都是软件模拟。运行时的除法一次要几十微秒，
  * 放在状态机里会造成脉冲启停延迟。所以这里全部在 Init 时算完，
@@ -101,6 +110,111 @@ float Motion_PulseToDeg(uint32_t pulse)
     return (float)pulse / s_pulse_per_deg;
 }
 
+/* ---------- 左右同步：按脉冲比例算两组 ARR ----------
+ *
+ * 两组同频时，脉冲多的一侧要跑更久。那一侧跑完之前，另一侧已经停了 ——
+ * 剩下的路程只有单侧在推，车头方向在这一段里持续偏，段与段接起来就是
+ * 一条弯的线（拐角处线跑偏、原地转有"拖一下"的感觉）。
+ *
+ * 以前四路脉冲共用 TIM3 的一个 ARR，物理上做不到"两边不同频"；
+ * 现在每路一个时基，只要让两边同时到达就行：
+ *
+ *     t = 脉冲数 x ARR / 时钟        （ARR 参数即一个周期的计数个数，
+ *                                     写进寄存器的是 ARR-1，见 Motor_ApplyArr）
+ *     令 t_left == t_right：
+ *     p_left x ARR_left == p_right x ARR_right
+ *
+ * 所以 ARR 与脉冲数成反比 —— 脉冲少的一侧 ARR 按同样比例放大，
+ * 两边就走完在同一时刻，而且**段的时长完全不变**（仍是脉冲多的一侧
+ * 在用户档位下走完的时间）。
+ *
+ * 取脉冲多的一侧用用户档位 base，另一侧按比例放大 ARR（变慢）。
+ * 段的**总时长不变** —— 仍然等于"脉冲多的一侧在用户档位下走完"的时间，
+ * 变的只是脉冲少的一侧不再提前停下。所以这个改动不会让整段更慢。
+ *
+ * 两个边界：
+ *   1. 比例算出来的 ARR 会被底层夹到 [SPEED_FAST_ARR, SPEED_SLOW_ARR]。
+ *      超出时同步不完整（仍比不同步好），但不会失控。
+ *   2. 用户档位本身如果接近最慢档（1500），稍有一点比例差就会顶到夹位。
+ *      现场调速度时别把档位一直按到最慢，转弯时没有余量可让。
+ */
+/* base x num / den，四舍五入，饱和到 0xFFFF。
+ *
+ * 为什么中间用 64 位：左右比例极端时（一边 40 万脉冲、另一边几十个），
+ * base x num 会超出 32 位。这里的结果其实只用来当 ARR，最终会被
+ * StepMotor 层夹到 SPEED_SLOW_ARR（1500），所以宁可粗糙也不能回绕 ——
+ * 回绕出来的 ARR 会让那一侧瞬间全速，而这一拍正在走。
+ *
+ * den 为 0 的情况在调用点已经排除，这里再挡一次，省得以后改调用点踩坑。 */
+#if CHASSIS_SYNC_ARR
+static uint32_t RatioArr(uint32_t base, uint32_t num, uint32_t den)
+{
+    uint64_t v;
+
+    if (den == 0) {
+        return base;
+    }
+
+    v = ((uint64_t)base * num + den / 2) / den;
+    if (v > 0xFFFFu) {
+        v = 0xFFFFu;
+    }
+    return (uint32_t)v;
+}
+#endif /* CHASSIS_SYNC_ARR —— 关掉同步时连这个函数都不编，否则会有
+        * "static function declared but never used" 的警告 */
+
+static void DriveSyncArr(uint32_t pl, uint32_t pr)
+{
+#if CHASSIS_SYNC_ARR
+    uint32_t base;
+    uint32_t hi;
+    uint32_t diff;
+    uint32_t permille;
+    uint32_t al;
+    uint32_t ar;
+
+    if (pl == 0 || pr == 0) {
+        StepMotor_RestoreSpeed();
+        return;
+    }
+
+    /* 基准必须是用户档位，不能用 GetSpeedTarget：上一段可能是原地转，
+     * 那个值已经被压到 CHASSIS_TURN_ARR 了，拿它当基准会越转越慢。 */
+    base = StepMotor_GetSpeedBase();
+
+    hi       = (pl > pr) ? pl : pr;
+    diff     = (pl > pr) ? (pl - pr) : (pr - pl);
+    permille = (uint32_t)(((uint64_t)diff * 1000u) / hi);
+
+    /* 差得很少就当一样。ARR 是整数，为 0.x% 去改写寄存器没有意义；
+     * 而 DriveLR 被视觉伺服每 200mm 调一次，段段都写会有一拍不稳。 */
+    if (permille <= CHASSIS_SYNC_DEADBAND_PM) {
+        StepMotor_RestoreSpeed();      /* 内部会判断"本来就在 base"直接返回 */
+        return;
+    }
+
+    /* ARR 与脉冲数反比：脉冲多的一侧保持用户档位，少的一侧按同样倍数放大。
+     * base x pl / pr 一步算到位（等价于 base + base x diff / pr，但没有
+     * 中间那次加法，也就少一次溢出机会）。 */
+    if (pl > pr) {
+        al = base;
+        ar = RatioArr(base, pl, pr);
+    } else {
+        ar = base;
+        al = RatioArr(base, pr, pl);
+    }
+
+    StepMotor_SetSpeedLR((uint16_t)al, (uint16_t)ar);
+#else
+    /* 关掉同步：两组同频，脉冲少的一侧先停。这是改造前的行为，
+     * 留在这里只为了现场对比，不要当成"更简单所以更好"。 */
+    (void)pl;
+    (void)pr;
+    StepMotor_RestoreSpeed();
+#endif
+}
+
 /* ---------- 四轮驱动（内部） ----------
  * pulse 用 uint32_t 直接传给 SetPulse，绕开 GoForward 的 uint16_t 上限，
  * 这样超过 12.9 米的行程也不会被截断。
@@ -118,16 +232,23 @@ static void DriveAll(uint8_t forward, uint32_t p1, uint32_t p2,
      * 跟着归零 —— 这正是"每段重设而不是全程一次"能把误差锁在段内的原因。 */
     s_trim_accum = 0;
 
-    /* 上一段可能是原地转，差速车在转弯时把速度压到了 CHASSIS_TURN_ARR。
-     * 走直线必须回到用户档位，否则车会一直慢下去而界面上完全看不出来。
-     * 放在这里而不是转弯结束时恢复：转弯结束那一刻正在转，恢复会当场
-     * 加速；等下一个直线段的开头再恢复，时间点才是对的。 */
-    StepMotor_RestoreSpeed();
-
     StepMotor_SetDirection(MOTOR1, forward ? M1_FWD : M1_REV);
     StepMotor_SetDirection(MOTOR2, forward ? M2_FWD : M2_REV);
     StepMotor_SetDirection(MOTOR3, forward ? M3_FWD : M3_REV);
     StepMotor_SetDirection(MOTOR4, forward ? M4_FWD : M4_REV);
+
+    /* 两组 ARR：多数情况下左右脉冲相同（直线），这里等同原来的
+     * StepMotor_RestoreSpeed —— 它既负责"转弯之后回到用户档位"，也负责
+     * 在左右真不一样时把两侧拉成同时到达。
+     *
+     * 两个作用合到一处是因为它们的前提相同：都要求"以用户档位为基准"。
+     * 分开写的话，恢复档位和同步比例会各写一次寄存器，中间那一下
+     * 就是一次无意义的频率扰动。
+     *
+     * 组代表取 M1 / M2：差速车的 k 系数本来就把左右两组的组内差抹平了
+     * （见 chassis.h），麦轮四路虽然各不相同，但相差不到 1%，而且麦轮
+     * 能横滑吸收，不值得为它把 SetSpeedLR 扩成四路接口。 */
+    DriveSyncArr(p1, p2);
 
     StepMotor_SetPulse(MOTOR1, p1);
     StepMotor_SetPulse(MOTOR2, p2);
@@ -232,10 +353,10 @@ void Motion_TurnRight(float deg)
     }
 
     /* 转弯同样不做软起软停。
-     * 理由和 DriveLR 一样：斜坡改的是全局 ARR，转弯时四路一起变，而
-     * 四路的目标脉冲是相等的 —— 起坡不影响左右关系，但会让"转 90 度"
-     * 的实际角速度前后不一致（起步慢、中段快），画车位时角速度不均
-     * 会让喷头在拐角处堆积。匀速拧过去更可控。 */
+     * 理由和 DriveLR 一样：斜坡每 100 个脉冲改一档 ARR，四路一起变，而
+     * 四路的目标脉冲是相等的（绕车体中心转，四轮弧长相同）—— 起坡不影响
+     * 左右关系，但会让"转 90 度"的实际角速度前后不一致（起步慢、中段快），
+     * 画车位时角速度不均会让喷头在拐角处堆积。匀速拧过去更可控。 */
     StepMotor_SetRampEnabled(0);
 
     StepMotor_SetPulse(MOTOR1, p);
@@ -305,6 +426,24 @@ uint8_t Motion_Trim(float delta_mm)
     if (StepMotor_AdjustTarget(MOTOR2, -half) == 0) { moved = 1; }   /* 右前少走 */
     if (StepMotor_AdjustTarget(MOTOR4, -half) == 0) { moved = 1; }   /* 右后少走 */
 
+    /* 目标改过之后，"两侧同时到达"就失效了 —— 按剩余脉冲重算一次 ARR。
+     *
+     * 不重算的话：段首在 DriveAll / DriveLR 里同步好的比例，被第一次
+     * Trim 打回"一侧先停"，而且越来越偏。5 米的直线段每 100mm 纠一次，
+     * 一路纠下来等于段首那次同步白做了。
+     *
+     * 这一步改的是 ARR，不是脉冲数——纠偏该转多少度只由左右行程差决定，
+     * 与是否同时到达无关。所以重算 ARR 不会改变纠偏量，只改变走出来的
+     * 形状（折线变圆弧）。 */
+    {
+        int32_t r1 = StepMotor_GetRemainOf(MOTOR1);
+        int32_t r2 = StepMotor_GetRemainOf(MOTOR2);
+
+        if (r1 >= MOTION_SYNC_MIN_REMAIN && r2 >= MOTION_SYNC_MIN_REMAIN) {
+            DriveSyncArr((uint32_t)r1, (uint32_t)r2);
+        }
+    }
+
     return moved;
 }
 
@@ -312,6 +451,10 @@ void Motion_DriveLR(float left_mm, float right_mm, uint8_t forward)
 {
     uint32_t pl;
     uint32_t pr;
+    uint32_t p1;
+    uint32_t p2;
+    uint32_t p3;
+    uint32_t p4;
 
     if (!s_ready) {
         return;
@@ -324,13 +467,23 @@ void Motion_DriveLR(float left_mm, float right_mm, uint8_t forward)
     if (pl == 0) { pl = 1; }
     if (pr == 0) { pr = 1; }
 
+    /* 轮径补偿先乘进来，后面算同步比例要用"真正发出去的脉冲数"。
+     * 用左右指令值算的话，k 系数带来的那点差会被漏掉 —— 虽然现在只差
+     * 百分之几，但同步的全部意义就是把差抹平，从源头就用错数没必要。 */
+    p1 = (uint32_t)((float)pl * s_k[0] + 0.5f);
+    p3 = (uint32_t)((float)pl * s_k[2] + 0.5f);
+    p2 = (uint32_t)((float)pr * s_k[1] + 0.5f);
+    p4 = (uint32_t)((float)pr * s_k[3] + 0.5f);
+
+    if (p1 == 0) { p1 = 1; }
+    if (p3 == 0) { p3 = 1; }
+    if (p2 == 0) { p2 = 1; }
+    if (p4 == 0) { p4 = 1; }
+
     /* 新的一段开始：累计纠偏归零。这是"每 5 米重新对齐一次"的落点 ——
      * 不归零的话，跨段累计迟早撞上 MOTION_TRIM_ACCUM_MAX_MM，
      * 然后整条线后半段都纠不动了，而日志里只有一串 ERR_RANGE。 */
     s_trim_accum = 0;
-
-    /* 同 DriveAll：直线段开头一定回到用户档位。 */
-    StepMotor_RestoreSpeed();
 
     StepMotor_SetDirection(MOTOR1, forward ? M1_FWD : M1_REV);
     StepMotor_SetDirection(MOTOR3, forward ? M3_FWD : M3_REV);
@@ -342,13 +495,28 @@ void Motion_DriveLR(float left_mm, float right_mm, uint8_t forward)
      * 间隙。每段都起一次坡的话，速度在 555Hz 和 3.3kHz 之间来回跳，
      * 画出来的线忽粗忽细，而且分段越多越明显 —— 纠偏反而把线画坏了。
      *
-     * 斜坡是给"人按一下走一段"的单次指令准备的，不是给伺服用的。 */
+     * 斜坡是给"人按一下走一段"的单次指令准备的，不是给伺服用的。
+     *
+     * 先关斜坡、再定 ARR，这个顺序不能反：StepMotor_SetSpeedLR 在
+     * 某一路的 ramp_on 为真时只记下目标值不写寄存器（那是为了让斜坡
+     * 自己一档档走过去）。虽然段与段首尾相接时 ramp_on 恒为 0，
+     * 但没有理由让正确性依赖那个前提。 */
     StepMotor_SetRampEnabled(0);
 
-    StepMotor_SetPulse(MOTOR1, (uint32_t)((float)pl * s_k[0] + 0.5f));
-    StepMotor_SetPulse(MOTOR3, (uint32_t)((float)pl * s_k[2] + 0.5f));
-    StepMotor_SetPulse(MOTOR2, (uint32_t)((float)pr * s_k[1] + 0.5f));
-    StepMotor_SetPulse(MOTOR4, (uint32_t)((float)pr * s_k[3] + 0.5f));
+    /* 左右不同距离时两组分开定 ARR，让两侧同时到达 —— 这是 DriveLR
+     * 和 DriveAll 唯一实质的差别。差速转弯（一边 1000mm 一边 500mm）
+     * 以前是内侧走一半就停、外侧单独推着车头拐，走出来是折线；
+     * 现在是全程按 1:2 的速度比走一条圆弧，两者行程差一样，转向角一样，
+     * 但路径形状和车头的角速度都平顺了。
+     *
+     * 注意组代表取 p1 / p2，也就是 M1 / M2。差速车的 s_k 保证同组两个
+     * 轮子的 k 相同，所以 p1 == p3、p2 == p4，取哪个都一样。 */
+    DriveSyncArr(p1, p2);
+
+    StepMotor_SetPulse(MOTOR1, p1);
+    StepMotor_SetPulse(MOTOR3, p3);
+    StepMotor_SetPulse(MOTOR2, p2);
+    StepMotor_SetPulse(MOTOR4, p4);
 
     StepMotor_SetRampEnabled(1);
 }

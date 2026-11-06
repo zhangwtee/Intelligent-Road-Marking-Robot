@@ -253,6 +253,16 @@ uint16_t StepMotor_GetSpeedTarget(void)
     return speed_arr;
 }
 
+/* 用户档位。和 GetSpeedTarget 的区别：
+ *   GetSpeedTarget 是"现在实际在跑多快"，转弯时会被压到 CHASSIS_TURN_ARR；
+ *   GetSpeedBase   是"用户用 +/- 选的那个档"，转弯不影响它。
+ * motion 层算左右同步比例必须以 base 为基准，否则转一次弯之后
+ * 下一段直线的基准就跟着变慢了，而且一次比一次慢。 */
+uint16_t StepMotor_GetSpeedBase(void)
+{
+    return speed_base;
+}
+
 /* ---------- 开关斜坡：包在运动调用外面用，用完立刻恢复 ---------- */
 void StepMotor_SetRampEnabled(uint8_t en)
 {
@@ -525,6 +535,30 @@ uint32_t StepMotor_GetPulseOf(uint8_t motor)
         return 0;
     }
     return s_m[motor - 1].cnt;
+}
+
+/* 本段剩余脉冲 = SET - CNT。
+ *
+ * 可以为负：Motion_Trim 把目标往下调的时候，如果已经走过头，下一拍中断
+ * 就会收尾。这不是错误，调用方自己决定负值怎么处理（motion 层碰到
+ * 非正数就跳过同步）。
+ *
+ * SET 与 CNT 在这里分两次读，中间可能被中断改一次 —— 差一个脉冲对
+ * "按比例分速度"毫无影响，不值得为它关中断。
+ */
+int32_t StepMotor_GetRemainOf(uint8_t motor)
+{
+    MotorCh_t *m;
+
+    if (motor < MOTOR1 || motor > MOTOR4) {
+        return 0;
+    }
+    m = &s_m[motor - 1];
+
+    if (m->set == JOG_PULSE_INFINITE || m->set > 0x7FFFFFFFu) {
+        return 0x7FFFFFFF;
+    }
+    return (int32_t)m->set - (int32_t)m->cnt;
 }
 
 /* ---------- 运动中调整本段目标脉冲 ----------
