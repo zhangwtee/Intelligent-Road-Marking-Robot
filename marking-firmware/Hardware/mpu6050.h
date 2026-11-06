@@ -7,7 +7,7 @@
  * MPU6050 陀螺仪驱动（软件 I2C，只用陀螺仪部分）
  *
  * 引脚：PB10 = SCL，PB11 = SDA
- *   电机占 PA6/PA7/PB0/PB1 和四个 DIR，舵机占 PB6/PB7，OLED 占 PB8/PB9，
+ *   电机占 PA6/PA0/PA1/PC6 和四个 DIR，舵机占 PB6/PB7，OLED 占 PB8/PB9，
  *   串口占 PA2/PA3/PA9/PA10，泵和蜂鸣器占 PB13/PB14，心跳灯占 PB15。
  *   从 C8T6 换到 ZET6 之后，PB10/PB11 仍然可用（是 I2C2 的 SCL/SDA），
  *   所以这次驱动一行都没改。要挪到别的脚，只改下面四个宏。
