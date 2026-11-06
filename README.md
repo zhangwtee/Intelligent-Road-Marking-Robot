@@ -80,11 +80,18 @@ UV4.exe -b Project.uvprojx -t "4WD_Car" -j0 -o build_4wd.log
 | 原地转速度 | 用当前档位 | 压到 `CHASSIS_TURN_ARR`（≈220mm/s） |
 | 转角补偿 | 1.000 | 1.050（现场量了再改） |
 | 段内纠偏累计上限 | 200mm | 80mm |
-| 固件体积 | Code = 19942 | Code = 19654 |
+| 固件体积 | Code = 20862 | Code = 20574 |
 
-上面这行体积是 `v1.0-c8` 时用 fromelf 量的。后来 `StepMotor` 拆成四路独立时基、
-`motion.c` 又加了同步逻辑，数字已经变了，别再拿它当基准 —— 要核对条件编译是否
-生效，看符号表（`Motion_MoveLeft` 在 4WD 里是否存在）比看体积可靠。
+体积是 ZET6 版（四路独立时基 + 左右同步之后）用 Keil 命令行实测的，两套都
+`0 Error(s), 0 Warning(s)`。差值 288 字节就是横移那两个函数，和换板前一样 ——
+说明同步逻辑是两边共用的，没有偷偷把麦轮的东西编进差速版。
+
+要确认条件编译生效，看符号表比看体积可靠：
+
+```bash
+fromelf --text -s Objects/4WD/Marking_4WD.axf | grep Motion_MoveLeft   # 空
+fromelf --text -s Objects/Mec/Marking_Mec.axf  | grep Motion_MoveLeft   # 有，116 字节
+```
 
 差速版为什么要“组内强制相同”的轮径系数：普通橡胶轮横向不能滑移，同一侧
 前后轮只要有一点行程差，多出来的部分只能靠某个轮子打滑消化，而哪个先打滑

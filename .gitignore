@@ -33,3 +33,5 @@ Desktop.ini
 venv/
 __pycache__/
 *.pyc
+# 命令行编译日志（README 里的 UV4 -b 示例会产生）
+build_*.log
