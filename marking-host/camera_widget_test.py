@@ -241,6 +241,49 @@ def test_respray_level_becomes_millimetres():
     assert mm == 600, mm
 
 
+def test_respray_waits_until_firmware_is_idle():
+    """固件还在跑上一段时不许发新的补喷帧 —— 节拍看状态，不看秒表。
+
+    以前用固定 2 秒间隔猜"上一段跑完没有"，而 1m 的补喷段在默认速度下要
+    2~3 秒。下一帧正好落在 STATE_RESPRAY 里，被固件回 ERR_STATE 丢掉：
+    日志里只是一个结果码 0x01，车实际少喷一段，什么都不报。
+    """
+    s = FakeSerial()
+    w = camera_widget.CameraWidget(serial_mgr=s, mode="respray")
+
+    w.on_status("C")                       # 正在补喷，1m 还没走完
+    w.last_spray = 0.0                     # 排除最小间隔的干扰
+    w.maybe_send_respray(2)
+    assert frames_of(s, frame.CMD_RESPRAY) == [], "固件还在跑就发了下一帧"
+
+    w.on_status("W")                       # 走完，回到空闲
+    w.maybe_send_respray(2)
+    assert len(frames_of(s, frame.CMD_RESPRAY)) == 1, "空闲了却没发"
+
+
+def test_respray_respects_minimum_interval():
+    """空闲也不能连喷：状态帧 5Hz，不限速就一停发好几帧，漆堆在同一处。"""
+    s = FakeSerial()
+    w = camera_widget.CameraWidget(serial_mgr=s, mode="respray")
+
+    w.on_status("W")
+    w.last_spray = 0.0
+    w.maybe_send_respray(2)
+    w.maybe_send_respray(2)                # 紧接着再来一次
+    assert len(frames_of(s, frame.CMD_RESPRAY)) == 1
+
+
+def test_respray_still_sends_without_status_frames():
+    """一帧回执都没收到时不能彻底不动 —— 退回"只看最小间隔"。"""
+    s = FakeSerial()
+    w = camera_widget.CameraWidget(serial_mgr=s, mode="respray")
+    assert w._fw_state == "?", "刚建出来应当是未知，不是 W"
+
+    w.last_spray = 0.0
+    w.maybe_send_respray(1)
+    assert len(frames_of(s, frame.CMD_RESPRAY)) == 1
+
+
 # ================================================================ 只读
 def test_view_mode_sends_nothing():
     """只是取景（画车位那个窗口）时一个字节都不该发。"""

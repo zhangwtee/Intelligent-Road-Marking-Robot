@@ -317,9 +317,9 @@ CRC 用标准校验值 `crc8(b"123456789") == 0xF4` 双向锚定 —— 不是�
 
 点 `二次喷涂` 开一个 `MODE_RESPRAY` 窗口，检测到破损就发一帧 `RESPRAY`，参数是按缺口大小换算的毫米数（档位 1~5 → 200~1000mm）。
 
-- 一次只发一帧，间隔不小于 `SPRAY_INTERVAL_S`（2s，略大于一段补喷跑完的时间）。下位机只在 `W` 状态接受，否则回 `ACK` 结果码 `0x01`。
+- 一次只发一帧，而且**等固件状态回到 `W` 才发下一帧**。`STATUS` 帧 5Hz 带状态字符，直接问"你现在空闲吗"比按时间猜靠谱：原来固定 2 秒间隔，而 1m 的补喷段要 2~3 秒才走完，下一帧正好落在 `STATE_RESPRAY` 里被回 `ACK 0x01` 丢掉，车少喷一段还不报错。`SPRAY_INTERVAL_S`（1s）退化成最小间隔，只负责挡住"一停就连喷几帧"。
 - 一帧一次 write，天然原子。改造前是「先发档位、再发 `C`」两次 write，中间被打断就变成「档位变了、车没动」，而且完全静默。
-- 按下面板上任何别的键会把自动流程撤下来，不然两秒后相机又自己开喷。
+- 按下面板上任何别的键会把自动流程撤下来，不然一秒后相机又自己开喷。
 
 ### 自动巡线喷涂（边走边喷边纠）
 
@@ -458,7 +458,7 @@ python3 main.py
   3. 落地但空跑，不接泵，跑一遍 `P`，量实际画出来的尺寸对不对。
   4. 最后才接漆，头几次跑把手放在电源开关上。
 - 上下位机的指令集对齐由测试守着：`python3 protocol_test.py` 直接从固件 `system.c` 抠 `case '...'`、从 `proto.h` 抠 `#define`，和面板按钮表、`frame.py` 逐项对账，加了指令忘了同步会当场报。面板上**不许挂固件还没实现的按钮** —— 以前 `N`（画车位（路沿））就挂在这儿，按下去是空操作，靠一个白名单放行；现在功能整个撤掉了，白名单也没了，谁再挂一个空按钮这条测试就拦。
-- 测试一共 132 项，都不需要硬件：`python3 protocol_test.py`（34）、`lane_control_test.py`（17）、`camera_widget_test.py`（17）、`ack_test.py`（13）、`motion_sync_test.py`（13）、`motor_test.py`（13）、`chassis_test.py`（10）、`main_window_test.py`（10）、`vision_test.py`（5）。其中 `motor_test` / `motion_sync_test` / `chassis_test` 是读固件源码的静态检查（不需要编译器）；其余只需要 numpy，`camera_widget_test.py` 和 `vision_test.py` 还要 `opencv-python-headless`，没有 PyQt5 也行（测试里有个只够本文件用的替身）。
+- 测试一共 135 项，都不需要硬件：`python3 protocol_test.py`（34）、`lane_control_test.py`（17）、`camera_widget_test.py`（20）、`ack_test.py`（13）、`motion_sync_test.py`（13）、`motor_test.py`（13）、`chassis_test.py`（10）、`main_window_test.py`（10）、`vision_test.py`（5）。其中 `motor_test` / `motion_sync_test` / `chassis_test` 是读固件源码的静态检查（不需要编译器）；其余只需要 numpy，`camera_widget_test.py` 和 `vision_test.py` 还要 `opencv-python-headless`，没有 PyQt5 也行（测试里有个只够本文件用的替身）。
 - **纠偏的三个上限写在两个地方，必须一致**：`proto.h` 的 `PROTO_TRIM_MAX_MM`、`motion.c` 的 `MOTION_TRIM_MAX_MM`、`lane_control.py` 的 `GAINS["MAX_TRIM_MM"]`。`protocol_test.py::test_trim_cap_is_the_same_everywhere` 盯着。不一致的症状各不相同而且都不报错：上位机给大了是「帧被回 ERR_RANGE，车完全不纠」，给中了大是「被 `Motion_Trim` 静默夹掉，ACK 还是 OK」。
 - 上位机串口默认 `/dev/serial0`（`main.py` / `serial_manager.py` / `serial_test.py`）。`serial0` 是 udev 符号链接，永远指向当前接在排针上的那个串口，所以底下换 UART 不用改代码。临时换口（比如 USB 转串口）用环境变量：`MARKING_PORT=/dev/ttyUSB0 ./start.sh`。
 - 树莓派 4B 的排针串口是哪个 UART 取决于配置，别写死成 `ttyAMA0`：
