@@ -17,7 +17,7 @@
 
 **上位机（marking-host，树莓派）**
 
-- PyQt5 面板：画车位（标准 / 路沿）、二次喷涂、自动巡线喷涂、整机自检、水泵清洗、紧急停止，带串口收发日志和链路健康度
+- PyQt5 面板：画车位（标准）、二次喷涂、自动巡线喷涂、整机自检、水泵清洗、紧急停止，带串口收发日志和链路健康度
 - 两种下发路径：单字节 ASCII（调试/手机，敲一个字母车就动）和 10 字节帧（带参数、CRC、SEQ、ACK）
 - 黄色标线检测：HSV 提黄 → 形态学去噪 → 闭运算补裂缝 → 轮廓长宽比筛线状 → PCA 主方向定矩形 → 在矩形内量原始黄像素覆盖率。阈值集中在 `core/line_quality.py`，不依赖 Qt，可单独跑 `vision_test.py`
 - 检测结论是**四态**（完好 / 磨损 / 断裂 / 看不清），不是「补 / 不补」两种。看不清单独一态，因为它和"完好"混在一起的时候，相机被挡住、线太细、画面全反光这几种情况的表现都是"它不工作，但日志一切正常"
@@ -183,7 +183,7 @@ Intelligent-Road-Marking-Robot/
 │   ├── core/frame.py        # 帧协议（与固件 proto.c 逐字节对齐）
 │   ├── core/lane_control.py # 视觉纠偏控制律（纯函数，带闭环仿真）
 │   ├── core/ack.py          # ACK 配对表 + 超时重发
-│   ├── protocol_test.py     # 上下位机指令集 + 帧常量对账（35 项）
+│   ├── protocol_test.py     # 上下位机指令集 + 帧常量对账（34 项）
 │   ├── chassis_test.py      # 双 Target 配置 / 条件编译是否真的生效（10 项）
 │   ├── main_window_test.py  # 航向显示 / 陀螺仪开关（offscreen 跑）（10 项）
 │   ├── motor_test.py        # 四路定时器 / 引脚 / 中断 / MOE / 起坡（13 项）
@@ -241,7 +241,6 @@ Intelligent-Road-Marking-Robot/
 
 三点补充：
 
-- `N`（画车位（路沿））下位机尚未实现，按下去是个空操作。上位机这边按钮和指令表都有，缺口由 `protocol_test.py::test_not_implemented_is_still_true` 盯着，固件补上它测试就会报。
 - **不认识的字节一律回 `?`**，不执行。这是给两个真实故障准备的：蓝牙模块断开/重连会吐 `+DISC`、`+CONNECT` 这类 AT 响应，里面的 `C`/`D`/`T` 都是合法命令；线上噪声、波特率漂移产生的假字节同理。注意 `?` 只挡不在命令表里的字节，挡不住乱码刚好等于某个合法字符 —— 后者要靠帧头 + CRC。
 - **上电静默 3 秒**：`timer_counter` 从头 3 秒内除 `T`（急停）外一律回 `?`，不执行。对着下面「上电毛刺被当成 `P`」那条风险。3 秒够 HC-05 一类模块完成初始化。
 - 上电首次合臂：`Hardware_Init` 会先调 `Servo_SetAngle(40)` / `Servo2_SetAngle(90)`。DPWM 初始 `TIM_Pulse = 0`，不写这两句，舵机在收到第一条 `J`/`D` 之前完全没有信号，舵臂会被外力带着乱动。
@@ -313,7 +312,6 @@ CRC 用标准校验值 `crc8(b"123456789") == 0xF4` 双向锚定 —— 不是�
 | `D` | 整机自检 |
 | `K` | 水泵清洗 |
 | `G` | 关水泵 |
-| `N` | 画车位（路沿）—— 下位机未实现 |
 | `C` | 二次喷涂。面板按钮发的仍是单字节 `C`（按当前档位）；相机闭环改发帧 `RESPRAY`，直接给毫米 |
 | `W` | 停止复位 |
 | `T` | 紧急停止 |
@@ -474,9 +472,9 @@ python3 main.py
   2. 轮子架空、泵接清水，逐条试方向（`U` / `R` / `Y` / `Z` / `A` / `X`），确认转向和预期一致；试 `T`，确认松开后确实不动了。
   3. 落地但空跑，不接泵，跑一遍 `P`，量实际画出来的尺寸对不对。
   4. 最后才接漆，头几次跑把手放在电源开关上。
-- 上下位机的指令集对齐由测试守着：`python3 protocol_test.py` 直接从固件 `system.c` 抠 `case '...'`、从 `proto.h` 抠 `#define`，和面板按钮表、`frame.py` 逐项对账，加了指令忘了同步会当场报。唯一已知的缺口是 `N`，写在该测试的 `NOT_IMPLEMENTED` 里。
-- 测试一共 133 项，都不需要硬件：`python3 protocol_test.py`（35）、`lane_control_test.py`（17）、`camera_widget_test.py`（17）、`ack_test.py`（13）、`motion_sync_test.py`（13）、`motor_test.py`（13）、`chassis_test.py`（10）、`main_window_test.py`（10）、`vision_test.py`（5）。其中 `motor_test` / `motion_sync_test` / `chassis_test` 是读固件源码的静态检查（不需要编译器）；其余只需要 numpy，`camera_widget_test.py` 和 `vision_test.py` 还要 `opencv-python-headless`，没有 PyQt5 也行（测试里有个只够本文件用的替身）。
-- **纠偏的三个上限写在两个地方，必须一致**：`proto.h` 的 `PROTO_TRIM_MAX_MM`、`motion.c` 的 `MOTION_TRIM_MAX_MM`、`lane_control.py` 的 `GAINS["MAX_TRIM_MM"]`。`protocol_test.py::test_trim_cap_is_the_same_in_three_places` 盯着。不一致的症状各不相同而且都不报错：上位机给大了是「帧被回 ERR_RANGE，车完全不纠」，给中了大是「被 `Motion_Trim` 静默夹掉，ACK 还是 OK」。
+- 上下位机的指令集对齐由测试守着：`python3 protocol_test.py` 直接从固件 `system.c` 抠 `case '...'`、从 `proto.h` 抠 `#define`，和面板按钮表、`frame.py` 逐项对账，加了指令忘了同步会当场报。面板上**不许挂固件还没实现的按钮** —— 以前 `N`（画车位（路沿））就挂在这儿，按下去是空操作，靠一个白名单放行；现在功能整个撤掉了，白名单也没了，谁再挂一个空按钮这条测试就拦。
+- 测试一共 132 项，都不需要硬件：`python3 protocol_test.py`（34）、`lane_control_test.py`（17）、`camera_widget_test.py`（17）、`ack_test.py`（13）、`motion_sync_test.py`（13）、`motor_test.py`（13）、`chassis_test.py`（10）、`main_window_test.py`（10）、`vision_test.py`（5）。其中 `motor_test` / `motion_sync_test` / `chassis_test` 是读固件源码的静态检查（不需要编译器）；其余只需要 numpy，`camera_widget_test.py` 和 `vision_test.py` 还要 `opencv-python-headless`，没有 PyQt5 也行（测试里有个只够本文件用的替身）。
+- **纠偏的三个上限写在两个地方，必须一致**：`proto.h` 的 `PROTO_TRIM_MAX_MM`、`motion.c` 的 `MOTION_TRIM_MAX_MM`、`lane_control.py` 的 `GAINS["MAX_TRIM_MM"]`。`protocol_test.py::test_trim_cap_is_the_same_everywhere` 盯着。不一致的症状各不相同而且都不报错：上位机给大了是「帧被回 ERR_RANGE，车完全不纠」，给中了大是「被 `Motion_Trim` 静默夹掉，ACK 还是 OK」。
 - 上位机串口默认 `/dev/serial0`（`main.py` / `serial_manager.py` / `serial_test.py`）。`serial0` 是 udev 符号链接，永远指向当前接在排针上的那个串口，所以底下换 UART 不用改代码。临时换口（比如 USB 转串口）用环境变量：`MARKING_PORT=/dev/ttyUSB0 ./start.sh`。
 - 树莓派 4B 的排针串口是哪个 UART 取决于配置，别写死成 `ttyAMA0`：
 

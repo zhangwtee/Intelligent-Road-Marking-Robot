@@ -27,10 +27,6 @@ FIRMWARE_COMMANDS = set(
     re.findall(r"case '([^']+)':", FIRMWARE_C.read_text(encoding="gbk"))
 )
 
-# 下位机还没实现的指令：按下去是个空操作。写在这儿是为了让"还没做"和
-# "悄悄漏了"分得开 —— 固件一补上，test_not_implemented_is_still_true 就响。
-NOT_IMPLEMENTED = {"N"}
-
 
 def test_panel_commands_are_known():
     """每个按钮发的字节，上位机自己得能翻译，否则日志全是"未知"。"""
@@ -49,12 +45,14 @@ def test_panel_commands_reach_firmware():
     """面板发的每个字节固件都得认识 —— 不认识不是报错，是按下车不动。
 
     这条就是 C 当初漏掉的那条：指令表里有、按钮也在，固件 switch 里没有。
+    现在没有任何白名单：面板上不许挂固件还没实现的按钮。以前 `N`（画车位
+    （路沿））挂在这儿、靠一个 NOT_IMPLEMENTED 集合放行，结果是界面上有个
+    按了没反应的按钮。既然功能不要了，白名单一起撤掉 —— 以后谁再挂一个
+    空按钮，这条会直接拦住。
     """
     sent = {cmd[0] for _, cmd in PANEL_BUTTONS}
     known = {ord(ch) for ch in FIRMWARE_COMMANDS}
-    unknown = sorted(
-        chr(b) for b in sent - known if chr(b) not in NOT_IMPLEMENTED
-    )
+    unknown = sorted(chr(b) for b in sent - known)
     assert not unknown, f"面板发得出去、固件不认: {unknown}"
 
 
@@ -102,14 +100,8 @@ def test_firmware_has_no_code_swallowed_by_a_comment():
     assert not bad, "代码被行尾注释吃掉了:\n" + "\n".join(bad)
 
 
-def test_not_implemented_is_still_true():
-    """固件补上 N 之后，把它从 NOT_IMPLEMENTED 里划掉，别再留个谎。"""
-    done = sorted(NOT_IMPLEMENTED & FIRMWARE_COMMANDS)
-    assert not done, f"固件已经实现了，从 NOT_IMPLEMENTED 里删掉: {done}"
-
-
 def test_camera_buttons_exist():
-    """弹摄像头的那两个标签必须真的是面板上的按钮，写错就静默不弹。"""
+    """弹摄像头的那些标签必须真的是面板上的按钮，写错就静默不弹。"""
     labels = {label for label, _ in PANEL_BUTTONS}
     assert CAMERA_BUTTONS <= labels, f"不在面板上的按钮: {CAMERA_BUTTONS - labels}"
 
