@@ -196,9 +196,23 @@ static void PaintCaptureResume(void)
 {
     int32_t remain;
 
+    /* 不在"画车位"里：这次急停和画车位无关，已有的断点别动。
+     *
+     * 反例就是连按两下急停 —— 人急的时候会连点。第一下停在某条边
+     * 中途，断点记好、状态变 TING；第二下进来时已经不在 STATE_PAINT
+     * 了，以前开头那句无条件清空会把刚记好的断点抹掉，面板上的
+     * "续画"跟着变灰，而人只看到"按了两下急停，续画没了"。
+     *
+     * 反过来，在画车位里被打断却记不下断点（停在转弯上、剩不到
+     * 50mm），那是真没有可续的，必须清成 0 —— 留着上一次的残值会
+     * 让"续画"从一条已经画完的边上再走一段。 */
+    if (sys_ctrl.state != STATE_PAINT) {
+        return;
+    }
+
     paint_resume_valid = 0;
 
-    if (sys_ctrl.state != STATE_PAINT || !PaintEdgeRunning()) {
+    if (!PaintEdgeRunning()) {
         return;
     }
     if (!StepMotor_IsAnyRunning()) {

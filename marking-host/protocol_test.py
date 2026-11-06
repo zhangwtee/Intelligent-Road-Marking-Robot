@@ -364,6 +364,37 @@ def test_status_flag_bits_match_firmware():
         assert getattr(frame, name) == value, name
 
 
+def test_second_estop_does_not_wipe_the_breakpoint():
+    """连按两下急停，第一下记的断点不能被第二下抹掉。
+
+    `T` 的处理是"先记断点、再切 TING"。第二下进来时状态已经是 TING ——
+    PaintCaptureResume 如果开头无条件清 paint_resume_valid，刚记好的断点
+    就没了：状态帧的 0x40 灭、面板上"续画"变灰，而人只看到"按了两下急停，
+    续画不见了"。急的时候连点两下是常态，这不是假想。
+
+    真没有可续的情况（停在转弯上、剩不到 50mm）还是必须清，所以判断语句
+    得排在清零前面，而不是简单把清零删掉。
+    """
+    text = FIRMWARE_C.read_bytes().decode("gbk", errors="replace")
+
+    match = re.search(
+        r"static void PaintCaptureResume\(void\)\s*\{(.*?)\n\}", text, re.S
+    )
+    assert match, "固件里找不到 PaintCaptureResume"
+    body = match.group(1)
+
+    assert "paint_resume_valid   = 1" in body, "抠到的不是断点那段代码"
+
+    guard = body.find("sys_ctrl.state != STATE_PAINT")
+    clear = body.find("paint_resume_valid = 0")
+
+    assert guard != -1, "PaintCaptureResume 里没有状态判断"
+    assert clear != -1, "PaintCaptureResume 里没有清零"
+    assert clear > guard, (
+        "paint_resume_valid = 0 排在了状态判断前面：连按两下急停会把断点抹掉"
+    )
+
+
 def test_paint_default_size_matches_firmware():
     """界面上预填的默认尺寸，得和固件里烧死的默认值一样。
 
