@@ -220,6 +220,10 @@ def test_frame_constants_match_firmware():
         "PROTO_PAINT_MAX_MM": frame.PAINT_MAX_MM,
         "PROTO_CMD_GYRO": frame.CMD_GYRO,
         "PROTO_CMD_HEADING": frame.CMD_HEADING,
+        "PROTO_CMD_SPEED": frame.CMD_SPEED,
+        "PROTO_PAINT_FLAG_HEADING": frame.PAINT_FLAG_HEADING,
+        "PROTO_SPEED_MIN_ARR": frame.SPEED_MIN_ARR,
+        "PROTO_SPEED_MAX_ARR": frame.SPEED_MAX_ARR,
         "PROTO_GYRO_OFF": frame.GYRO_OFF,
         "PROTO_GYRO_ON": frame.GYRO_ON,
         "PROTO_GYRO_RECAL": frame.GYRO_RECAL,
@@ -262,6 +266,7 @@ def test_every_frame_the_host_sends_has_a_firmware_branch():
         "GYRO": frame.CMD_GYRO,
         "PAINT": frame.CMD_PAINT,
         "LEVEL": frame.CMD_LEVEL,
+        "SPEED": frame.CMD_SPEED,
         "PING": frame.CMD_PING,
     }
 
@@ -274,6 +279,57 @@ def test_every_frame_the_host_sends_has_a_firmware_branch():
             broken.append(f"{macro} 在 system.c 里没有 case")
 
     assert not broken, broken
+
+
+def test_speed_range_is_the_same_in_three_places():
+    """速度范围写在三处，必须一样。
+
+        proto.h            PROTO_SPEED_MIN/MAX_ARR   收帧时判越界
+        StepMotor_New.c    SPEED_FAST_ARR / SLOW_ARR 夹紧
+        frame.py           SPEED_MIN_ARR / MAX_ARR   滑条范围
+                         + SPEED_DEFAULT_ARR         上电默认
+
+    不一致的症状都不会报错：上位机给得比固件大 -> 回 ERR_RANGE，表现为
+    "滑条拖到底，车还是那么快"；给得比底层小 -> 被静默夹紧，界面上的数
+    和车上跑的数就不一样了，而人会拿界面上那个数去算漆量。
+    """
+    proto_h = FIRMWARE_PROTO_H.read_bytes().decode("gbk", errors="replace")
+    motor_c = (FIRMWARE_HW / "StepMotor_New.c").read_bytes().decode("gbk", errors="replace")
+
+    def num(text, name, pattern=r"#define\s+%s\s+(\d+)"):
+        m = re.search(pattern % name, text)
+        assert m, f"找不到 {name}"
+        return int(m.group(1))
+
+    assert num(proto_h, "PROTO_SPEED_MIN_ARR") == frame.SPEED_MIN_ARR
+    assert num(proto_h, "PROTO_SPEED_MAX_ARR") == frame.SPEED_MAX_ARR
+    assert num(motor_c, "SPEED_FAST_ARR") == frame.SPEED_MIN_ARR
+    assert num(motor_c, "SPEED_SLOW_ARR") == frame.SPEED_MAX_ARR
+    assert num(motor_c, "SPEED_DEFAULT_ARR") == frame.SPEED_DEFAULT_ARR
+
+
+def test_speed_frame_carries_the_arr():
+    """速度帧：DATA[0:2] 大端 ARR，越小越快。
+
+    发的是 ARR 不是档位号 —— 档位号要多一层"两边表一样"的假设，
+    补喷长度就是这么从档位改回毫米的。
+    """
+    f = frame.build_speed(600, seq=4)
+    assert frame.check_frame(f)
+    assert f[1] == frame.CMD_SPEED
+    assert (f[3] << 8) | f[4] == 600
+    assert frame.describe(f[1], f[3:8]) == "速度 600"
+
+
+def test_paint_frame_carries_the_heading_flag():
+    """DATA[4] bit0 = 四条边用航向闭环。默认不带。"""
+    plain = frame.build_paint(5000, 2300)
+    guided = frame.build_paint(5000, 2300, heading=True)
+
+    assert plain[7] == 0, "没要求纠偏却把标志置上了"
+    assert guided[7] & frame.PAINT_FLAG_HEADING
+    assert "纠偏" not in frame.describe(plain[1], plain[3:8])
+    assert "纠偏" in frame.describe(guided[1], guided[3:8])
 
 
 def test_paint_default_size_matches_firmware():

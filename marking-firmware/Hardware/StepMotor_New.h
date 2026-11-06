@@ -86,8 +86,19 @@ void StepMotor_StopAll(void);//全部停止
 void StepMotor_StopJog(void);   // 遥控点动的柔和停车（减速跑完再停）
 void StepMotor_SetRampEnabled(uint8_t en);      // 0 = 本次运动不起坡
 void StepMotor_GoForwardFlat(uint16_t pulse);   // 匀速前进（画线用，不做软起软停）
-void StepMotor_SpeedUp(void);   // 蓝牙 '+'：提速一档（改用户档位）
-void StepMotor_SpeedDown(void); // 蓝牙 '-'：降速一档（改用户档位）
+void StepMotor_SpeedUp(void);   // '+'：提速一档（改用户档位）
+void StepMotor_SpeedDown(void); // '-'：降速一档（改用户档位）
+
+/* 直接设用户档位。帧命令 CMD_SPEED 走这里：上位机给的是绝对 ARR，
+ * 不是"加一档"，因为现场要的是"回到 300"而不是"按七下减号"。
+ *
+ * 越界值夹到 150~1500，不报错 —— 判越界在协议层做（proto.h 的
+ * PROTO_SPEED_MIN/MAX_ARR），这里只是兜底。
+ *
+ * 调用前提：没在一段"左右不同速"的运动里。段内调用会把四路拉成同一个
+ * ARR，DriveSyncArr 按脉冲比例定好的左右比例当场失效。system.c 的
+ * SpeedChangeAllowed 负责这个前提。 */
+void     StepMotor_SetUserSpeed(uint16_t arr);
 
 /* 直接设置"当前生效档位"，不动用户档位。
  *

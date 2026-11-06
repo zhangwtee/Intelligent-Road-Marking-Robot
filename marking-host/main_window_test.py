@@ -288,6 +288,70 @@ def test_paint_cancels_the_vision_loop_before_it_starts():
     w.camera_widget = None
 
 
+def test_paint_heading_flag_rides_with_the_size():
+    """纠偏开关必须和尺寸在同一帧里，默认关。
+
+    做成单独的"开关"命令的话，两条之间被打断就变成「开关改了、这次画车位
+    没赶上」—— 而日志里两条都发了，看不出哪次生效。
+    """
+    w = make_window()
+    assert w.paint_heading_check.isChecked() is False, "纠偏不该默认打开"
+
+    w.paint_heading_check.setChecked(True)
+    w.send_paint()
+
+    sent = w.serial_mgr.sent
+    assert len(sent) == 1, sent
+    assert sent[0][1] == frame.CMD_PAINT
+    assert sent[0][7] & frame.PAINT_FLAG_HEADING, "DATA[4] 的纠偏位没置上"
+    assert "纠偏" in w.send_log.toPlainText()
+
+
+def test_speed_slider_sends_the_arr():
+    """滑条的值就是固件的 ARR，大端塞进 DATA[0:2]。"""
+    w = make_window()
+
+    w.speed_slider.setValue(600)
+
+    sent = w.serial_mgr.sent
+    assert len(sent) == 1, sent
+    assert frame.check_frame(sent[0]), sent[0].hex()
+    assert sent[0][1] == frame.CMD_SPEED
+    assert ((sent[0][3] << 8) | sent[0][4]) == 600
+    assert w.speed_label.text() == "600"
+
+
+def test_speed_slider_does_not_flood_while_dragging():
+    """拖动过程中一帧都不发，松手才发最后那个值。
+
+    QSlider 每移一个像素就 valueChanged 一次，而 9600 下一帧 10.4ms ——
+    不挡的话拖一下就是几十帧，ACK 和错误码全被冲掉。
+    """
+    w = make_window()
+    w.speed_slider.isSliderDown = lambda: True        # 假装正按着鼠标
+
+    for arr in (250, 240, 230, 220):
+        w.speed_slider.setValue(arr)
+
+    assert w.serial_mgr.sent == [], "拖动过程中就发了帧"
+    assert w.speed_label.text() == "220", "拖动时标签也得跟着走"
+
+    w.on_speed_released()
+    assert len(w.serial_mgr.sent) == 1
+    assert ((w.serial_mgr.sent[0][3] << 8) | w.serial_mgr.sent[0][4]) == 220
+
+
+def test_speed_is_not_resent_when_unchanged():
+    """值没变就别发 —— 点一下滑条也会触发 sliderReleased。"""
+    w = make_window()
+
+    w.speed_slider.setValue(600)
+    w.on_speed_released()
+    w.on_speed_released()
+
+    assert len(w.serial_mgr.sent) == 1, w.serial_mgr.sent
+
+
 def test_heading_frames_do_not_flood_the_log():
     """航向帧 5Hz，不能写进接收日志。
 

@@ -17,7 +17,7 @@
 
 **上位机（marking-host，树莓派）**
 
-- PyQt5 面板：画车位（尺寸可在界面上现输）、二次喷涂、自动巡线喷涂、整机自检、水泵清洗、紧急停止，带串口收发日志和链路健康度
+- PyQt5 面板：画车位（尺寸和「要不要陀螺仪纠偏」都在界面上现选）、速度滑条、二次喷涂、自动巡线喷涂、整机自检、水泵清洗、紧急停止，带串口收发日志和链路健康度
 - 两种下发路径：单字节 ASCII（调试/手机，敲一个字母车就动）和 10 字节帧（带参数、CRC、SEQ、ACK）
 - 黄色标线检测：HSV 提黄 → 形态学去噪 → 闭运算补裂缝 → 轮廓长宽比筛线状 → PCA 主方向定矩形 → 在矩形内量原始黄像素覆盖率。阈值集中在 `core/line_quality.py`，不依赖 Qt，可单独跑 `vision_test.py`
 - 检测结论是**四态**（完好 / 磨损 / 断裂 / 看不清），不是「补 / 不补」两种。看不清单独一态，因为它和"完好"混在一起的时候，相机被挡住、线太细、画面全反光这几种情况的表现都是"它不工作，但日志一切正常"
@@ -168,9 +168,9 @@ Intelligent-Road-Marking-Robot/
 │   ├── core/frame.py        # 帧协议（与固件 proto.c 逐字节对齐）
 │   ├── core/lane_control.py # 视觉纠偏控制律（纯函数，带闭环仿真）
 │   ├── core/ack.py          # ACK 配对表 + 超时重发
-│   ├── protocol_test.py     # 上下位机指令集 + 帧常量对账（36 项）
+│   ├── protocol_test.py     # 上下位机指令集 + 帧常量对账（39 项）
 │   ├── chassis_test.py      # 双 Target 配置 / 条件编译是否真的生效（10 项）
-│   ├── main_window_test.py  # 航向显示 / 陀螺仪开关 / 车位尺寸（offscreen 跑）（14 项）
+│   ├── main_window_test.py  # 航向显示 / 陀螺仪开关 / 车位尺寸 / 调速（offscreen 跑）（18 项）
 │   ├── motor_test.py        # 四路定时器 / 引脚 / 中断 / MOE / 起坡（13 项）
 │   ├── motion_sync_test.py  # 左右同步的接线与数学（13 项）
 │   ├── lane_control_test.py # 控制律符号/限幅 + 闭环仿真（17 项）
@@ -214,7 +214,7 @@ Intelligent-Road-Marking-Robot/
 | `A` | 左移（平移） |
 | `X` | 右移（平移） |
 | `T` | 强制停止所有执行器（状态停在 TING，`C` 等会自己动作的指令随之失效） |
-| `P` | 画车位（标准，默认 5.3m × 2.5m 完整矩形，水泵随行）。尺寸由 `CMD_PAINT` 或 `system.c` 里的默认值决定，不再写死脉冲数 |
+| `P` | 画车位（标准，默认 5.3m × 2.5m 完整矩形，水泵随行）。尺寸由 `CMD_PAINT` 或 `system.c` 里的默认值决定，不再写死脉冲数。这条路不带纠偏 —— 要边走边纠就走帧 |
 | `C` | 二次喷涂补线，按【当前档位】泵开直行一段后自停。只在 `W` 状态被接受，已经在喷就不重进、不打断正在跑的活、急停后进不来 |
 | `1`~`5` | 设定补喷长度 0.2 / 0.4 / 0.6 / 0.8 / 1.0 m（上电默认 `5`，和改造前写死的 1.0m 一致）。只在 `W` / `TING` 接受，跑动中发来会回 `?` |
 | `K` | 开水泵 |
@@ -222,7 +222,7 @@ Intelligent-Road-Marking-Robot/
 | `D` | 整机自检（开臂 → 前进 → 合臂） |
 | `J` | 关闭舵臂（舵机平滑回到 40° / 90°） |
 | `F` | 蜂鸣提示（后退提示音） |
-| `+` / `-` | 蓝牙专用调速，上位机发来忽略。运动中的按键只改目标速度，斜坡自己走过去 |
+| `+` / `-` | 调速一档（ARR ±100）。蓝牙和上位机的单字节通道都能用；画车位 / 走段 / 补喷中途发来回 `?` —— 段首按脉冲比例定好的左右速度比，中途改会把四路拉平，剩下的路只有一侧在推 |
 
 三点补充：
 
@@ -255,8 +255,9 @@ Intelligent-Road-Marking-Robot/
 | `0x03` | LEVEL | `DATA[0]` 档位 1~5（兼容旧的 `1`~`5`） |
 | `0x04` | TRIM | `DATA[0:2]` int16 毫米（±20），>0 向右修正。只在运动中有效，是段内增量 |
 | `0x05` | PUMP | `DATA[0]` 0 关 / 1 开，只在 `W` / MOVE 中接受 |
-| `0x06` | PAINT | `DATA[0:1]` 长 mm，`DATA[2:3]` 宽 mm（1000~8000），0 = 默认 5300×2500 |
+| `0x06` | PAINT | `DATA[0:1]` 长 mm，`DATA[2:3]` 宽 mm（1000~8000），0 = 默认 5300×2500；`DATA[4]` 标志 bit0 = 四条边走航向闭环 |
 | `0x07` | GYRO | `DATA[0]` 子命令：0 关闭环 / 1 开闭环 / 2 重标零 / 3 标定轮距 |
+| `0x08` | SPEED | `DATA[0:2]` 速度 ARR（150~1500，越小越快）。只在空闲 / 急停 / 遥控点动时接受 |
 | `0x09` | PING | 无，只回 ACK |
 
 上行（STM32 → 上位机，只发给树莓派，不发给蓝牙）：
@@ -304,6 +305,10 @@ CRC 用标准校验值 `crc8(b"123456789") == 0xF4` 双向锚定 —— 不是�
 按钮表只定义在 [marking-host/core/protocol.py](marking-host/core/protocol.py) 的 `PANEL_BUTTONS` 里一处，`main_window.py` 和摄像头弹窗都从那儿取，标签写两遍就会出现某个按钮悄悄失效。
 
 「画车位」是唯一不在那张表里的按钮：它要带两个参数。面板上是「长 `[5300]` mm 宽 `[2500]` mm」两个输入框，按一次发一帧 `CMD_PAINT`，固件先验范围（1000~8000）、再写尺寸、最后置 `STATE_PAINT`，三者一步完成 —— 不会出现「尺寸改了但车没动」或者「用旧尺寸开跑」。以前改尺寸得动 `system.c` 的 `PAINT_LEN_DEFAULT_MM` 重新编译烧写，换个规格就要重烧一次。输入框的范围就是 `proto.h` 的 `PROTO_PAINT_MIN/MAX_MM`，越界值根本输不进去；预填的默认值和固件默认值由 `protocol_test.test_paint_default_size_matches_firmware` 对账。
+
+按钮下面那个「画车位时用陀螺仪纠偏」勾选框装在**同一个帧**里（`DATA[4]` bit0）。四条边的每段起点以当时车头为「直」，边走边纠（`Heading_TrimDeltaMm` → `Motion_Trim`），转弯那几步不纠。做成帧里的一个位而不是单独一条开关命令，是因为后者会出现「开关改了但这次画车位没赶上」的中间态，而日志里两条都发了、看不出哪次生效。陀螺仪没标定时固件回 `ERR_HW`，不是「照画但不纠」—— 后者画出来是歪的，日志里一切正常，然后人会去怪转角系数。它管的是**边直不直**，角正不正归 `CHASSIS_TURN_SCALE` 管，两个数别一起调。
+
+速度也上了面板：一条滑条，值就是固件的 ARR（帧 `0x08`，越小越快），右拖变快。以前只有蓝牙的 `+`/`-` 能调速，用树莓派跑的时候速度只能靠手机改，或者烧死在一个档位 —— 而速度直接决定漆量和拐角冲击。拖动过程中一帧都不发、松手才发最后一次（9600 下一帧 10.4ms，不挡的话拖一下就是几十帧，ACK 和错误码全被冲干净），值没变也不发。段内（画车位 / 走段 / 补喷）固件回 `ERR_STATE` 拒绝：段首按脉冲比例定好的左右速度比，中途改会把四路拉平。
 
 下位机对单字节命令仍然是「收到什么原样回显什么」；帧命令回 ACK 帧、每 200ms 主动发一帧 STATUS。上位机同一个解析器同时认这两种，状态栏显示的是 STATUS 里的真实状态，不再是「最后按了哪个键」。
 
@@ -375,8 +380,14 @@ MPU6050 给角速度，10ms 采一次、按实测 dt 积分成角度。积分精
 那种表现很容易被误判成"陀螺仪不准"。
 
 执行仍然走 `Motion_Trim`（运动中改目标脉冲、不清进度），所以纠偏不需要停车。
-段起点（进入 `STATE_MOVE` 那一下）记一次航向参考；续段不重记 —— 续的是同一条线，
-重记等于把已经修掉的偏差又当成 0。
+段起点记一次航向参考：进入 `STATE_MOVE` 那一下，以及画车位每条边起步那一下；
+续段不重记 —— 续的是同一条线，重记等于把已经修掉的偏差又当成 0。
+
+画车位是另一条路：四条边走 `Motion_ForwardFlat`（匀速、无斜坡，漆量才均匀），
+本来一点航向兜底都没有，一条 5.3 米的边左右轮差 1% 就是末端 5cm。`CMD_PAINT`
+的 `DATA[4]` bit0 打开之后，每条边起步记参考、边走边纠，转弯那几步不纠。
+不默认开：纠偏要改左右目标脉冲，为了"直"牺牲多少匀速，由按按钮的人按现场决定。
+它只管**边直不直**；角正不正归 `CHASSIS_TURN_SCALE`，两个数分开调。
 
 **和视觉纠偏的分工。** 两者不能同时往同一个差速上叠：
 
@@ -462,7 +473,7 @@ python3 main.py
   3. 落地但空跑，不接泵，跑一遍 `P`，量实际画出来的尺寸对不对。
   4. 最后才接漆，头几次跑把手放在电源开关上。
 - 上下位机的指令集对齐由测试守着：`python3 protocol_test.py` 直接从固件 `system.c` 抠 `case '...'`、从 `proto.h` 抠 `#define`，和面板按钮表、`frame.py` 逐项对账，加了指令忘了同步会当场报。面板上**不许挂固件还没实现的按钮** —— 以前 `N`（画车位（路沿））就挂在这儿，按下去是空操作，靠一个白名单放行；现在功能整个撤掉了，白名单也没了，谁再挂一个空按钮这条测试就拦。
-- 测试一共 141 项，都不需要硬件：`python3 protocol_test.py`（36）、`lane_control_test.py`（17）、`camera_widget_test.py`（20）、`ack_test.py`（13）、`motion_sync_test.py`（13）、`motor_test.py`（13）、`chassis_test.py`（10）、`main_window_test.py`（14）、`vision_test.py`（5）。其中 `motor_test` / `motion_sync_test` / `chassis_test` 是读固件源码的静态检查（不需要编译器）；其余只需要 numpy，`camera_widget_test.py` 和 `vision_test.py` 还要 `opencv-python-headless`，没有 PyQt5 也行（测试里有个只够本文件用的替身）。
+- 测试一共 148 项，都不需要硬件：`python3 protocol_test.py`（39）、`lane_control_test.py`（17）、`camera_widget_test.py`（20）、`ack_test.py`（13）、`motion_sync_test.py`（13）、`motor_test.py`（13）、`chassis_test.py`（10）、`main_window_test.py`（18）、`vision_test.py`（5）。其中 `motor_test` / `motion_sync_test` / `chassis_test` 是读固件源码的静态检查（不需要编译器）；其余只需要 numpy，`camera_widget_test.py` 和 `vision_test.py` 还要 `opencv-python-headless`，没有 PyQt5 也行（测试里有个只够本文件用的替身）。
 - **纠偏的三个上限写在两个地方，必须一致**：`proto.h` 的 `PROTO_TRIM_MAX_MM`、`motion.c` 的 `MOTION_TRIM_MAX_MM`、`lane_control.py` 的 `GAINS["MAX_TRIM_MM"]`。`protocol_test.py::test_trim_cap_is_the_same_everywhere` 盯着。不一致的症状各不相同而且都不报错：上位机给大了是「帧被回 ERR_RANGE，车完全不纠」，给中了大是「被 `Motion_Trim` 静默夹掉，ACK 还是 OK」。
 - 上位机串口默认 `/dev/serial0`（`main.py` / `serial_manager.py` / `serial_test.py`）。`serial0` 是 udev 符号链接，永远指向当前接在排针上的那个串口，所以底下换 UART 不用改代码。临时换口（比如 USB 转串口）用环境变量：`MARKING_PORT=/dev/ttyUSB0 ./start.sh`。
 - 树莓派 4B 的排针串口是哪个 UART 取决于配置，别写死成 `ttyAMA0`：

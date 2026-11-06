@@ -359,24 +359,29 @@ static void Motor_RampStart(uint8_t i, uint32_t pulse)
  * 运动中也只改目标档位，不直接写寄存器：直接写等于把斜坡打断，
  * 从起始慢速一个周期内跳到目标频率，开环步进这一下丢的步补不回来。
  */
+/* 绝对设速。和 SpeedUp / SpeedDown 是同一个动作，只是值由调用方给。 */
+void StepMotor_SetUserSpeed(uint16_t arr)
+{
+    speed_base = Motor_ClampArr(arr);
+    StepMotor_SetSpeedTarget(speed_base);
+}
+
+/* 一档 = SPEED_STEP_ARR。已经到头的直接返回，别让 speed_base - 100
+ * 在 uint16_t 上回绕成 65436 —— 那会被夹成最慢档，按"加速"反而变最慢。 */
 void StepMotor_SpeedUp(void)
 {
-    if (speed_base > SPEED_FAST_ARR + SPEED_STEP_ARR) {
-        speed_base -= SPEED_STEP_ARR;
-    } else {
-        speed_base = SPEED_FAST_ARR;
+    if (speed_base <= SPEED_FAST_ARR) {
+        return;
     }
-    StepMotor_SetSpeedTarget(speed_base);
+    StepMotor_SetUserSpeed((uint16_t)(speed_base - SPEED_STEP_ARR));
 }
 
 void StepMotor_SpeedDown(void)
 {
-    if (speed_base < SPEED_SLOW_ARR - SPEED_STEP_ARR) {
-        speed_base += SPEED_STEP_ARR;
-    } else {
-        speed_base = SPEED_SLOW_ARR;
+    if (speed_base >= SPEED_SLOW_ARR) {
+        return;
     }
-    StepMotor_SetSpeedTarget(speed_base);
+    StepMotor_SetUserSpeed((uint16_t)(speed_base + SPEED_STEP_ARR));
 }
 
 /* ---------- 初始化 ---------- */

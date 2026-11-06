@@ -2,7 +2,7 @@ import cv2
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QTextEdit, QLabel,
     QComboBox, QCheckBox, QSlider, QStackedLayout, QSpacerItem, QSizePolicy,
-    QSpinBox
+    QSpinBox, QScrollArea
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QTextCursor
@@ -194,11 +194,63 @@ class MainWindow(QWidget):
         size_row.addStretch(1)
         left_layout.addLayout(size_row)
 
+        # ---------------- 速度 ----------------
+        # 以前只有蓝牙的 '+'/'-' 能调速，上位机这边根本没有通路：用树莓派
+        # 跑的时候速度只能靠手机改，或者烧死在一个档位。而速度直接决定画线
+        # 质量（漆量、拐角冲击），这是现场最需要当场调的一个量。
+        #
+        # 滑条的值就是固件的 ARR（越小越快）。不换算成 mm/s 是因为那要经过
+        # CALIB_STEPS_PER_REV，而这个数本身还没和驱动器 OLED 上的 MStep
+        # 对过 —— 显示一个可能差一倍的速度比不显示更糟。
+        speed_row = QHBoxLayout()
+        speed_row.setSpacing(6)
+        speed_row.addWidget(self._make_size_label("速度"))
+
+        self.speed_slider = QSlider(Qt.Horizontal)
+        self.speed_slider.setRange(frame.SPEED_MIN_ARR, frame.SPEED_MAX_ARR)
+        self.speed_slider.setSingleStep(50)
+        self.speed_slider.setPageStep(100)
+        self.speed_slider.setValue(frame.SPEED_DEFAULT_ARR)
+        # 反过来：往右拖 = ARR 变小 = 变快。跟"数值越小越快"的直觉一致，
+        # 也跟手机上连按 '+' 的方向一致。
+        self.speed_slider.setInvertedAppearance(True)
+        self.speed_slider.setMinimumHeight(32)
+        self.speed_slider.setToolTip(
+            f"数值越小越快：{frame.SPEED_MIN_ARR}（最快）~ "
+            f"{frame.SPEED_MAX_ARR}（最慢）。"
+            "松手才发一帧 —— 拖动过程中每变一个值就发一帧会把串口刷满。\n"
+            "注意：手机上按 +/- 改了速度，这里不会跟着变（状态帧里没有速度字段），"
+            "滑条只反映本界面最后一次发出去的值。"
+        )
+        self.speed_slider.valueChanged.connect(self.on_speed_changed)
+        self.speed_slider.sliderReleased.connect(self.on_speed_released)
+        speed_row.addWidget(self.speed_slider, 1)
+
+        self.speed_label = QLabel(str(frame.SPEED_DEFAULT_ARR))
+        self.speed_label.setMinimumWidth(46)
+        self.speed_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.speed_label.setStyleSheet("font-size:16px; font-weight:bold;")
+        speed_row.addWidget(self.speed_label)
+
+        left_layout.addLayout(speed_row)
+        self._speed_sent = None        # 上一次真的发出去的 ARR
+
         self.btn_paint = QPushButton(PAINT_BUTTON)
         self.btn_paint.setMinimumHeight(40)
         self.btn_paint.setStyleSheet("font-size:20px;")
         self.btn_paint.clicked.connect(self.send_paint)
         left_layout.addWidget(self.btn_paint)
+
+        # 画车位时要不要航向纠偏。不常开：纠偏要改左右目标脉冲，而画车位的
+        # 边是匀速段（漆量才均匀），为了直要牺牲多少匀速由人决定。
+        self.paint_heading_check = QCheckBox("画车位时用陀螺仪纠偏（四条边）")
+        self.paint_heading_check.setStyleSheet("font-size:14px;")
+        self.paint_heading_check.setToolTip(
+            "四条边每段起点以当时车头为「直」，边走边纠。\n"
+            "陀螺仪没标定时固件会回绝整条命令（ERR_HW），而不是照画不纠。\n"
+            "角度的误差归 CHASSIS_TURN_SCALE 管，和这个开关无关。"
+        )
+        left_layout.addWidget(self.paint_heading_check)
 
         # 按钮表在 core/protocol.py 里，和指令表放在一起，避免标签写两遍对不上
         self.control_buttons = []
@@ -225,7 +277,18 @@ class MainWindow(QWidget):
         self.btn_settings.clicked.connect(self.show_settings)
         left_layout.addWidget(self.btn_settings)
 
-        main_layout.addLayout(left_layout, 1)
+        # 左栏已经比 1000x560 高出一截（树莓派那块屏常常只有 600 高），
+        # 套一层滚动区：装得下就看不见滚动条，装不下能滚 —— 总比把
+        # 「设置」按钮顶出窗口外、点了没反应好。
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QScrollArea.NoFrame)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        left_inner = QWidget()
+        left_inner.setLayout(left_layout)
+        left_scroll.setWidget(left_inner)
+
+        main_layout.addWidget(left_scroll, 1)
 
         # ---------------- 中间（发送日志） ----------------
         center_layout = QVBoxLayout()
@@ -510,17 +573,44 @@ class MainWindow(QWidget):
         范围、再写尺寸、最后置 STATE_PAINT —— 三者一步完成，不存在
         "尺寸改了但车没动"或者"用旧尺寸开跑"的中间态。
 
+        纠偏开关也随这一帧走：DATA[4] 的 bit0。做成帧里的一个位而不是
+        单独一条"开关"命令，是因为后者会出现「开关改了但这次画车位没赶上」
+        的中间态 —— 而那种状态在日志里看不出来。
+
         先撤相机再发帧：视觉那条线会周期发 MOVE / TRIM，抢在画车位前面
         到达时固件回 ERR_STATE，画不成还只在日志里留一个结果码。
         """
         length = self.paint_len_spin.value()
         width = self.paint_wid_spin.value()
+        heading = self.paint_heading_check.isChecked()
 
         self._detach_camera_auto()
         self.send_frame(
-            frame.build_paint(length, width),
-            f"画车位 {length}x{width}mm",
+            frame.build_paint(length, width, heading=heading),
+            f"画车位 {length}x{width}mm" + (" +纠偏" if heading else ""),
         )
+
+    # ---------------- 速度 ----------------
+    def on_speed_changed(self, arr):
+        self.speed_label.setText(str(arr))
+
+        # 拖动过程中不发。QSlider 每移一个像素就 valueChanged 一次，9600 下
+        # 一帧 10.4ms —— 拖一下就几十条，ACK 和错误码会被冲干净，固件那边
+        # 也要处理一串注定被后到的值覆盖的命令。松手时由 sliderReleased 发一次。
+        if self.speed_slider.isSliderDown():
+            return
+        self._send_speed(arr)
+
+    def on_speed_released(self):
+        self._send_speed(self.speed_slider.value())
+
+    def _send_speed(self, arr):
+        # 值没变就不发。点一下滑条（不拖动）也会触发 sliderReleased，
+        # 每次都发一帧等于给日志刷噪声。
+        if arr == self._speed_sent:
+            return
+        self._speed_sent = arr
+        self.send_frame(frame.build_speed(arr), f"速度 {arr}")
 
     def send_button(self):
         label = self.sender().text()

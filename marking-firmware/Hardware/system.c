@@ -82,6 +82,14 @@ typedef enum {
 static PaintStep paint_step = PAINT_IDLE;
 static uint8_t selfcheck_step = 0;
 
+/* 现在这条边在不在走（EDGE1~4）。TURN 那几步不算 —— 那几步四个轮子
+ * 是同速反向转，本来就没有"左右该走一样"这件事可纠。 */
+static uint8_t PaintEdgeRunning(void)
+{
+    return (uint8_t)(paint_step == PAINT_EDGE1 || paint_step == PAINT_EDGE2
+                     || paint_step == PAINT_EDGE3 || paint_step == PAINT_EDGE4);
+}
+
 /* STATE_MOVE 的参数：走哪个方向、走多少毫米。
  * 由帧命令 PROTO_CMD_MOVE 填，进入状态时读一次。 */
 static uint8_t  move_dir = PROTO_MOVE_FWD;
@@ -103,6 +111,23 @@ static uint8_t gyro_measure;              /* 1 = 正在标轮距，段内不纠偏 */
 static uint8_t gyro_measure_prev_en;      /* 标定前闭环是不是开着的 */
 static float   gyro_measure_start_deg;    /* 标定开始时的累计航向 */
 static uint8_t move_trim_exhausted;       /* 本段纠偏累计到顶，后面别再调 */
+
+/* ---- 画车位时的航向纠偏（可选，由 CMD_PAINT 的 DATA[4] bit0 打开） ----
+ *
+ * 四条边走的是 Motion_ForwardFlat（匀速、无斜坡），以前完全没有航向兜底：
+ * 一条 5.3 米的边，左右轮差 1% 末端就偏 5cm，而且四条边往同一个方向偏，
+ * 闭合时缺口翻倍。
+ *
+ * 为什么做成"每次画车位现选"而不是一个常开开关：纠偏要改左右目标脉冲，
+ * 而 ForwardFlat 的全部意义是匀速（漆量均匀）。为了"直"接受多少速度不匀，
+ * 取决于这一段画什么 —— 交给按按钮的人决定，比烧死在固件里好。
+ *
+ * 只纠正边，不纠转弯：转完之后 MarkReference 把那一刻记成"直"，所以
+ * 边永远是直的，而角度的误差由 CHASSIS_TURN_SCALE 决定 —— 那两个数
+ * 一个管线直不直，一个管角正不正，别混在一起调。 */
+static uint8_t paint_heading;          /* 本次画车位四条边走不走航向闭环 */
+static uint8_t paint_heading_forced;   /* 闭环是这次画车位打开的，退出要还回去 */
+static uint8_t paint_trim_exhausted;   /* 这条边纠偏累计到顶，别再调 */
 
 /* 轮距自标定时单侧走的距离。
  * 300mm 的取法：若轮距 500mm，车会转 300/500 = 0.6 rad ≈ 34 度。
@@ -243,6 +268,41 @@ static void ReplyTo(uint8_t from, uint8_t byte) {
     }
 }
 
+/* 现在能不能改速度。
+ *
+ * 段内（MOVE / PAINT / RESPRAY / SELFCHECK）不许改，两个理由：
+ *   1) DriveSyncArr 在段首按"脉冲数 x ARR = 常数"把左右两组的 ARR 定了。
+ *      中途改基准会把四路拉成同一个 ARR，比例当场失效，剩下的路只有
+ *      一侧在推 —— 车斜着走完这一段，而每一步单独看都没错。
+ *   2) 画线时速度决定单位长度的漆量，改速就是改线宽。
+ * 遥控点动（U/R/Y/Z/A/X）不限：那几路是无限行程，本来就没有左右比例，
+ * 而且"边走边调速对位"正是点动的用法。 */
+static uint8_t SpeedChangeAllowed(void)
+{
+    switch (sys_ctrl.state) {
+    case STATE_WAIT:
+    case STATE_TING:
+    case STATE_APPROACH:
+    case STATE_RETREAT:
+    case STATE_YOU:
+    case STATE_ZUO:
+    case STATE_MOVE_LEFT:
+    case STATE_MOVE_RIGHT:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* 第 3 行显示当前档位。改速的三个入口（'+' / '-' / CMD_SPEED）共用，
+ * 免得有一处忘了刷新，OLED 上的数和车上跑的就不一样了。 */
+static void ShowSpeedOnOled(void)
+{
+    OLED_ShowString(3, 1, "Speed ");
+    OLED_ShowNum(3, 7, StepMotor_GetSpeedBase(), 4);
+    OLED_ShowString(3, 11, "      ");
+}
+
 /* ==========================================================================
  * 帧协议接入
  *
@@ -373,6 +433,7 @@ static void HandleFrame(const uint8_t *f, uint8_t from)
     uint16_t mm;
     uint16_t right_mm;
     uint16_t len_mm, wid_mm;
+    uint16_t arr;
     int16_t  trim_mm;
 
     /* 上电静默同样管帧。帧头和 CRC 只能证明"这串字节没被打乱"，
@@ -566,6 +627,20 @@ static void HandleFrame(const uint8_t *f, uint8_t from)
         }
         break;
 
+    case PROTO_CMD_SPEED:
+        /* 绝对设速。为什么是 ARR 而不是档位号，见 proto.h 里这段的说明。 */
+        arr = (uint16_t)(((uint16_t)d[0] << 8) | d[1]);
+
+        if (arr < PROTO_SPEED_MIN_ARR || arr > PROTO_SPEED_MAX_ARR) {
+            result = PROTO_ERR_RANGE;
+        } else if (!SpeedChangeAllowed()) {
+            result = PROTO_ERR_STATE;
+        } else {
+            StepMotor_SetUserSpeed(arr);
+            ShowSpeedOnOled();
+        }
+        break;
+
     case PROTO_CMD_PAINT:
         len_mm = (uint16_t)(((uint16_t)d[0] << 8) | d[1]);
         wid_mm = (uint16_t)(((uint16_t)d[2] << 8) | d[3]);
@@ -576,11 +651,17 @@ static void HandleFrame(const uint8_t *f, uint8_t from)
         if (len_mm < PROTO_PAINT_MIN_MM || len_mm > PROTO_PAINT_MAX_MM
             || wid_mm < PROTO_PAINT_MIN_MM || wid_mm > PROTO_PAINT_MAX_MM) {
             result = PROTO_ERR_RANGE;
+        } else if ((d[4] & PROTO_PAINT_FLAG_HEADING) && !Heading_IsReady()) {
+            /* 要了纠偏但陀螺仪没标定/没接上：回绝，而不是"照画但不纠"。
+             * 后者画出来是歪的，而日志里一切正常 —— 上位机会以为这一版
+             * 闭环已经在工作，然后去怀疑 CHASSIS_TURN_SCALE。 */
+            result = PROTO_ERR_HW;
         } else if (sys_ctrl.state != STATE_WAIT) {
             result = PROTO_ERR_STATE;
         } else {
             paint_len_mm = (float)len_mm;
             paint_wid_mm = (float)wid_mm;
+            paint_heading = (d[4] & PROTO_PAINT_FLAG_HEADING) ? 1 : 0;
             sys_ctrl.state = STATE_PAINT;
         }
         break;
@@ -790,20 +871,21 @@ static void HandleCmd(uint8_t cmd, uint8_t from) {
 		case 'T'://强制停止
         sys_ctrl.state = STATE_TING;
 				break;
-		case '+':   // 蓝牙专用：提速一档（上位机发来忽略）
-			if(from == SOURCE_BT) {
-				StepMotor_SpeedUp();
-				OLED_ShowString(3, 1, "Speed Up        ");
+		case '+':   // 提速一档（单字节通道：蓝牙和上位机都能用）
+			if (!SpeedChangeAllowed()) {
+			    /* 正在画线/走段：回绝，别让它以为生效了 */
+			    ReplyTo(from, '?');
 			} else {
-			    ReplyTo(from, '?');   /* 上位机发来：明确回绝，别让它以为生效了 */
+			    StepMotor_SpeedUp();
+			    ShowSpeedOnOled();
 			}
 			break;
-		case '-':   // 蓝牙专用：降速一档（上位机发来忽略）
-			if(from == SOURCE_BT) {
-				StepMotor_SpeedDown();
-				OLED_ShowString(3, 1, "Speed Down      ");
-			} else {
+		case '-':   // 降速一档（同 '+')
+			if (!SpeedChangeAllowed()) {
 			    ReplyTo(from, '?');
+			} else {
+			    StepMotor_SpeedDown();
+			    ShowSpeedOnOled();
 			}
 			break;
 		case '1': case '2': case '3': case '4': case '5':
@@ -1027,6 +1109,17 @@ void System_StateMachine(void) {
             gyro_measure = 0;
         }
 
+        /* 画车位结束（画完 / 急停 / 超时都是这条路）：把闭环还回原样。
+         * 不还的话，界面上勾选框写着"没接管"，实际还在纠下一条 MOVE，
+         * 于是视觉纠偏被回 BUSY —— 人会以为是视觉坏了。 */
+        if (sys_ctrl.last_state == STATE_PAINT) {
+            if (paint_heading_forced) {
+                Heading_SetEnabled(0);
+                paint_heading_forced = 0;
+            }
+            paint_heading = 0;
+        }
+
         Pump_Off();   // 泵只由下面每个状态的进入动作决定，别让它跟着上个状态活下来
         Buzzer_Off(); // 同理。原来 Buzzer_Off() 只有 RETREAT_BEEP 的未变分支在调，
                       // 所以按了 F 再在 2 秒内按别的键，蜂鸣器就一直响 ——
@@ -1110,6 +1203,19 @@ void System_StateMachine(void) {
 		}
 		case STATE_PAINT:
 {// 每次进入画线状态都从头开始
+            paint_trim_exhausted = 0;
+            paint_heading_forced  = 0;
+
+            /* 要了纠偏就把闭环打开，并记住"是不是这次打开的" —— 退出时
+             * 只还回自己打开的那一次，用户本来就开着的不能碰。 */
+            if (paint_heading) {
+                if (!Heading_IsEnabled()) {
+                    Heading_SetEnabled(1);
+                    paint_heading_forced = 1;
+                }
+                Heading_MarkReference();
+            }
+
             Pump_On();
             Motion_ForwardFlat(paint_len_mm);
             paint_step = PAINT_EDGE1;
@@ -1317,6 +1423,21 @@ void System_StateMachine(void) {
                     sys_ctrl.state = STATE_WAIT;
                     break;
                 }
+
+                /* 边走边纠。Heading_TrimDeltaMm 内部有节流（100ms）、死区
+                 * （0.4 度）和单次限幅，拿到 0 就是"这一拍不用动"。
+                 *
+                 * 返回 2 = 这条边的累计纠偏到顶（MOTION_TRIM_ACCUM_MAX_MM）。
+                 * 再纠下去内侧轮会越停越早，车开始原地打转，而每一步单独
+                 * 看都只是小修正。剩下的路让它走完，下一条边重新对齐。 */
+                if (paint_heading && !paint_trim_exhausted && PaintEdgeRunning()) {
+                    float delta = Heading_TrimDeltaMm();
+
+                    if (delta != 0.0f && Motion_Trim(delta) == 2) {
+                        paint_trim_exhausted = 1;
+                    }
+                }
+
                 switch (paint_step) {
                     case PAINT_EDGE1:
                         if (!StepMotor_IsAnyRunning()) {
@@ -1329,6 +1450,13 @@ void System_StateMachine(void) {
                     case PAINT_TURN1:
                         if (!StepMotor_IsAnyRunning()) {
                             Pump_On();
+                            /* 新的一条边从这一刻起算"直"。转弯本身带来的
+                             * 角度偏差在这里归零 —— 边是直的，角的误差归
+                             * CHASSIS_TURN_SCALE 管。 */
+                            if (paint_heading) {
+                                Heading_MarkReference();
+                                paint_trim_exhausted = 0;
+                            }
                             Motion_ForwardFlat(paint_wid_mm);
                             paint_step = PAINT_EDGE2;
                             OLED_ShowString(3, 1, "Paint:2/4       ");
@@ -1345,6 +1473,13 @@ void System_StateMachine(void) {
                     case PAINT_TURN2:
                         if (!StepMotor_IsAnyRunning()) {
                             Pump_On();
+                            /* 新的一条边从这一刻起算"直"。转弯本身带来的
+                             * 角度偏差在这里归零 —— 边是直的，角的误差归
+                             * CHASSIS_TURN_SCALE 管。 */
+                            if (paint_heading) {
+                                Heading_MarkReference();
+                                paint_trim_exhausted = 0;
+                            }
                             Motion_ForwardFlat(paint_len_mm);
                             paint_step = PAINT_EDGE3;
                             OLED_ShowString(3, 1, "Paint:3/4       ");
@@ -1361,6 +1496,13 @@ void System_StateMachine(void) {
                     case PAINT_TURN3:
                         if (!StepMotor_IsAnyRunning()) {
                             Pump_On();
+                            /* 新的一条边从这一刻起算"直"。转弯本身带来的
+                             * 角度偏差在这里归零 —— 边是直的，角的误差归
+                             * CHASSIS_TURN_SCALE 管。 */
+                            if (paint_heading) {
+                                Heading_MarkReference();
+                                paint_trim_exhausted = 0;
+                            }
                             Motion_ForwardFlat(paint_wid_mm);
                             paint_step = PAINT_EDGE4;
                             OLED_ShowString(3, 1, "Paint:4/4       ");

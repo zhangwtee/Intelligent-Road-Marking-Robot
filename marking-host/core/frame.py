@@ -58,8 +58,13 @@ CMD_LEVEL = 0x03        # DATA[0] = 档位 1~5，兼容旧的 '1'~'5'
 CMD_TRIM = 0x04         # DATA[0:1] = int16 毫米，>0 向右修正，只在移动中有效
 CMD_PUMP = 0x05         # DATA[0] = 0 关 / 1 开
 CMD_PAINT = 0x06        # DATA[0:1]=长 mm，DATA[2:3]=宽 mm，0=默认 5300/2500
+                        # DATA[4]=标志，bit0 = 四条边走陀螺仪航向闭环
 CMD_GYRO = 0x07         # DATA[0]=子命令，陀螺仪航向闭环
+CMD_SPEED = 0x08        # DATA[0:1]=速度 ARR（大端），越小越快，150~1500
 CMD_PING = 0x09         # 无参数，只回 ACK
+
+# CMD_PAINT 的 DATA[4] 标志
+PAINT_FLAG_HEADING = 0x01   # 四条边用航向闭环。陀螺仪没标定时固件回 ERR_HW
 
 # CMD_GYRO 的子命令
 GYRO_OFF = 0x00         # 关闭环，直线交回视觉/开环
@@ -120,6 +125,7 @@ CMD_NAMES = {
     CMD_PUMP: "水泵",
     CMD_PAINT: "画车位",
     CMD_GYRO: "陀螺仪",
+    CMD_SPEED: "速度",
     CMD_PING: "PING",
     CMD_ACK: "ACK",
     CMD_STATUS: "状态",
@@ -133,6 +139,13 @@ MOVE_MAX_MM = 5000
 TRIM_MAX_MM = 20        # 必须等于 proto.h 的 PROTO_TRIM_MAX_MM
 PAINT_MIN_MM = 1000
 PAINT_MAX_MM = 8000
+
+# 速度参数就是固件写进定时器那个 ARR（计数时钟 1MHz，ARR 即微秒数）：
+# 越小越快。范围取固件 StepMotor_New.c 的 SPEED_FAST_ARR / SPEED_SLOW_ARR，
+# protocol_test 会去对账 —— 对不上时界面上显示的档位就是假的。
+SPEED_MIN_ARR = 150         # 最快：6.7kHz 脉冲
+SPEED_MAX_ARR = 1500        # 最慢：667Hz 脉冲
+SPEED_DEFAULT_ARR = 300     # 上电默认，和固件 SPEED_DEFAULT_ARR 一致
 
 # 画车位的默认尺寸，和固件 system.c 的 PAINT_*_DEFAULT_MM 一致
 PAINT_LEN_DEFAULT_MM = 5300
@@ -244,9 +257,30 @@ def build_pump(on: bool, seq: int = 0) -> bytes:
     return build_frame(CMD_PUMP, seq, bytes([1 if on else 0]))
 
 
-def build_paint(length_mm: int = 0, width_mm: int = 0, seq: int = 0) -> bytes:
-    """按尺寸画一个矩形车位。传 0 表示用固件里的默认值 5.3m x 2.5m。"""
-    return build_frame(CMD_PAINT, seq, _u16(length_mm) + _u16(width_mm))
+def build_paint(length_mm: int = 0, width_mm: int = 0, heading: bool = False,
+                seq: int = 0) -> bytes:
+    """按尺寸画一个矩形车位。传 0 表示用固件里的默认值 5.3m x 2.5m。
+
+    heading=True 让四条边走陀螺仪航向闭环：画车位的边是 ForwardFlat（匀速、
+    无斜坡），本来没有任何航向兜底，一条 5.3 米的边左右轮差 1% 就是末端 5cm，
+    四条边还往同一个方向偏。
+
+    这个开关随帧走而不是单独一条命令：一帧原子，"尺寸和纠偏一起生效"，
+    不会出现「开关改了但这次画车位没赶上」。
+    """
+    flags = PAINT_FLAG_HEADING if heading else 0
+    return build_frame(CMD_PAINT, seq,
+                       _u16(length_mm) + _u16(width_mm) + bytes([flags]))
+
+
+def build_speed(arr: int, seq: int = 0) -> bytes:
+    """设速度。arr 是脉冲定时器的 ARR（越小越快），不是"第几档"。
+
+    为什么不发档位号：ARR 是固件真正写进寄存器的那两个数之一，中间再加
+    一层档位表，就多一处"两边表不一样"的机会 —— 补喷长度当年就是这么
+    从档位改成毫米的。越界值固件回 ERR_RANGE，界面上的滑条已经先挡了一道。
+    """
+    return build_frame(CMD_SPEED, seq, _u16(arr))
 
 
 def build_level(level: int, seq: int = 0) -> bytes:
@@ -291,7 +325,10 @@ def describe(cmd: int, data: bytes) -> str:
     if cmd == CMD_PAINT:
         length = (data[0] << 8) | data[1] or PAINT_LEN_DEFAULT_MM
         width = (data[2] << 8) | data[3] or PAINT_WID_DEFAULT_MM
-        return f"画车位 {length}x{width}mm"
+        tail = " +陀螺仪纠偏" if data[4] & PAINT_FLAG_HEADING else ""
+        return f"画车位 {length}x{width}mm{tail}"
+    if cmd == CMD_SPEED:
+        return f"速度 {((data[0] << 8) | data[1])}"
     if cmd == CMD_PING:
         return "PING"
     if cmd == CMD_ACK:

@@ -53,8 +53,20 @@
                                      * 唯一的执行口：它不改"走多远"，只改
                                      * "左右两边各自还差多少"。 */
 #define PROTO_CMD_PUMP      0x05    /* DATA[0] = 0 关 / 1 开，只在 WAIT/MOVE */
-#define PROTO_CMD_PAINT     0x06    /* DATA[0:1] 长 mm，DATA[2:3] 宽 mm，0=默认 */
+#define PROTO_CMD_PAINT     0x06    /* DATA[0:1] 长 mm，DATA[2:3] 宽 mm，0=默认
+                                     * DATA[4]   = 标志，bit0 = 四条边用航向闭环 */
 #define PROTO_CMD_GYRO      0x07    /* DATA[0] = 子命令（见下），陀螺仪航向闭环 */
+#define PROTO_CMD_SPEED     0x08    /* DATA[0:1] = 速度参数 ARR 大端，越小越快。
+                                     * 见 PROTO_SPEED_MIN/MAX_ARR。
+                                     *
+                                     * 为什么给 ARR 而不是"第几档"：ARR 就是固件
+                                     * 真正写进定时器的那两个数之一，中间再加一层
+                                     * 档位表，就多一处"两边档位表不一样"的机会。
+                                     * 补喷长度当年就是从档位改成毫米的。
+                                     *
+                                     * 只允许在空闲 / 急停 / 遥控点动时改。段内改
+                                     * 会把段首按脉冲比例定好的左右 ARR 拉平，
+                                     * 剩下的路只有一侧在推，车斜着走完这一段。 */
 #define PROTO_CMD_PING      0x09    /* 无参数，只回 ACK */
 
 /* ---- CMD_GYRO 的子命令（DATA[0]） ----
@@ -117,6 +129,19 @@
                                          * 一致，protocol_test 会对账这两个数 */
 #define PROTO_PAINT_MIN_MM      1000
 #define PROTO_PAINT_MAX_MM      8000
+
+/* ---- CMD_PAINT 的 DATA[4] 标志 ---- */
+#define PROTO_PAINT_FLAG_HEADING 0x01   /* 四条边走陀螺仪航向闭环。
+                                         * 陀螺仪没标定时整条命令回 ERR_HW ——
+                                         * "照画但不纠"是歪的且没人报错。 */
+
+/* ---- 速度：脉冲定时器的 ARR（计数时钟 1MHz，ARR 即微秒数）
+ *
+ * 这两个值和 StepMotor_New.c 的 SPEED_FAST_ARR / SPEED_SLOW_ARR 必须一致，
+ * 越界的帧在这里就回绝，而不是让底层默默夹紧 —— 夹紧的话上位机界面上
+ * 显示的数和车上真正跑的数就不一样了。 */
+#define PROTO_SPEED_MIN_ARR     150     /* 最快：6.7kHz，约 1.3m/s */
+#define PROTO_SPEED_MAX_ARR     1500    /* 最慢：667Hz，约 0.13m/s */
 
 /* CRC-8/ATM：poly 0x07，初值 0，不反射，不异或输出。
  * 标准自检值 Proto_Crc8("123456789", 9) == 0xF4，上位机用同一个值锚定。 */
