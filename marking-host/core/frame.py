@@ -89,6 +89,9 @@ CMD_ACK = 0x81          # DATA[0]=原命令 DATA[1]=结果码
 CMD_STATUS = 0x82       # DATA[0]=状态 DATA[1]=段号 DATA[2]=标志 DATA[3:5]=脉冲
 CMD_HEADING = 0x83      # DATA[0:1]=int16 航向 0.01°，DATA[2:3]=int16 角速度 0.1dps
                         # DATA[4] 高 4 位=陀螺仪状态，低 4 位=掉线次数
+CMD_SPEED_INFO = 0x84   # DATA[0:1]=固件当前档位 ARR 大端，DATA[2]=标志
+                        # 1Hz 兜底、值一变立刻补发。以前速度只有下行：
+                        # 手机上按 +/- 改完，这边滑条还停在老值。
 
 # STATUS 帧 DATA[2] 的标志位，和固件 SendStatusFrame 里那几行 |= 一一对应。
 # 以前是散落在 UI 里的魔法数字，加一位就要在两边各改一处，改漏了不报错。
@@ -99,6 +102,9 @@ STATUS_FLAG_GYRO_READY = 0x08   # 陀螺仪在线且已标零
 STATUS_FLAG_GYRO_CLOSED = 0x10  # 航向闭环正在跑
 STATUS_FLAG_GYRO_ERR = 0x20     # 这一局读过 I2C 错误（精度已打折扣）
 STATUS_FLAG_RESUME = 0x40       # 画车位有急停断点，可以续画
+
+# SPEED_INFO 帧 DATA[2] 的标志位
+SPEED_FLAG_SAVED = 0x01     # 已写进固件 flash，断电不丢
 
 # 陀螺仪状态码，和固件 heading.h 的 HeadingState 一一对应
 GYRO_STATE_NAMES = {
@@ -152,6 +158,7 @@ CMD_NAMES = {
     CMD_ACK: "ACK",
     CMD_STATUS: "状态",
     CMD_HEADING: "航向",
+    CMD_SPEED_INFO: "当前速度",
 }
 
 # 参数范围（和固件 proto.h 里的 PROTO_* 一一对应）
@@ -376,6 +383,10 @@ def describe(cmd: int, data: bytes) -> str:
         names = {GYRO_OFF: "关闭环", GYRO_ON: "开闭环",
                  GYRO_RECAL: "重标零", GYRO_MEASURE: "标轮距"}
         return f"陀螺仪 {names.get(data[0], hex(data[0]))}"
+    if cmd == CMD_SPEED_INFO:
+        arr = (data[0] << 8) | data[1]
+        tail = " 已存" if data[2] & SPEED_FLAG_SAVED else " 待存"
+        return f"速度 {arr}{tail}"
     if cmd == CMD_HEADING:
         deg = _s16(data[0], data[1]) / 100.0
         rate = _s16(data[2], data[3]) / 10.0
@@ -401,6 +412,11 @@ def make_frame_record(frame: bytes) -> dict:
 
     # 航向帧额外给几个结构化字段。UI 不该为了拿一个角度去切片 data 数组 ——
     # 那样每个调用点都要自己处理符号和单位，迟早有一处漏掉。
+    if cmd == CMD_SPEED_INFO:
+        # 和航向帧同一个理由：UI 不该为了拿个整数去自己切片。
+        record["speed_arr"] = (data[0] << 8) | data[1]
+        record["speed_saved"] = bool(data[2] & SPEED_FLAG_SAVED)
+
     if cmd == CMD_HEADING:
         record["heading_deg"] = _s16(data[0], data[1]) / 100.0
         record["rate_dps"] = _s16(data[2], data[3]) / 10.0

@@ -654,6 +654,16 @@
           <GroupName>Hardware</GroupName>
           <Files>
             <File>
+              <FileName>cfg.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\Hardware\cfg.c</FilePath>
+            </File>
+            <File>
+              <FileName>cfg.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\Hardware\cfg.h</FilePath>
+            </File>
+            <File>
               <FileName>chassis.h</FileName>
               <FileType>5</FileType>
               <FilePath>.\Hardware\chassis.h</FilePath>
@@ -1459,6 +1469,16 @@
         <Group>
           <GroupName>Hardware</GroupName>
           <Files>
+            <File>
+              <FileName>cfg.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\Hardware\cfg.c</FilePath>
+            </File>
+            <File>
+              <FileName>cfg.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\Hardware\cfg.h</FilePath>
+            </File>
             <File>
               <FileName>chassis.h</FileName>
               <FileType>5</FileType>

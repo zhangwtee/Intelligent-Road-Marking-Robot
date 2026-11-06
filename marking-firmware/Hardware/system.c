@@ -5,6 +5,7 @@
 #include "chassis.h"    /* 底盘车型：麦轮 / 四轮差速，由 Target 的 Define 决定 */
 #include "heading.h"    /* 陀螺仪航向估计与直线闭环 */
 #include "mpu6050.h"    /* 只为了拿错误计数给状态帧用 */
+#include "cfg.h"        /* 速度档位的掉电保存 */
 /* 画车位的尺寸和转角。
  *
  * 改造前这里是三个脉冲数（26500 / 12500 / 3000）—— 它们等于多少米、多少度，
@@ -234,6 +235,70 @@ static void PaintCaptureResume(void)
     paint_resume_valid   = 1;
 }
 
+/* ---- 速度档位的掉电保存 ----
+ *
+ * 只在"车停着、状态空闲、改完已经过了 2 秒"的时候写 flash：
+ *   1) 擦一页要几十毫秒，这段时间取指被挂起，正在发脉冲的那一路会少几步
+ *      —— 开环步进丢的步补不回来。而改速本来只许在空闲/急停/遥控点动里做，
+ *      遥控点动那几种状态电机是转着的，所以不能只看状态，还得看电机。
+ *   2) 2 秒是给"拖滑条调几档"留的合并窗口。flash 擦写寿命一万次上下，
+ *      每拖一下就写一次，几百次调试就磨掉一成的余量。
+ *
+ * 变速的检测放在这里比对 speed_base，而不是塞进 '+'/'-'/CMD_SPEED 三个分支：
+ * 以后再加一条改速度的路，忘了在这里登记的后果是"改了但不保存" —— 这类
+ * 静默失效在断电之后才被发现，查起来最远。 */
+#define SPEED_SAVE_DELAY_MS   2000
+
+static uint16_t speed_seen;
+static uint8_t  speed_seen_valid;
+static uint32_t speed_changed_ms;
+static uint8_t  speed_save_pending;
+
+static void SpeedSaveService(void)
+{
+    uint16_t arr = StepMotor_GetSpeedBase();
+
+    if (!speed_seen_valid) {
+        /* 第一圈只对齐基线，不当作"用户改了速"。
+         *
+         * 但新板子第一次上电时 flash 里什么都没有，界面上那个"未保存"
+         * 标记会永远是橙的 —— 而那个标记的意思是"此刻断电会丢"，实际上
+         * 默认值就在代码里，断电也不丢。所以这里把默认值存一次，让
+         * "存过的值 == 正在跑的值"这个等式从一开始就成立。
+         * 存过一次之后，之后每次上电都能读到，不会再走到这个分支。 */
+        speed_seen         = arr;
+        speed_seen_valid   = 1;
+        speed_save_pending = (uint8_t)(arr != Cfg_GetSavedSpeed());
+        speed_changed_ms   = timer_counter;
+        return;
+    }
+
+    if (arr != speed_seen) {
+        speed_seen         = arr;
+        speed_save_pending = (uint8_t)(arr != Cfg_GetSavedSpeed());
+        speed_changed_ms   = timer_counter;
+    }
+
+    if (!speed_save_pending) {
+        return;
+    }
+    if ((uint32_t)(timer_counter - speed_changed_ms) < SPEED_SAVE_DELAY_MS) {
+        return;
+    }
+    if (sys_ctrl.state != STATE_WAIT && sys_ctrl.state != STATE_TING) {
+        return;                 /* 还在干别的，等停下再说 */
+    }
+    if (StepMotor_IsAnyRunning()) {
+        return;                 /* 遥控点动里也在转，一样不能写 */
+    }
+
+    /* 写失败（比如页被写保护）就让 pending 留着，下一圈再试 ——
+     * 界面上的"已保存"标记不会亮，人至少能看出来它没存上。 */
+    if (Cfg_SaveSpeed(arr)) {
+        speed_save_pending = 0;
+    }
+}
+
 // TIM1初始化函数
 void TIM1_Init(void) {
     TIM_TimeBaseInitTypeDef TIM_TimeBaseStructure;
@@ -313,6 +378,21 @@ StepMotor_SetPulse(MOTOR4, 1);
      * F103 没有 FPU，运行时的浮点除法一次要几十微秒，放在状态机里
      * 会让脉冲启停明显滞后。 */
     Motion_Init();
+
+    /* 速度档位从 flash 恢复。放在 Motion_Init 之后、Heading_Init 之前：
+     * 这里只改 speed_base（用户档位），真正写进定时器要等下一次
+     * SetPulse，所以上电不会因此自己动一下，也不会打乱下面陀螺仪的
+     * 上电等待。
+     *
+     * 读不到有效值就保持 StepMotor_Init 里的 SPEED_DEFAULT_ARR —— 一块
+     * 新板子第一次上电走的就是这条。 */
+    {
+        uint16_t saved_speed;
+
+        if (Cfg_LoadSpeed(&saved_speed)) {
+            StepMotor_SetUserSpeed(saved_speed);
+        }
+    }
 
     /* 陀螺仪放在最后初始化：MPU6050_Init 里有 200 多毫秒的上电等待
      * （手册 tPOWERUP + 软复位恢复时间），放在前面会把串口、舵机、电机
@@ -910,6 +990,37 @@ static void SendHeadingFrame(void)
     SendFrame(SOURCE_PI, PROTO_CMD_HEADING, 0, d);
 }
 
+/* 速度帧：把固件当前档位报给上位机。
+ *
+ * 发送时机：值一变立刻发（滑条拖一下马上能看到回执），没变 1Hz 兜底。
+ * 1Hz 不是 5Hz —— 这一帧除了"现在多快"没有别的用途，9600 下省下来的
+ * 带宽是 ACK 和错误码的，而那两样才是排障时真正要看的。 */
+static uint16_t speed_info_arr = 0xFFFF;    /* 0xFFFF 保证第一帧一定发出去 */
+static uint32_t speed_info_ms;
+
+static void SendSpeedInfoFrame(void)
+{
+    uint8_t  d[PROTO_DATA_LEN] = {0, 0, 0, 0, 0};
+    uint16_t arr = StepMotor_GetSpeedBase();
+
+    if (arr == speed_info_arr
+        && (uint32_t)(timer_counter - speed_info_ms) < PROTO_SPEED_INFO_PERIOD_MS) {
+        return;
+    }
+    speed_info_arr = arr;
+    speed_info_ms  = timer_counter;
+
+    d[0] = (uint8_t)((arr >> 8) & 0xFF);
+    d[1] = (uint8_t)(arr & 0xFF);
+    if (Cfg_GetSavedSpeed() == arr) {
+        /* 打到闪存里了才置位：上位机据此显示"断电还在"还是"过一会儿才存"。
+         * 反过来，若拿"发过 CMD_SPEED"当已保存，掉电丢值的现场会没有任何线索。 */
+        d[2] |= PROTO_SPEED_FLAG_SAVED;
+    }
+
+    SendFrame(SOURCE_PI, PROTO_CMD_SPEED_INFO, 0, d);
+}
+
 static void HandleCmd(uint8_t cmd, uint8_t from) {
     /* 上电静默：头 3 秒只放行急停。
      * 'T' 必须例外 —— 急停在任何时刻都得有效，包括上电那一瞬间。 */
@@ -1212,6 +1323,12 @@ void System_StateMachine(void) {
     ProcessCommand();
     SendStatusFrame();     /* 5Hz 上行状态，只发给树莓派 */
     SendHeadingFrame();    /* 5Hz 上行航向，未就绪时不发 */
+    SendSpeedInfoFrame();  /* 变速立刻发，否则 1Hz 兜底 */
+
+    /* 速度的掉电保存：改完 2 秒、车停着、状态空闲时才真正写 flash。
+     * 放在状态机之前 —— 状态机里那一轮可能刚把车开起来，先让这里
+     * 看一眼"停没停"，比在状态机里到处埋点可靠。 */
+    SpeedSaveService();
     uint32_t current_time = GetTick();
 	 // 检测状态是否改变
     if (sys_ctrl.state != sys_ctrl.last_state) {

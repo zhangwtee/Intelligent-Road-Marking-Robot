@@ -395,6 +395,104 @@ def test_second_estop_does_not_wipe_the_breakpoint():
     )
 
 
+def test_speed_info_is_the_firmware_side_of_the_same_constant():
+    """速度回传帧：上位机认的号、固件发的号，必须是同一个。
+
+    这条帧以前不存在，所以"界面显示 300、车上跑 200"是常态。号对不上时
+    不会报错 —— 上位机只是把这一帧当成"未知帧"写进日志，滑条一动不动，
+    看起来和没加这个功能一样。
+    """
+    text = FIRMWARE_C.read_bytes().decode("gbk", errors="replace")
+    head = FIRMWARE_PROTO_H.read_bytes().decode("gbk", errors="replace")
+
+    assert f"PROTO_CMD_SPEED_INFO 0x{frame.CMD_SPEED_INFO:02X}" in head, "proto.h 里没有这个号"
+    assert f"PROTO_SPEED_FLAG_SAVED  0x{frame.SPEED_FLAG_SAVED:02X}" in head, "标志位对不上"
+
+    # 固件必须真的发它：光有常量、没有发送点，等于上位机永远收不到
+    assert "SendFrame(SOURCE_PI, PROTO_CMD_SPEED_INFO, 0, d)" in text, "固件里没有发送点"
+
+
+def test_speed_info_frame_is_readable():
+    """速度帧能被翻译成人话，并且给出结构化字段。
+
+    上位机不该为了拿一个整数自己去切 data[0:2] —— 那样每个调用点都要
+    处理一遍字节序，迟早有一处写反。
+    """
+    f = frame.build_frame(
+        frame.CMD_SPEED_INFO, 0,
+        bytes([(600 >> 8) & 0xFF, 600 & 0xFF, frame.SPEED_FLAG_SAVED]),
+    )
+    assert frame.check_frame(f)
+
+    record = frame.make_frame_record(f)
+    assert record["speed_arr"] == 600, record
+    assert record["speed_saved"] is True, record
+    assert "600" in record["status"], record["status"]
+    assert "已存" in record["status"], record["status"]
+
+    unsaved = frame.build_frame(frame.CMD_SPEED_INFO, 0, bytes([0, 200, 0]))
+    record = frame.make_frame_record(unsaved)
+    assert record["speed_saved"] is False, record
+    assert "待存" in record["status"], record["status"]
+
+
+def test_speed_save_waits_until_the_car_is_standing_still():
+    """存速度的那次擦除，必须等车停稳。
+
+    擦一页要几十毫秒，这段时间取指被挂起、中断排在后面 —— 正在发脉冲的
+    那一两路会少几步，而开环步进丢的步补不回来。症状是"偶尔画线短一截"，
+    没人会把它和"保存速度"联系起来。所以两个条件都得在：状态空闲、电机停着。
+    """
+    text = FIRMWARE_C.read_bytes().decode("gbk", errors="replace")
+
+    match = re.search(r"static void SpeedSaveService\(void\)\s*\{(.*?)\n\}", text, re.S)
+    assert match, "固件里找不到 SpeedSaveService"
+    body = match.group(1)
+
+    assert "StepMotor_IsAnyRunning()" in body, "存速度前没检查电机在不在转"
+    assert "STATE_WAIT" in body and "STATE_TING" in body, "存速度前没检查状态"
+    assert "SpeedSaveService();" in text, "主循环里没有调用，等于永远不保存"
+
+
+def test_flash_page_is_the_last_page_of_the_image():
+    """保存速度用的那一页，必须落在 IROM 声明的范围里，而且是最后一页。
+
+    这台机器的 IROM 是 0x08000000 + 0x80000（512K）。将来换成 C8 那种 128K
+    的板子、或者把 IROM 改小，cfg.c 里写死的地址就会跑到器件外面 ——
+    擦写直接失败，而失败的表现只是"速度存不住"，一点别的痕迹都没有。
+    页大小同理：F103 大容量是 2KB，中容量是 1KB，用错了会连带擦掉前一页。
+    """
+    proj = FIRMWARE_HW.parent / "Project.uvprojx"
+    xml = proj.read_text(encoding="utf-8", errors="replace")
+
+    roms = re.findall(
+        r"<IROM>\s*<Type>1</Type>\s*<StartAddress>(0x[0-9A-Fa-f]+)</StartAddress>"
+        r"\s*<Size>(0x[0-9A-Fa-f]+)</Size>",
+        xml,
+    )
+    assert roms, "工程里找不到 IROM 配置"
+    assert len(set(roms)) == 1, f"两个 Target 的 IROM 不一样: {roms}"
+
+    start, size = (int(v, 16) for v in roms[0])
+
+    cfg = (FIRMWARE_HW / "cfg.c").read_text(encoding="gbk", errors="replace")
+    page = int(re.search(r"#define\s+CFG_PAGE_SIZE\s+(\d+)u", cfg).group(1))
+    image_end = re.search(
+        r"#define\s+CFG_IMAGE_END\s+\(0x([0-9A-Fa-f]+)u\s*\+\s*(\d+)u\s*\*\s*(\d+)u\)",
+        cfg,
+    )
+    assert image_end, "cfg.c 里 CFG_IMAGE_END 的写法变了，测试要跟着改"
+
+    cfg_start = int(image_end.group(1), 16)
+    cfg_end = cfg_start + int(image_end.group(2)) * int(image_end.group(3))
+
+    assert page == 2048, f"F103 大容量的页是 2KB，cfg.c 写的是 {page}"
+    assert cfg_start == start, f"cfg.c 的基址 0x{cfg_start:08X} != IROM 0x{start:08X}"
+    assert cfg_end == start + size, (
+        f"cfg.c 认为镜像到 0x{cfg_end:08X}，工程 IROM 到 0x{start + size:08X}"
+    )
+
+
 def test_paint_default_size_matches_firmware():
     """界面上预填的默认尺寸，得和固件里烧死的默认值一样。
 

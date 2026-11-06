@@ -1,3 +1,5 @@
+import time
+
 import cv2
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QTextEdit, QLabel,
@@ -13,6 +15,13 @@ from core.ack import AckTracker
 from core.protocol import (
     PANEL_BUTTONS, CAMERA_BUTTONS, CAMERA_OFF_BUTTONS, PAINT_BUTTON, ESTOP_BUTTON
 )
+
+# 发出 CMD_SPEED 之后，多久开始相信速度帧。
+#
+# 我们自己那帧发出去到固件生效之间，上行里可能还有一两帧是旧值（速度帧
+# 1Hz，最坏要 1 秒才刷新）。不挡的话松手瞬间滑条会先跳回旧值、再跳回来。
+# 0.5 秒是折中：够固件把帧收完，又不至于把手机上改的值挡太久。
+SPEED_SETTLE_S = 0.5
 
 
 class MainWindow(QWidget):
@@ -219,8 +228,10 @@ class MainWindow(QWidget):
             f"数值越小越快：{frame.SPEED_MIN_ARR}（最快）~ "
             f"{frame.SPEED_MAX_ARR}（最慢）。"
             "松手才发一帧 —— 拖动过程中每变一个值就发一帧会把串口刷满。\n"
-            "注意：手机上按 +/- 改了速度，这里不会跟着变（状态帧里没有速度字段），"
-            "滑条只反映本界面最后一次发出去的值。"
+            "滑条跟着固件回的速度帧（0x84）走：手机上按 +/- 改完，这里会自动跟过去，"
+            "所以它显示的一直是车上正在跑的值，不是本界面最后一次发出去的值。\n"
+            "数字变成橙色表示还没写进 flash（改完 2 秒、车停着才写），"
+            "断电可能回到上一次存下的档位。"
         )
         self.speed_slider.valueChanged.connect(self.on_speed_changed)
         self.speed_slider.sliderReleased.connect(self.on_speed_released)
@@ -234,6 +245,8 @@ class MainWindow(QWidget):
 
         left_layout.addLayout(speed_row)
         self._speed_sent = None        # 上一次真的发出去的 ARR
+        self._firmware_speed = None     # 固件最近一次报回来的档位
+        self._speed_sent_at = 0.0       # 上一次发 CMD_SPEED 的时刻
 
         self.btn_paint = QPushButton(PAINT_BUTTON)
         self.btn_paint.setMinimumHeight(40)
@@ -478,6 +491,9 @@ class MainWindow(QWidget):
             self._apply_gyro_flags(flags)
             self._apply_resume_flag(flags)
 
+        elif cmd == frame.CMD_SPEED_INFO and len(payload) >= 2:
+            self._apply_speed_info(item)
+
         elif cmd == frame.CMD_HEADING:
             self._update_heading(item)
 
@@ -500,6 +516,10 @@ class MainWindow(QWidget):
         # 航向帧同样是 5Hz，只更新界面，不进日志 ——
         # 进日志的话按钮回显和 ACK 会被它淹没，而那两样才是排障时要看的。
         if item.get("kind") == "frame" and item.get("cmd") == frame.CMD_HEADING:
+            return
+
+        # 速度帧 1Hz，同理由：只更新滑条，不进日志。
+        if item.get("kind") == "frame" and item.get("cmd") == frame.CMD_SPEED_INFO:
             return
 
         if not self.recv_pause_checkbox.isChecked():
@@ -665,8 +685,57 @@ class MainWindow(QWidget):
         self.send_frame(frame.build_paint(resume=True), "画车位 续画")
 
     # ---------------- 速度 ----------------
+    def _apply_speed_info(self, item):
+        """按固件报回来的速度帧回填滑条。
+
+        为什么必须回填：改速有两条路（本界面滑条、手机蓝牙 +/-）。不回填的话，
+        手机改完这里还停在老值，人按界面上的数字判断漆量 —— 而车跑的是另一个
+        速度。固件那边限幅（滑条给 140 会被夹成 150）也是靠这条帧才看得见。
+
+        手指还按在滑条上时不回填：那会和用户抢，滑条自己跳回去。
+        松手后我们会发一帧，固件再回一帧确认，中间的差异不会留到最后。
+        """
+        arr = item.get("speed_arr")
+        if not isinstance(arr, int) or not (frame.SPEED_MIN_ARR <= arr <= frame.SPEED_MAX_ARR):
+            return          # 帧坏了（CRC 放过但值不合理）就别拿它动界面
+
+        self._firmware_speed = arr
+
+        # 刚发出去、还没被固件处理：这一两帧是旧值，别拿它把滑条拽回去。
+        if (arr != self._speed_sent
+                and time.monotonic() - self._speed_sent_at < SPEED_SETTLE_S):
+            return
+
+        if not self.speed_slider.isSliderDown():
+            if self.speed_slider.value() != arr:
+                self.speed_slider.blockSignals(True)
+                self.speed_slider.setValue(arr)
+                self.speed_slider.blockSignals(False)
+            self.speed_label.setText(str(arr))
+
+        # 固件已经在这个值上了，再按"值没变不发"的规则也就不会重发 ——
+        # 但对齐一下 _speed_sent，省得"手机改到 200、界面拖回 200"时误发一帧。
+        self._speed_sent = arr
+
+        # 橙色 = 还在等固件写 flash。等它置上 0x01 这位，颜色回到默认。
+        saved = item.get("speed_saved", False)
+        self.speed_label.setStyleSheet(
+            "font-size:16px; font-weight:bold;" if saved
+            else "font-size:16px; font-weight:bold; color:#b06000;"
+        )
+        self.speed_label.setToolTip(
+            "已写进固件 flash，断电不丢" if saved
+            else "固件还没写 flash（改完 2 秒、车停着才写），现在断电会回到上次存的档位"
+        )
+
     def on_speed_changed(self, arr):
         self.speed_label.setText(str(arr))
+        # 刚动过滑条，这个值一定还没写进 flash —— 先标橙，等下一条速度帧
+        # 回来说"存好了"再变回去。不这么做的话，松手后到固件写完之间的
+        # 一两秒里，标签是黑的，看着像已经存上了。
+        self.speed_label.setStyleSheet(
+            "font-size:16px; font-weight:bold; color:#b06000;"
+        )
 
         # 拖动过程中不发。QSlider 每移一个像素就 valueChanged 一次，9600 下
         # 一帧 10.4ms —— 拖一下就几十条，ACK 和错误码会被冲干净，固件那边
@@ -684,6 +753,7 @@ class MainWindow(QWidget):
         if arr == self._speed_sent:
             return
         self._speed_sent = arr
+        self._speed_sent_at = time.monotonic()
         self.send_frame(frame.build_speed(arr), f"速度 {arr}")
 
     def send_button(self):

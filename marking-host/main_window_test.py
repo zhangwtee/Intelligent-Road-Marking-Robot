@@ -70,6 +70,15 @@ def heading_frame(deg, rate=0.0, state=3, errors=0):
     )
 
 
+def speed_info_frame(arr, saved=True):
+    """固件上行 0x84：当前档位 + 有没有写进 flash。"""
+    return frame.build_frame(
+        frame.CMD_SPEED_INFO, 0,
+        bytes([(arr >> 8) & 0xFF, arr & 0xFF,
+               frame.SPEED_FLAG_SAVED if saved else 0]),
+    )
+
+
 def test_heading_label_shows_signed_degrees():
     w = make_window()
 
@@ -350,6 +359,79 @@ def test_speed_is_not_resent_when_unchanged():
     w.on_speed_released()
 
     assert len(w.serial_mgr.sent) == 1, w.serial_mgr.sent
+
+
+def test_speed_info_moves_the_slider_without_sending():
+    """固件报回的速度要回填到滑条上，而且不能因此再发一帧。
+
+    回填是这条帧存在的全部理由：手机蓝牙按 +/- 改完，树莓派面板上还写着老值，
+    人会按那个数字判断漆量和拐角冲击。而回填时若顺手触发一次 valueChanged，
+    就成了"收到 700、回发 700、再收到 700"的自激。
+    """
+    w = make_window()
+
+    w.on_data_received(speed_info_frame(700))
+
+    assert w.speed_slider.value() == 700, w.speed_slider.value()
+    assert w.speed_label.text() == "700"
+    assert w.serial_mgr.sent == [], "回填滑条时又发了一帧"
+
+
+def test_speed_info_does_not_fight_the_drag():
+    """手指按在滑条上时，固件报的值不能把滑条拽回去。
+
+    拖动中的每一帧都是"过去的值"（固件还没收到我们最新的那帧），
+    拿它回填等于和用户抢控件：滑条会一跳一跳。
+    """
+    w = make_window()
+    w.speed_slider.isSliderDown = lambda: True     # 假装正按着鼠标
+
+    w.speed_slider.setValue(250)
+    w.on_data_received(speed_info_frame(900))
+
+    assert w.speed_slider.value() == 250, "拖动中被固件值拽走了"
+
+
+def test_speed_label_marks_the_value_that_is_not_in_flash():
+    """没写进 flash 的值要看得出来，否则"断电还在"是个默认假设。"""
+    w = make_window()
+
+    w.on_data_received(speed_info_frame(600, saved=False))
+    assert "#b06000" in w.speed_label.styleSheet(), "未保存没有标记"
+
+    w.on_data_received(speed_info_frame(600, saved=True))
+    assert "#b06000" not in w.speed_label.styleSheet(), "已保存还留着橙色"
+
+
+def test_speed_info_right_after_sending_is_ignored():
+    """刚发出去的那一两帧旧值不能把滑条拽回去。
+
+    速度帧 1Hz，我们发完到固件处理完之间，上行的可能还是旧值 ——
+    不挡的话松手瞬间滑条会"跳回旧值、再跳回来"，看着像没生效。
+    过了窗口之后要认账：固件限幅（拖到 140 夹成 150）就是这么显出来的。
+    """
+    w = make_window()
+
+    w.speed_slider.setValue(400)
+    assert len(w.serial_mgr.sent) == 1, w.serial_mgr.sent
+
+    w.on_data_received(speed_info_frame(300))        # 还带着旧值
+    assert w.speed_slider.value() == 400, "被在途的旧帧拽回去了"
+
+    w._speed_sent_at -= 1.0                          # 假装窗口已经过去
+    w.on_data_received(speed_info_frame(150))        # 固件限幅的结果
+    assert w.speed_slider.value() == 150, "限幅值没有回填"
+
+
+def test_speed_info_is_not_written_to_the_log():
+    """速度帧 1Hz，同样不能进接收日志。"""
+    w = make_window()
+
+    for _ in range(5):
+        w.on_data_received(speed_info_frame(320))
+
+    assert w.recv_log.toPlainText().strip() == "", w.recv_log.toPlainText()
+    assert w.speed_slider.value() == 320
 
 
 def test_heading_frames_do_not_flood_the_log():
