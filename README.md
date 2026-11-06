@@ -80,7 +80,7 @@ UV4.exe -b Project.uvprojx -t "4WD_Car" -j0 -o build_4wd.log
 | 原地转速度 | 用当前档位 | 压到 `CHASSIS_TURN_ARR`（≈220mm/s） |
 | 转角补偿 | 1.000 | 1.050（现场量了再改） |
 | 段内纠偏累计上限 | 200mm | 80mm |
-| 固件体积 | Code = 20862 | Code = 20574 |
+| 固件体积 | Code = 20946 | Code = 20658 |
 
 体积是 ZET6 版（四路独立时基 + 左右同步之后）用 Keil 命令行实测的，两套都
 `0 Error(s), 0 Warning(s)`。差值 288 字节就是横移那两个函数，和换板前一样 ——
@@ -186,7 +186,7 @@ Intelligent-Road-Marking-Robot/
 │   ├── protocol_test.py     # 上下位机指令集 + 帧常量对账（35 项）
 │   ├── chassis_test.py      # 双 Target 配置 / 条件编译是否真的生效（10 项）
 │   ├── main_window_test.py  # 航向显示 / 陀螺仪开关（offscreen 跑）（10 项）
-│   ├── motor_test.py        # 四路定时器 / 引脚 / 中断 / MOE / 起坡（12 项）
+│   ├── motor_test.py        # 四路定时器 / 引脚 / 中断 / MOE / 起坡（13 项）
 │   ├── motion_sync_test.py  # 左右同步的接线与数学（13 项）
 │   ├── lane_control_test.py # 控制律符号/限幅 + 闭环仿真（17 项）
 │   ├── ack_test.py          # 配对、超时、重发、SEQ 复用（13 项）
@@ -464,7 +464,8 @@ python3 main.py
 - 上电瞬间舵臂就会动。`Hardware_Init()` 一进去就调 `Servo_SetAngle(40)` / `Servo2_SetAngle(90)`，因为 DPWM 初始 `TIM_Pulse = 0`，不写这两句舵机收不到有效信号。上电前手离舵臂远点。
 - 串口协议没有校验，线上的噪声就是指令。9600 8N1、单字节 ASCII，没有帧头也没有校验和，线上任何一个乱字节（拔插、上电毛刺、蓝牙丢包）都可能被状态机当成 `U`（前进）甚至 `P`（自动画线），蓝牙那条尤其不可信。第一次跑某条链路，务必先把轮子架空。
 - 步进是开环的，没有编码器，丢步不可恢复，每次上电的位置等于上次断电那一刻再加一个未知误差，所以 `P` 画的 5.3m × 2.5m 矩形是以车当前位置为起点的，要消掉累积误差只能加限位 / 回零开关。
-- 步进的运动起停都走梯形斜坡（`RAMP_SOFT_ARR` 1800 → `speed_arr`，每 `RAMP_SOFT_STEP_PULSE` 个脉冲走 `RAMP_SOFT_STEP_ARR`），调试时不要绕过斜坡，也不要在加速段中间硬改频率，丢步就是这么来的。斜坡状态**每路一份**（`ramp_on / state / period / decel` 存在各自的 `MotorCh_t` 里）：四路 ARR 现在可以不同，共用一套斜坡的话，同一个「每次减 100」对 ARR=300 那路是 33% 提速，对 ARR=900 那路只有 11%，要么快的一路丢步、要么慢的一路起不来。
+- 步进的运动起停都走梯形斜坡（起点 1800 → 目标 `m->arr`，每 `RAMP_SOFT_STEP_PULSE` 个脉冲推进一档），调试时不要绕过斜坡，也不要在加速段中间硬改频率，丢步就是这么来的。
+  斜坡有两处是四路独立时才有意义的：**状态每路一份**（`ramp_on / state / period / decel / start` 在各自的 `MotorCh_t` 里），**起点和步长都按比例**。后一条容易忽略——如果四路都从 1800 起、每步固定减 100，左右分速时两路在整个起坡段是同速的，比例被抹平；短的那一路若没走出起坡段就停了，等于全程同速跑，比目标更快，车头往反方向偏。所以起点按「最慢那一路拿满 1800、其余等比缩小」算（左 300 / 右 600 → 左从 900 起），步长用当前 ARR 的 1/8（`RAMP_SOFT_SHIFT`），两路步数相同、比例整段恒定。
 - 四路脉冲各有一个 UPDATE 中断，最坏情况（四路同时跑最高档）合计约 27k 次/秒，72MHz 下占 CPU 不到 3%。这个数是在「四路都满速」的前提下算的，实际画线时转弯那一路会慢下来，占用更低。真正需要注意的是**中断里不要做浮点**：`StepMotor_New.c` 的四个 `TIMx_IRQHandler` 全是整数运算，加任何 `float` 都会拖进软浮点库，一次几十微秒，脉冲就抖了。
 - `T`（急停）是软件停止，不切电源。它让状态机停在 `TING`，但电机使能、泵的 GPIO 都还带电，手边必须有一个物理断电手段（电池开关 / 拔插头），别只靠串口发 `T`。
 - 泵里先装水，别装漆。确认过时序、喷幅、行进速度都对了再换漆。任何时候不要把喷头对着人。
@@ -474,7 +475,7 @@ python3 main.py
   3. 落地但空跑，不接泵，跑一遍 `P`，量实际画出来的尺寸对不对。
   4. 最后才接漆，头几次跑把手放在电源开关上。
 - 上下位机的指令集对齐由测试守着：`python3 protocol_test.py` 直接从固件 `system.c` 抠 `case '...'`、从 `proto.h` 抠 `#define`，和面板按钮表、`frame.py` 逐项对账，加了指令忘了同步会当场报。唯一已知的缺口是 `N`，写在该测试的 `NOT_IMPLEMENTED` 里。
-- 测试一共 132 项，都不需要硬件：`python3 protocol_test.py`（35）、`lane_control_test.py`（17）、`camera_widget_test.py`（17）、`ack_test.py`（13）、`motion_sync_test.py`（13）、`motor_test.py`（12）、`chassis_test.py`（10）、`main_window_test.py`（10）、`vision_test.py`（5）。其中 `motor_test` / `motion_sync_test` / `chassis_test` 是读固件源码的静态检查（不需要编译器）；其余只需要 numpy，`camera_widget_test.py` 和 `vision_test.py` 还要 `opencv-python-headless`，没有 PyQt5 也行（测试里有个只够本文件用的替身）。
+- 测试一共 133 项，都不需要硬件：`python3 protocol_test.py`（35）、`lane_control_test.py`（17）、`camera_widget_test.py`（17）、`ack_test.py`（13）、`motion_sync_test.py`（13）、`motor_test.py`（13）、`chassis_test.py`（10）、`main_window_test.py`（10）、`vision_test.py`（5）。其中 `motor_test` / `motion_sync_test` / `chassis_test` 是读固件源码的静态检查（不需要编译器）；其余只需要 numpy，`camera_widget_test.py` 和 `vision_test.py` 还要 `opencv-python-headless`，没有 PyQt5 也行（测试里有个只够本文件用的替身）。
 - **纠偏的三个上限写在两个地方，必须一致**：`proto.h` 的 `PROTO_TRIM_MAX_MM`、`motion.c` 的 `MOTION_TRIM_MAX_MM`、`lane_control.py` 的 `GAINS["MAX_TRIM_MM"]`。`protocol_test.py::test_trim_cap_is_the_same_in_three_places` 盯着。不一致的症状各不相同而且都不报错：上位机给大了是「帧被回 ERR_RANGE，车完全不纠」，给中了大是「被 `Motion_Trim` 静默夹掉，ACK 还是 OK」。
 - 上位机串口默认 `/dev/serial0`（`main.py` / `serial_manager.py` / `serial_test.py`）。`serial0` 是 udev 符号链接，永远指向当前接在排针上的那个串口，所以底下换 UART 不用改代码。临时换口（比如 USB 转串口）用环境变量：`MARKING_PORT=/dev/ttyUSB0 ./start.sh`。
 - 树莓派 4B 的排针串口是哪个 UART 取决于配置，别写死成 `ttyAMA0`：

@@ -50,14 +50,15 @@ typedef struct {
     volatile uint8_t  ramp_state;   /* 加速 / 匀速 / 减速 */
     volatile uint16_t ramp_period;  /* 斜坡节拍计数（脉冲数） */
     volatile uint32_t ramp_decel;   /* 本路减速段长度（脉冲数） */
+    volatile uint16_t ramp_start;   /* 本路这次起坡的起点 ARR（减速要回到这里） */
 } MotorCh_t;
 
 /* TIM5 走 CH2，其余走 CH1 */
 static MotorCh_t s_m[NUM_MOTORS] = {
-    { TIM3, 1, TIM_CCER_CC1E, 0, 0, SPEED_DEFAULT_ARR, SPEED_DEFAULT_ARR, 0, 0, 0, 0 },
-    { TIM2, 1, TIM_CCER_CC1E, 0, 0, SPEED_DEFAULT_ARR, SPEED_DEFAULT_ARR, 0, 0, 0, 0 },
-    { TIM5, 2, TIM_CCER_CC2E, 0, 0, SPEED_DEFAULT_ARR, SPEED_DEFAULT_ARR, 0, 0, 0, 0 },
-    { TIM8, 1, TIM_CCER_CC1E, 0, 0, SPEED_DEFAULT_ARR, SPEED_DEFAULT_ARR, 0, 0, 0, 0 },
+    { TIM3, 1, TIM_CCER_CC1E, 0, 0, SPEED_DEFAULT_ARR, SPEED_DEFAULT_ARR, 0, 0, 0, 0, 0 },
+    { TIM2, 1, TIM_CCER_CC1E, 0, 0, SPEED_DEFAULT_ARR, SPEED_DEFAULT_ARR, 0, 0, 0, 0, 0 },
+    { TIM5, 2, TIM_CCER_CC2E, 0, 0, SPEED_DEFAULT_ARR, SPEED_DEFAULT_ARR, 0, 0, 0, 0, 0 },
+    { TIM8, 1, TIM_CCER_CC1E, 0, 0, SPEED_DEFAULT_ARR, SPEED_DEFAULT_ARR, 0, 0, 0, 0, 0 },
 };
 
 static volatile uint16_t speed_arr  = SPEED_DEFAULT_ARR;   /* 当前生效档位 */
@@ -71,9 +72,17 @@ static volatile uint16_t speed_base = SPEED_DEFAULT_ARR;   /* 用户档位 */
  * 对 ARR=300 的那一路是 33% 的提速，对 ARR=900 的那一路只有 11% ——
  * 共用一套要么快的一路丢步，要么慢的一路根本起不来。
  */
-#define RAMP_SOFT_ARR         1800   /* 起停两端的 ARR（越大越柔，1.8kHz 起步） */
-#define RAMP_SOFT_STEP_ARR     100   /* 每次调整的 ARR 步长 */
-#define RAMP_SOFT_STEP_PULSE   100   /* 每多少个脉冲调整一次 */
+#define RAMP_SOFT_ARR         1800   /* 最慢一档的起坡 ARR（1.8kHz 起步） */
+#define RAMP_SOFT_STEP_ARR     100   /* 只用于估算减速段长度，见 Motor_RampStart */
+#define RAMP_SOFT_STEP_PULSE   100   /* 每多少个脉冲推进一步 */
+
+/* 每步把 ARR 缩小（加速）/放大（减速）到当前的 7/8 或 9/8。
+ *
+ * 用比例而不是固定减 100：左右分速时两路的起点和目标都不同，固定步长
+ * 会走成不同的步数 —— 短的那一路先到位，剩下的时间比例就偏了。
+ * 按比例推进时两边步数相同（start 与 arr 同比例缩放），整个起坡段
+ * 比例恒定。 */
+#define RAMP_SOFT_SHIFT        3
 
 #define RAMP_ACCEL    0
 #define RAMP_CRUISE   1
@@ -272,47 +281,66 @@ void StepMotor_SetRampEnabled(uint8_t en)
     ramp_enable = en;
 }
 
-/* 四路目标 ARR 是否不一致 —— 也就是"左右正在分速"。
+/* 本路起坡的起点 ARR。
  *
- * 用比较当前值，而不是记一个"刚才分过速"的标志：标志会残留（Stop 之后
- * 不清、走旧接口 SetPulse 时不经过 SetSpeedLR/SetSpeedTarget），一旦残留，
- * 直线段就再也起不了坡，人按一下走一段会从静止直接跳到巡航频率，丢步。
- * ARR 是此刻的真实状态，不会有这种历史包袱。
+ * 同档（四路 arr 相同）时就是 RAMP_SOFT_ARR。左右分速时按比例缩放：
+ * 最慢的那一路拿满 RAMP_SOFT_ARR，其余按各自目标等比缩小。
+ *
+ * 为什么不能四路都从 RAMP_SOFT_ARR 起：斜坡是按脉冲推进的，两路同时从
+ * 1800 出发、同时每步降同样的量，整个起坡段就是同速，比例被抹平。更糟
+ * 的是短的那一路总行程可能还没走出起坡段 —— 它全程按同速跑，比目标比例
+ * 更快，车头会往反方向偏。
+ *
+ * 例：左 300 / 右 600。右拿满 1800，左取 1800 x 300 / 600 = 900。
+ * 两路都按"每步减掉当前的 1/8"推进，13 步同时到达，比例恒为 1:2。
+ *
+ * 为什么不用"记一个分过速的标志"：标志会残留（Stop 之后不清、旧接口
+ * SetPulse 不经过 SetSpeedLR），残留的后果是直线段再也起不了坡，人按一下
+ * 走一段会从静止直接跳到巡航频率 —— 那是真的丢步。
  */
-static uint8_t Motor_IsSplit(void)
+static uint16_t Motor_RampStartArr(uint8_t i)
 {
-    uint8_t i;
+    uint16_t slow = 0;
+    uint16_t v;
+    uint8_t  j;
 
-    for (i = 1; i < NUM_MOTORS; i++) {
-        if (s_m[i].arr != s_m[0].arr) {
-            return 1;
+    for (j = 0; j < NUM_MOTORS; j++) {
+        if (s_m[j].arr > slow) {
+            slow = s_m[j].arr;
         }
     }
-    return 0;
+    if (slow == 0) {
+        slow = 1;
+    }
+
+    v = (uint16_t)(((uint32_t)RAMP_SOFT_ARR * s_m[i].arr) / slow);
+    if (v < s_m[i].arr) {
+        v = s_m[i].arr;         /* 别比起步目标还慢 */
+    }
+    if (v > RAMP_SOFT_ARR) {
+        v = RAMP_SOFT_ARR;
+    }
+    return v;
 }
 
 /* ---------- 斜坡初始化：某一路从空闲启动时调用 ---------- */
 static void Motor_RampStart(uint8_t i, uint32_t pulse)
 {
     MotorCh_t *m = &s_m[i];
-    uint32_t steps;
+    uint16_t   start;
+    uint32_t   steps;
 
-    if (!ramp_enable || m->arr >= RAMP_SOFT_ARR) {   /* 斜坡被关掉，或本来就很慢 */
+    start = Motor_RampStartArr(i);
+
+    if (!ramp_enable || start <= m->arr) {  /* 斜坡被关掉，或本来就在最慢档 */
         m->ramp_on = 0;
         Motor_ApplyArr(i, m->arr);
         return;
     }
 
-    /* 左右在分速（同步）中：起坡会把比例抹平 —— 两路都从 1800 起步、
-     * 每 100 个脉冲各降一档，整个起坡段同速；短的那一路行程可能还没
-     * 走出起坡段，等于全程按同速跑，比目标比例更快，车头往反方向偏。
-     * 这种时候速度比例是这一段的目的，优先于柔和起停。 */
-    if (Motor_IsSplit()) {
-        m->ramp_on = 0;
-        Motor_ApplyArr(i, m->arr);
-        return;
-    }
-
+    /* 减速段长度按"固定步长 100"估，比实际的按比例步长（1/8）偏大。
+     * 偏大只会让减速早一点开始，不会丢步；偏小才会在停车的最后一刻
+     * 还挂着高频率。 */
     steps         = (uint32_t)(RAMP_SOFT_ARR - m->arr) / RAMP_SOFT_STEP_ARR;
     m->ramp_decel = steps * RAMP_SOFT_STEP_PULSE;
     if (m->ramp_decel * 2 > pulse) {            /* 行程短，走成三角形 */
@@ -321,7 +349,8 @@ static void Motor_RampStart(uint8_t i, uint32_t pulse)
     m->ramp_period = 0;
     m->ramp_state  = RAMP_ACCEL;
     m->ramp_on     = 1;
-    Motor_ApplyArr(i, RAMP_SOFT_ARR);           /* 从最慢起步 */
+    m->ramp_start  = start;
+    Motor_ApplyArr(i, start);                   /* 从本路的起点起步 */
 }
 
 /* ---------- 蓝牙调速：每按一次走一档 ----------
@@ -734,7 +763,13 @@ static void Motor_ISR(uint8_t i)
                 if (remaining <= m->ramp_decel) {
                     m->ramp_state = RAMP_DECEL;       /* 行程不够，直接收尾 */
                 } else if (m->arr_now > m->arr) {
-                    uint16_t a = (uint16_t)(m->arr_now - RAMP_SOFT_STEP_ARR);
+                    uint16_t step = (uint16_t)(m->arr_now >> RAMP_SOFT_SHIFT);
+                    uint16_t a;
+
+                    if (step == 0) {
+                        step = 1;                     /* ARR 很小时别卡住不降 */
+                    }
+                    a = (uint16_t)(m->arr_now - step);
                     if (a < m->arr) {
                         a = m->arr;
                     }
@@ -747,10 +782,19 @@ static void Motor_ISR(uint8_t i)
                     m->ramp_state = RAMP_DECEL;
                 }
             } else {                                  /* RAMP_DECEL */
-                if (m->arr_now < RAMP_SOFT_ARR) {
-                    uint16_t a = (uint16_t)(m->arr_now + RAMP_SOFT_STEP_ARR);
-                    if (a > RAMP_SOFT_ARR) {
-                        a = RAMP_SOFT_ARR;
+                /* 减回本次起坡的起点，不是 RAMP_SOFT_ARR —— 分速时左路的
+                 * 起点只有 900，回到 1800 会让它在停车的最后一段反而比
+                 * 起步还慢，左右关系再一次被拉歪。 */
+                if (m->arr_now < m->ramp_start) {
+                    uint16_t step = (uint16_t)(m->arr_now >> RAMP_SOFT_SHIFT);
+                    uint16_t a;
+
+                    if (step == 0) {
+                        step = 1;
+                    }
+                    a = (uint16_t)(m->arr_now + step);
+                    if (a > m->ramp_start) {
+                        a = m->ramp_start;
                     }
                     Motor_ApplyArr(i, a);
                 }

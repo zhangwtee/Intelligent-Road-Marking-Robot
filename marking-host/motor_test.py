@@ -9,6 +9,7 @@
     中断函数名写错     -> 强符号没定义，落到启动文件的 B . 死循环
                          电机转到一半突然全停，看不出和代码有关
     四路又退回同一个   -> 编译通过、能跑，但差速重新变成"内侧硬停"
+    起坡四路同一个起点 -> 比例在起坡段被抹平，短的一侧反而跑得快
 
 这几条都能从源码静态看出来，不需要上电。
 """
@@ -151,30 +152,50 @@ def test_speed_split_api_declared():
 
 
 @test
-def test_ramp_skipped_when_speed_is_split():
-    """分速（左右不同 ARR）时不能起坡。
+def test_ramp_start_is_scaled_per_motor():
+    """起坡起点要按左右比例缩放，不能四路都从同一个 ARR 起。
 
-    斜坡让四路都从 RAMP_SOFT_ARR 起步、每 100 个脉冲各降一档，两路档位
-    始终相同 —— 整个起坡段同速，同步白做。短的那一路行程可能根本没走出
-    起坡段，等于全程同速跑，比目标比例更快，车头往反方向偏。
+    斜坡是按脉冲推进的：两路同时从 1800 出发、每步降同样的量，起坡段就
+    完全同速，左右比例被抹平；短的那一路若没走出起坡段就停了，等于全程
+    同速跑，比目标更快，车头往反方向偏。
     """
     text = read_gbk(SM_C)
 
-    helper = re.search(r"static uint8_t Motor_IsSplit\(void\)\s*\{(.*?)\n\}", text, re.S)
-    assert helper, "找不到 Motor_IsSplit()"
+    helper = re.search(r"static uint16_t Motor_RampStartArr\(uint8_t i\)\s*\{(.*?)\n\}", text, re.S)
+    assert helper, "找不到 Motor_RampStartArr()"
     body = helper.group(1)
-    assert re.search(r"s_m\[\w+\]\.arr\s*!=\s*s_m\[0\]\.arr", body), \
-        "Motor_IsSplit 不是比较四路 ARR，判断依据不对"
+    assert "RAMP_SOFT_ARR" in body and "/ slow" in body, \
+        "起点没有按最慢那一路做比例缩放"
 
     ramp = re.search(r"static void Motor_RampStart\(.*?\n\}", text, re.S)
     assert ramp, "找不到 Motor_RampStart"
     fn = ramp.group(0)
-    assert "Motor_IsSplit()" in fn, "Motor_RampStart 没检查分速状态"
-    assert fn.index("Motor_IsSplit()") < fn.index("Motor_ApplyArr(i, RAMP_SOFT_ARR)"), \
-        "分速判断放在了起坡赋值之后，等于没判"
+    assert "Motor_RampStartArr(i)" in fn, "起坡没用按比例算出来的起点"
+    assert re.search(r"Motor_ApplyArr\(i,\s*start\)", fn), "起坡首帧不是从 start 写"
+    assert "ramp_start" in fn, "没记住本路起点，减速段就没有回退目标"
 
-    # 不能靠"记一个标志"：停止后不清会残留，直线段再也起不了坡
-    assert "s_split_lr" not in text, "又回到用标志记分速状态了"
+
+@test
+def test_ramp_steps_are_proportional():
+    """斜坡每步按当前 ARR 的比例推进，而不是固定减 100。
+
+    固定步长下，起点和目标都不同的两路会走成不同步数 —— 短的一路先到位，
+    剩下的时间比例就偏了。按比例时两边步数相同，比例整段恒定。
+    """
+    text = read_gbk(SM_C)
+    assert re.search(r"#define\s+RAMP_SOFT_SHIFT\s+\d+", text), "没有比例推进的位移宏"
+
+    isr = re.search(r"static void Motor_ISR\(uint8_t i\)\s*\{(.*?)\n\}", text, re.S)
+    assert isr, "找不到 Motor_ISR"
+    body = isr.group(1)
+
+    assert body.count(">> RAMP_SOFT_SHIFT") >= 2, "加减档没有都改成按比例"
+    assert "arr_now - RAMP_SOFT_STEP_ARR" not in body, "加速还是固定步长"
+    assert "arr_now + RAMP_SOFT_STEP_ARR" not in body, "减速还是固定步长"
+
+    # 减速要回到本路的起点，不是固定的 RAMP_SOFT_ARR
+    assert "a > m->ramp_start" in body, "减速上限没按本路起点夹"
+    assert "a > RAMP_SOFT_ARR" not in body, "减速还在往 1800 拉，分速时会把比例拉歪"
 
 
 def main():
