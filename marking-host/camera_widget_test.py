@@ -199,6 +199,55 @@ def test_single_bad_frame_does_not_spray():
     assert frames_of(s, frame.CMD_RESPRAY) == [], "单帧噪点就发了补喷"
 
 
+def test_respray_uses_the_same_streak_rule_as_tracking():
+    """补喷和巡线对"算不算破损成立"的判断必须一致。
+
+    以前补喷是"投票通过就发"，巡线在投票之上还要连续 2 帧。同一个缺口，
+    站着看和边走边看给两个答案，调试时会觉得两个模式脾气不一样 ——
+    而且找不出哪一边才是"对的"。现在两边共用 _want_spray。
+    """
+    original = camera_widget.classify_line_quality
+    s = FakeSerial()
+    w = camera_widget.CameraWidget(serial_mgr=s, mode="respray")
+    w.VOTE_MAJORITY = 1          # 只看"连续帧确认"这一层，不掺投票窗口
+
+    patch_quality(lambda px: (QUALITY_BREAK, 4, "break"))
+    try:
+        feed(w, line_frame())
+        assert not frames_of(s, frame.CMD_RESPRAY), "一帧破损就补喷了"
+
+        feed(w, line_frame())
+    finally:
+        camera_widget.classify_line_quality = original
+
+    assert frames_of(s, frame.CMD_RESPRAY), "连续两帧破损还没补喷"
+
+
+def test_pump_off_needs_more_than_one_good_frame():
+    """关泵也要连续帧：一处阴影把泵关了，下一帧又开，出漆断断续续。
+
+    这条守着 _want_spray 的另一半 —— 只测开泵的话，把 PUMP_OFF_AFTER 的
+    判断删掉也照样能过。
+    """
+    original = camera_widget.classify_line_quality
+    s = FakeSerial()
+    w = camera_widget.CameraWidget(serial_mgr=s, mode="track")
+    w.start_track()
+    w.TRIM_INTERVAL_S = 1000.0
+
+    patch_quality(lambda px: (QUALITY_BREAK, 4, "break"))
+    try:
+        for _ in range(w.VOTE_WINDOW + w.PUMP_ON_AFTER):
+            feed(w, line_frame())
+        assert w.pump_on is True
+
+        patch_quality(lambda px: (QUALITY_OK, 0, "ok"))
+        feed(w, line_frame())
+        assert w.pump_on is True, "一帧完好的就关泵了"
+    finally:
+        camera_widget.classify_line_quality = original
+
+
 def test_sustained_damage_does_spray():
     """真的破损会连续几十帧成立，必须照常触发。"""
     original = camera_widget.classify_line_quality

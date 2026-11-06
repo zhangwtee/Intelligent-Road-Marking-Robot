@@ -49,8 +49,12 @@ PANEL_BUTTONS = [
 # 按下去要弹出摄像头画面的按钮
 CAMERA_BUTTONS = {"二次喷涂"}
 
+# 急停单独拎出来：它必须永远可见。面板左栏的内容已经比树莓派那块屏高，
+# 放在可滚区里意味着出事的第一个动作是"先滚下去找急停"。
+ESTOP_BUTTON = "紧急停止"
+
 # 按下去要收起摄像头画面的按钮
-CAMERA_OFF_BUTTONS = {"紧急停止"}
+CAMERA_OFF_BUTTONS = {ESTOP_BUTTON}
 
 # 画车位不在这张表里：它是唯一一个要带参数的按钮。单字节 'P' 只能用固件
 # 里烧死的默认尺寸（system.c 的 PAINT_LEN_DEFAULT_MM），现场换个规格就得

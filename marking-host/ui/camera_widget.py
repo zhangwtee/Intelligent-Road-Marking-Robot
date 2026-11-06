@@ -349,29 +349,45 @@ class CameraWidget(QLabel):
         if abs(trim) >= lane_control.GAINS["DEADBAND_MM"]:
             self._send(frame.build_trim(int(round(trim)), self._next_seq()))
 
+    def _want_spray(self, quality):
+        """这一帧该不该喷。带连续帧滞回，两个模式共用同一套判据。
+
+        补喷走 RESPRAY 帧、巡线走 PUMP 帧，动作不同，但"哪一帧才算破损
+        成立"必须是同一个判据。以前的差别是没理由的：巡线在投票之上还压
+        一道 PUMP_ON_AFTER，补喷投票通过就直接喷。同一个缺口，站着看和
+        边走边看给两个答案，调试时会觉得"这两个模式脾气不一样"。
+
+        滞回在两边都必要，不只是巡线：
+          开泵 —— 连 PUMP_ON_AFTER 帧判破损才动，滤掉单帧反光；
+          关泵 —— 连 PUMP_OFF_AFTER 帧判完好才停，不然一处阴影就把泵
+                  关了，接着又开，出漆断断续续。
+        """
+        if quality in (QUALITY_WORN, QUALITY_BREAK):
+            self._bad_streak += 1
+            self._good_streak = 0
+        else:
+            self._good_streak += 1
+            self._bad_streak = 0
+
+        if not self.pump_on:
+            return self._bad_streak >= self.PUMP_ON_AFTER
+
+        return self._good_streak < self.PUMP_OFF_AFTER
+
+    def _apply_pump(self, want):
+        """把"该不该喷"落到泵上。值没变就不发 —— 5Hz 的重发会把 ACK 表刷满。"""
+        if want == self.pump_on:
+            return
+        self.pump_on = want
+        self._send(frame.build_pump(want, self._next_seq()))
+
     def _update_pump(self, quality):
         """按三态控制泵，带滞回。
 
         UNSURE 一律关泵：看不到就不喷。这条比"多喷一点"重要得多 ——
         镜头糊了、车开出线外了，继续喷就是在空地上倒漆。
         """
-        if quality in (QUALITY_WORN, QUALITY_BREAK):
-            self._bad_streak += 1
-            self._good_streak = 0
-        elif quality == QUALITY_OK:
-            self._good_streak += 1
-            self._bad_streak = 0
-        else:
-            self._good_streak += 1
-            self._bad_streak = 0
-
-        if not self.pump_on and self._bad_streak >= self.PUMP_ON_AFTER:
-            self.pump_on = True
-            self._send(frame.build_pump(True, self._next_seq()))
-
-        elif self.pump_on and self._good_streak >= self.PUMP_OFF_AFTER:
-            self.pump_on = False
-            self._send(frame.build_pump(False, self._next_seq()))
+        self._apply_pump(self._want_spray(quality))
 
     def on_status(self, state_char, pulse=0, flags=None):
         """接收下位机上行的状态帧，由主窗口转发进来。
@@ -588,7 +604,11 @@ class CameraWidget(QLabel):
 
                 # ================= 闭环 =================
                 if self.mode == self.MODE_RESPRAY:
-                    if voted in (QUALITY_WORN, QUALITY_BREAK):
+                    # 和巡线用同一个"连续 N 帧"判据（见 _want_spray）：
+                    # 投票已经把单帧抖动滤掉，这一层滤的是"投票窗口正好
+                    # 卡在破损边缘"那种来回摆的情况 —— 补喷一发就是几百
+                    # 毫米的漆，比巡线的开泵贵得多。
+                    if self._want_spray(voted):
                         self.maybe_send_respray(spray_level)
 
                 elif self.mode == self.MODE_TRACK and self.tracking:

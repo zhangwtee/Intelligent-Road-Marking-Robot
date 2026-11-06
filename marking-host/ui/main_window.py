@@ -11,7 +11,7 @@ from ui.camera_widget import CameraWidget
 from core import frame
 from core.ack import AckTracker
 from core.protocol import (
-    PANEL_BUTTONS, CAMERA_BUTTONS, CAMERA_OFF_BUTTONS, PAINT_BUTTON
+    PANEL_BUTTONS, CAMERA_BUTTONS, CAMERA_OFF_BUTTONS, PAINT_BUTTON, ESTOP_BUTTON
 )
 
 
@@ -252,9 +252,30 @@ class MainWindow(QWidget):
         )
         left_layout.addWidget(self.paint_heading_check)
 
-        # 按钮表在 core/protocol.py 里，和指令表放在一起，避免标签写两遍对不上
+        # 续画：急停停在某条边中途之后，从这里把这一圈走完。
+        # 默认禁用，只有固件在状态帧里报了断点（flags 的 0x40）才亮。
+        # 常亮按钮 + 命令回 ERR_STATE 是最糟的交互：人以为在续画，其实车
+        # 一动没动，而画布上那条线看起来"就是断在这儿"。
+        self.btn_resume = QPushButton("续画（从急停处接着画）")
+        self.btn_resume.setMinimumHeight(36)
+        self.btn_resume.setStyleSheet("font-size:16px;")
+        self.btn_resume.setEnabled(False)
+        self.btn_resume.setToolTip(
+            "急停停在某条边中途时可用：只走那条边剩下的部分，"
+            "已经画过的边不会重喷。\n"
+            "停在转弯上不能续 —— 那不是少喷一段，是少转了 90 度，"
+            "接上去的框是歪的，而且歪得像转角系数没标定。\n"
+            "按「停止复位」视为这条活不干了，断点作废，这个按钮随之熄灭。"
+        )
+        self.btn_resume.clicked.connect(self.send_resume)
+        left_layout.addWidget(self.btn_resume)
+
+        # 按钮表在 core/protocol.py 里，和指令表放在一起，避免标签写两遍对不上。
+        # 急停不在这批里 —— 它固定在滚动区外面，见下面。
         self.control_buttons = []
         for label, _cmd in PANEL_BUTTONS:
+            if label == ESTOP_BUTTON:
+                continue
             btn = QPushButton(label)
             btn.clicked.connect(self.send_button)
             btn.setMinimumHeight(40)
@@ -288,7 +309,29 @@ class MainWindow(QWidget):
         left_inner.setLayout(left_layout)
         left_scroll.setWidget(left_inner)
 
-        main_layout.addWidget(left_scroll, 1)
+        # 急停固定在滚动区外面，任何窗口高度下都看得见。
+        #
+        # 左栏内容已经 792px，树莓派那块屏常常只有 600 高 —— 把它留在可滚
+        # 区里，意味着现场出事时第一个动作是"先把左栏滚下去"，而滚动条本身
+        # 只有十几像素宽。这类按钮不该有"得先找到它"这个前提。
+        self.btn_estop = QPushButton(ESTOP_BUTTON)
+        self.btn_estop.setMinimumHeight(56)
+        self.btn_estop.setStyleSheet(
+            "QPushButton { font-size:22px; font-weight:bold;"
+            " background:#d9534f; color:white; border-radius:4px; }"
+            "QPushButton:pressed { background:#c9302c; }"
+        )
+        self.btn_estop.setToolTip(
+            "任何状态下都立即停车、关泵、断舵机，状态停在 TING。\n"
+            "不会自动恢复：要接着干活按「停止复位」，要接着画这一圈按「续画」。"
+        )
+        self.btn_estop.clicked.connect(self.send_button)
+        self.control_buttons.append(self.btn_estop)
+
+        left_column = QVBoxLayout()
+        left_column.addWidget(left_scroll, 1)
+        left_column.addWidget(self.btn_estop)
+        main_layout.addLayout(left_column, 1)
 
         # ---------------- 中间（发送日志） ----------------
         center_layout = QVBoxLayout()
@@ -433,6 +476,7 @@ class MainWindow(QWidget):
                 widget.on_status(state_char, flags=flags)
 
             self._apply_gyro_flags(flags)
+            self._apply_resume_flag(flags)
 
         elif cmd == frame.CMD_HEADING:
             self._update_heading(item)
@@ -442,7 +486,15 @@ class MainWindow(QWidget):
         # 它只更新状态栏 —— 这一栏以前是"最后按了哪个键"，现在变成
         # "下位机现在真实在干什么"，这是接帧之后最直观的一个变化。
         if item.get("kind") == "frame" and item.get("cmd") == frame.CMD_STATUS:
-            self.status_label.setText(f"状态:\n{item['status']}")
+            data = item.get("data") or b""
+            state = chr(data[0]) if data and 32 <= data[0] < 127 else "?"
+            if state == "P" and len(data) >= 2:
+                # 状态帧的 DATA[1] 是画车位子状态，固件一直在发，之前没人用。
+                # 人在树莓派前只能扭头看车上那块 OLED 才知道画到第几条边。
+                step = frame.PAINT_STEP_LABELS.get(data[1], str(data[1]))
+                self.status_label.setText(f"画车位:\n{step}")
+            else:
+                self.status_label.setText(f"状态:\n{item['status']}")
             return
 
         # 航向帧同样是 5Hz，只更新界面，不进日志 ——
@@ -493,6 +545,15 @@ class MainWindow(QWidget):
         if not ready:
             self.gyro_label.setText("陀螺仪：未就绪（没接 / 标零中 / 掉线）")
             self.gyro_label.setStyleSheet("font-size:14px; color:#c00000;")
+
+    def _apply_resume_flag(self, flags):
+        """续画按钮跟着固件的断点走。
+
+        为什么不由上位机自己记"刚才发了急停，所以有断点"：断点有没有，
+        只有固件知道 —— 停在转弯上不记、剩不到 50mm 不记、按了 W 会清掉。
+        上位机猜的话，一半的情况下按钮亮着但续不上。
+        """
+        self.btn_resume.setEnabled(bool(flags & frame.STATUS_FLAG_RESUME))
 
     def _update_heading(self, item):
         deg = item.get("heading_deg", 0.0)
@@ -589,6 +650,19 @@ class MainWindow(QWidget):
             frame.build_paint(length, width, heading=heading),
             f"画车位 {length}x{width}mm" + (" +纠偏" if heading else ""),
         )
+
+    def send_resume(self):
+        """从急停断点接着画。
+
+        帧里的长宽不生效：断点里带着这一圈的尺寸，固件只认断点。
+        没有断点时固件回 ERR_STATE，而不是当成新的一条从头画 ——
+        后者会把已经喷过的两条边再喷一遍，而人是从"车动了"才发现。
+
+        先撤相机，理由和 send_paint 一样：视觉那条线 10Hz 发 MOVE/TRIM，
+        抢在前面到达时固件回 ERR_STATE，续不上还只在日志里留一个结果码。
+        """
+        self._detach_camera_auto()
+        self.send_frame(frame.build_paint(resume=True), "画车位 续画")
 
     # ---------------- 速度 ----------------
     def on_speed_changed(self, arr):

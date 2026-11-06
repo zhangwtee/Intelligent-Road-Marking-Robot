@@ -398,6 +398,102 @@ def test_camera_widget_stops_trim_when_gyro_takes_over():
     w.camera_widget = None
 
 
+def test_estop_is_outside_the_scroll_area():
+    """急停必须常驻可见，不能藏在滚动区里。
+
+    左栏内容已经比树莓派那块屏高，放进可滚区就意味着现场出事时第一个
+    动作是"先把左栏滚下去"，而滚动条只有十几像素宽。这类按钮不该有
+    "得先找到它"这个前提 —— 所以它固定在滚动区外面。
+    """
+    from PyQt5.QtWidgets import QScrollArea
+
+    w = make_window()
+    w.resize(1000, 560)
+    w.show()
+
+    assert w.btn_estop.isVisible(), "急停没显示出来"
+
+    scroll = w.findChild(QScrollArea)
+    assert scroll is not None, "左栏的滚动区没了？"
+    assert not scroll.widget().isAncestorOf(w.btn_estop), "急停被塞回滚动区里了"
+
+    # 而且在窗口范围内：不能被挤到窗口下沿之外
+    bottom = w.btn_estop.mapTo(w, w.btn_estop.rect().bottomLeft()).y()
+    assert bottom <= w.height(), f"急停超出窗口下沿: {bottom} > {w.height()}"
+
+
+def test_resume_button_is_dead_until_firmware_reports_a_breakpoint():
+    """续画按钮只有在固件说有断点时才亮。
+
+    断点有没有只有固件知道：停在转弯上不记、剩不到 50mm 不记、按了 W
+    会清掉。上位机自己记"刚才发过急停"的话，一半情况下按钮亮着却续不上 ——
+    那是最糟的交互：人以为在续画，车一动没动。
+    """
+    w = make_window()
+
+    assert w.btn_resume.isEnabled() is False, "一上电就亮了"
+
+    w.on_data_received(status_frame(state_char="T", flags=0x40))
+    assert w.btn_resume.isEnabled() is True
+
+    # 按「停止复位」：固件清断点，0x40 掉了，按钮跟着灭
+    w.on_data_received(status_frame(state_char="W", flags=0x00))
+    assert w.btn_resume.isEnabled() is False
+
+
+def test_resume_sends_the_resume_flag_not_a_size():
+    """续画帧带 bit1，长宽留 0。
+
+    带尺寸的话固件虽然不采纳，但日志里会显示一个"这次的尺寸"，
+    和实际在走的那一圈对不上 —— 排查时会以为尺寸被改了。
+    """
+    w = make_window()
+
+    w.paint_len_spin.setValue(6000)
+    w.paint_wid_spin.setValue(3000)
+    w.send_resume()
+
+    sent = w.serial_mgr.sent
+    assert len(sent) == 1, sent
+    assert frame.check_frame(sent[0])
+    assert sent[0][1] == frame.CMD_PAINT
+
+    flags = sent[0][7]
+    assert flags & frame.PAINT_FLAG_RESUME, flags
+
+    length = (sent[0][3] << 8) | sent[0][4]
+    width = (sent[0][5] << 8) | sent[0][6]
+    assert (length, width) == (0, 0), "续画不该带尺寸"
+
+
+def test_resume_and_heading_flags_do_not_collide():
+    """续画带纠偏是合法的（断点那条边本来就在纠），两个位要能同时置。"""
+    both = frame.build_paint(0, 0, heading=True, resume=True)
+    assert both[7] == frame.PAINT_FLAG_HEADING | frame.PAINT_FLAG_RESUME
+
+    assert frame.build_paint(heading=True)[7] == frame.PAINT_FLAG_HEADING
+    assert frame.build_paint(resume=True)[7] == frame.PAINT_FLAG_RESUME
+    assert frame.build_paint()[7] == 0
+
+
+def test_status_bar_shows_which_edge_is_being_painted():
+    """状态帧的 DATA[1] 是画车位子状态，固件一直在发，以前没人用。
+
+    人在树莓派前面，没有这一行就得扭头看车上那块 OLED 才知道画到第几条边。
+    """
+    w = make_window()
+
+    w.on_data_received(status_frame(state_char="P", step=5))
+    assert "第3条边" in w.status_label.text(), w.status_label.text()
+
+    w.on_data_received(status_frame(state_char="P", step=6))
+    assert "转弯3" in w.status_label.text(), w.status_label.text()
+
+    # 别的状态还按原来的方式显示，别把段号硬套到所有状态上
+    w.on_data_received(status_frame(state_char="M", step=0))
+    assert "第" not in w.status_label.text(), w.status_label.text()
+
+
 if __name__ == "__main__":
     for name in sorted(n for n in globals() if n.startswith("test_")):
         globals()[name]()

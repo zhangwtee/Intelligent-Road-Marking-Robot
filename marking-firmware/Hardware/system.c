@@ -58,6 +58,12 @@ static uint8_t  respray_level = 4;
 /* 补喷总时限：一段最长 1.0m，正常 1.5s 内结束。10s 是 6 倍余量。 */
 #define RESPRAY_TIMEOUT_MS  10000
 
+/* 续画的最小剩余行程。
+ *
+ * 剩得太少就别记断点了：续一段 3mm 的线，泵开一下关一下，只会在断点
+ * 那儿滴一个点，而这一条边本来就是"已经走完了"。 */
+#define PAINT_RESUME_MIN_MM 50.0f
+
 /* 帧命令 CMD_MOVE 的总时限：最长 5 米，最慢档 0.13m/s 约 38 秒。 */
 #define MOVE_TIMEOUT_MS     60000
 
@@ -129,6 +135,22 @@ static uint8_t paint_heading;          /* 本次画车位四条边走不走航向闭环 */
 static uint8_t paint_heading_forced;   /* 闭环是这次画车位打开的，退出要还回去 */
 static uint8_t paint_trim_exhausted;   /* 这条边纠偏累计到顶，别再调 */
 
+/* ---- 急停断点 ----
+ *
+ * T 停在某条边中途时记一份，之后 CMD_PAINT 带 RESUME 位就从这儿接着走。
+ *
+ * 存"还剩多少毫米"而不是"已经走了多少"：续画时 SetPulse 会把 CNT 清零
+ * 重新计数（见 StepMotor_SetPulse 的说明），只有剩余量能直接喂给
+ * Motion_ForwardFlat。
+ *
+ * 生命周期：T 记下 -> RESUME 用掉/失败清掉 -> W（停止复位）也清掉。
+ * W 清掉是有意的：W 的语义是"这条活不干了"，留着一个更早的断点，
+ * 会让"续画"按钮在几天后仍然亮着。 */
+static uint8_t   paint_resume_valid;
+static PaintStep paint_resume_step;
+static float     paint_resume_mm;
+static uint8_t   paint_resume_heading;   /* 断点那条边当时有没有在纠偏 */
+
 /* 轮距自标定时单侧走的距离。
  * 300mm 的取法：若轮距 500mm，车会转 300/500 = 0.6 rad ≈ 34 度。
  * 角度够大，读数的相对误差就小；又不会大到让车转出测试场地。
@@ -158,6 +180,45 @@ static uint16_t led_tick = 0;   // 心跳灯计数（1ms 一次，500 次翻转 = 500ms）
 
 // last_state 初值用非法状态，保证上电后首轮会执行 STATE_WAIT 的进入动作
 static SystemCtrl sys_ctrl = {STATE_WAIT, (SystemState)0, 0};
+
+/* 急停前把"这条边还剩多少"记下来。
+ *
+ * 只在边上记。停在转弯（PAINT_TURN*）上不记 —— 那不是"少喷一段"，是
+ * "少转了 90 度"：续一段直线接上去，框是歪的，而且歪得很像转角系数
+ * 没标定，人会去调错地方。宁可让续画直接失败（上位机那个按钮是灰的），
+ * 也不要给一个"看起来成功、实际接不上"的结果。
+ *
+ * 换算取 MOTOR1 作代表：这条边四路的目标都是 M1 的脉冲乘轮径系数得来的，
+ * 相差在 1% 以内；而 Motion_ForwardFlat 续画时四路仍然等长，用哪一路的
+ * 剩余都是同一个数。
+ */
+static void PaintCaptureResume(void)
+{
+    int32_t remain;
+
+    paint_resume_valid = 0;
+
+    if (sys_ctrl.state != STATE_PAINT || !PaintEdgeRunning()) {
+        return;
+    }
+    if (!StepMotor_IsAnyRunning()) {
+        return;              /* 这条边已经走完，只是状态机还没轮到 */
+    }
+
+    remain = StepMotor_GetRemainOf(MOTOR1);
+    if (remain <= 0) {
+        return;              /* 纠偏把目标压过头了，等于已经走完 */
+    }
+
+    if (Motion_PulseToMm((uint32_t)remain) < PAINT_RESUME_MIN_MM) {
+        return;
+    }
+
+    paint_resume_step    = paint_step;
+    paint_resume_mm      = Motion_PulseToMm((uint32_t)remain);
+    paint_resume_heading = paint_heading;
+    paint_resume_valid   = 1;
+}
 
 // TIM1初始化函数
 void TIM1_Init(void) {
@@ -648,6 +709,26 @@ static void HandleFrame(const uint8_t *f, uint8_t from)
         if (len_mm == 0) { len_mm = (uint16_t)PAINT_LEN_DEFAULT_MM; }
         if (wid_mm == 0) { wid_mm = (uint16_t)PAINT_WID_DEFAULT_MM; }
 
+        if (d[4] & PROTO_PAINT_FLAG_RESUME) {
+            /* 续画。尺寸不看：断点里已经记着这条边还剩多少，这个帧里的
+             * 长宽只是上位机顺手带上的当前设置。
+             *
+             * 允许从 TING 直接续 —— 急停之后本来就停在那儿，要求先按一次
+             * "停止复位"才能续，等于把最容易忘的一步塞进了流程里。
+             * 普通画车位仍然只认 WAIT：那是"从零开一条新线"，
+             * 急停后误触一下就动起来，和 'C' 的风险是一回事。 */
+            if (!paint_resume_valid) {
+                result = PROTO_ERR_STATE;          /* 没有断点，别当成新的一条画 */
+            } else if (sys_ctrl.state != STATE_WAIT && sys_ctrl.state != STATE_TING) {
+                result = PROTO_ERR_STATE;
+            } else if (paint_resume_heading && !Heading_IsReady()) {
+                result = PROTO_ERR_HW;             /* 断点带纠偏，但陀螺仪已经掉线 */
+            } else {
+                sys_ctrl.state = STATE_PAINT;
+            }
+            break;
+        }
+
         if (len_mm < PROTO_PAINT_MIN_MM || len_mm > PROTO_PAINT_MAX_MM
             || wid_mm < PROTO_PAINT_MIN_MM || wid_mm > PROTO_PAINT_MAX_MM) {
             result = PROTO_ERR_RANGE;
@@ -659,10 +740,11 @@ static void HandleFrame(const uint8_t *f, uint8_t from)
         } else if (sys_ctrl.state != STATE_WAIT) {
             result = PROTO_ERR_STATE;
         } else {
-            paint_len_mm = (float)len_mm;
-            paint_wid_mm = (float)wid_mm;
-            paint_heading = (d[4] & PROTO_PAINT_FLAG_HEADING) ? 1 : 0;
-            sys_ctrl.state = STATE_PAINT;
+            paint_len_mm       = (float)len_mm;
+            paint_wid_mm       = (float)wid_mm;
+            paint_heading      = (d[4] & PROTO_PAINT_FLAG_HEADING) ? 1 : 0;
+            paint_resume_valid = 0;   /* 新画一条，旧断点作废 */
+            sys_ctrl.state     = STATE_PAINT;
         }
         break;
 
@@ -735,6 +817,10 @@ void SendStatusFrame(void)
     /* 0x20 = 陀螺仪掉过线。跑着跑着冒出来，说明接线松了或者干扰变大，
      * 角度精度已经开始下降 —— 赶在车走歪之前就能看见。 */
     if (MPU6050_ErrorCount() > 0)          flags |= 0x20;
+    /* 0x40 = 画车位有断点可续（急停停在某条边中途）。
+     * 上位机据此决定"续画"按钮能不能按 —— 按钮常亮、按下去回 ERR_STATE
+     * 是最糟的交互：人以为在续画，其实一个字都没动。 */
+    if (paint_resume_valid)                flags |= 0x40;
 
     d[0] = (uint8_t)sys_ctrl.state;
     d[1] = (uint8_t)((sys_ctrl.state == STATE_PAINT) ? paint_step : selfcheck_step);
@@ -832,6 +918,9 @@ static void HandleCmd(uint8_t cmd, uint8_t from) {
 		case 'W'://等待指令  串口'W'
 			    StepMotor_StopAll();
 					OLED_ShowString(3, 1, "Wait            ");
+        /* W = 这条活不干了，断点跟着作废。留着的话，"续画"按钮会在
+         * 几天后仍然亮着，按下去接到一个早就不存在的位置。 */
+        paint_resume_valid = 0;
         sys_ctrl.state = STATE_WAIT;
 				break;
 		case 'K'://开水泵
@@ -869,6 +958,9 @@ static void HandleCmd(uint8_t cmd, uint8_t from) {
 				sys_ctrl.state = STATE_MOVE_RIGHT; 
 				break;
 		case 'T'://强制停止
+        /* 先记断点再切状态：切状态那一下会把电机停掉（见状态机的退出块），
+         * 之后 StepMotor_GetRemainOf 读到的就全是"空闲"。 */
+        PaintCaptureResume();
         sys_ctrl.state = STATE_TING;
 				break;
 		case '+':   // 提速一档（单字节通道：蓝牙和上位机都能用）
@@ -913,7 +1005,22 @@ static void HandleCmd(uint8_t cmd, uint8_t from) {
 		    }
 		    break;
 		case 'P'://画车位
-    sys_ctrl.state = STATE_PAINT;
+    /* 蓝牙兜底路径：不传尺寸，一律用固件默认值。
+     *
+     * 这里以前直接进 STATE_PAINT，长度用的 paint_len_mm —— 而那是上一次
+     * 帧命令写进去的。于是"手机发 P 画标准车位"会画出上一次在界面上设
+     * 的尺寸，而且哪儿都不报错：文档说默认 5.3x2.5，实际画的是 5.0x2.3。 */
+    if (sys_ctrl.state == STATE_WAIT) {
+        paint_len_mm       = PAINT_LEN_DEFAULT_MM;
+        paint_wid_mm       = PAINT_WID_DEFAULT_MM;
+        paint_heading      = 0;   /* 单字节通道不带纠偏 */
+        paint_resume_valid = 0;   /* 更不是续画 */
+        sys_ctrl.state     = STATE_PAINT;
+    } else {
+        /* 正在画 / 走段 / 补喷时发 P：不打断，明确回绝。
+         * 和 'C' 用的是同一条判断 —— 这两个按键都会让车自己动起来。 */
+        ReplyTo(from, '?');
+    }
     break;
 
 		default:
@@ -1202,9 +1309,23 @@ void System_StateMachine(void) {
 		    break;
 		}
 		case STATE_PAINT:
-{// 每次进入画线状态都从头开始
+{
+            /* 是不是从断点接着画。断点只在这一拍有效，取完就作废 ——
+             * 忘了清的话，下一条"画车位"会莫名其妙只画半条边。 */
+            uint8_t resume = paint_resume_valid;
+
             paint_trim_exhausted = 0;
             paint_heading_forced  = 0;
+            paint_resume_valid    = 0;
+
+            if (resume) {
+                /* 边号和纠偏开关按断点那一刻还原。
+                 * 后者必须显式还原：急停切出 STATE_PAINT 时，退出块已经
+                 * 把 paint_heading 清成 0 了，不还回去就等于"续画但不再纠"，
+                 * 而界面上那个勾选框还勾着。 */
+                paint_step    = paint_resume_step;
+                paint_heading = paint_resume_heading;
+            }
 
             /* 要了纠偏就把闭环打开，并记住"是不是这次打开的" —— 退出时
              * 只还回自己打开的那一次，用户本来就开着的不能碰。 */
@@ -1217,10 +1338,26 @@ void System_StateMachine(void) {
             }
 
             Pump_On();
-            Motion_ForwardFlat(paint_len_mm);
-            paint_step = PAINT_EDGE1;
-            OLED_ShowString(3, 1, "Paint:1/4       ");
-            
+
+            if (resume) {
+                /* 只走这条边剩下的那段。SetPulse 会把 CNT 清零，所以
+                 * "续"在这里等于"从当前位置再走 remain 毫米"。 */
+                Motion_ForwardFlat(paint_resume_mm);
+                paint_resume_mm = 0.0f;
+            } else {
+                paint_step = PAINT_EDGE1;
+                Motion_ForwardFlat(paint_len_mm);
+            }
+
+            /* OLED 上必须显示真实边号：续画从 3/4 开始，屏幕上就该是 3/4，
+             * 显示 1/4 会让人以为车又从第一条边重新走了。 */
+            switch (paint_step) {
+                case PAINT_EDGE2: OLED_ShowString(3, 1, "Paint:2/4       "); break;
+                case PAINT_EDGE3: OLED_ShowString(3, 1, "Paint:3/4       "); break;
+                case PAINT_EDGE4: OLED_ShowString(3, 1, "Paint:4/4       "); break;
+                default:          OLED_ShowString(3, 1, "Paint:1/4       "); break;
+            }
+
     break;
 }
 		

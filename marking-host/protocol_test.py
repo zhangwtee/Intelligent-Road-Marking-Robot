@@ -222,6 +222,7 @@ def test_frame_constants_match_firmware():
         "PROTO_CMD_HEADING": frame.CMD_HEADING,
         "PROTO_CMD_SPEED": frame.CMD_SPEED,
         "PROTO_PAINT_FLAG_HEADING": frame.PAINT_FLAG_HEADING,
+        "PROTO_PAINT_FLAG_RESUME": frame.PAINT_FLAG_RESUME,
         "PROTO_SPEED_MIN_ARR": frame.SPEED_MIN_ARR,
         "PROTO_SPEED_MAX_ARR": frame.SPEED_MAX_ARR,
         "PROTO_GYRO_OFF": frame.GYRO_OFF,
@@ -330,6 +331,37 @@ def test_paint_frame_carries_the_heading_flag():
     assert guided[7] & frame.PAINT_FLAG_HEADING
     assert "纠偏" not in frame.describe(plain[1], plain[3:8])
     assert "纠偏" in frame.describe(guided[1], guided[3:8])
+
+
+def test_status_flag_bits_match_firmware():
+    """状态帧标志位的取值，上位机和固件必须一样。
+
+    这些位没有协议常量可对账（固件那边是 SendStatusFrame 里直接 |= 的），
+    所以只能扫源码。位写错不会报错：比如续画位写成 0x20，按钮就会跟着
+    "陀螺仪读错过"一起亮 —— 而且只在陀螺仪出问题的时候亮，平时反而正常。
+    """
+    text = FIRMWARE_C.read_bytes().decode("gbk", errors="replace")
+
+    # 固件写的是 flags |= 0xNN; 后面跟行内注释，逐条对
+    pairs = {
+        "STATUS_FLAG_RUNNING": 0x01,
+        "STATUS_FLAG_SILENT": 0x02,
+        "STATUS_FLAG_DROPPED": 0x04,
+        "STATUS_FLAG_GYRO_READY": 0x08,
+        "STATUS_FLAG_GYRO_CLOSED": 0x10,
+        "STATUS_FLAG_GYRO_ERR": 0x20,
+        "STATUS_FLAG_RESUME": 0x40,
+    }
+    missing = []
+    for name, value in pairs.items():
+        want = f"flags |= 0x{value:02X}"
+        if want not in text:
+            missing.append(f"{name}={want}")
+
+    assert not missing, f"固件的 SendStatusFrame 里找不到这些位: {missing}"
+
+    for name, value in pairs.items():
+        assert getattr(frame, name) == value, name
 
 
 def test_paint_default_size_matches_firmware():

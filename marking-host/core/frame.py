@@ -65,6 +65,18 @@ CMD_PING = 0x09         # 无参数，只回 ACK
 
 # CMD_PAINT 的 DATA[4] 标志
 PAINT_FLAG_HEADING = 0x01   # 四条边用航向闭环。陀螺仪没标定时固件回 ERR_HW
+PAINT_FLAG_RESUME = 0x02    # 从急停断点接着画。没有断点时固件回 ERR_STATE
+
+# 画车位子状态（固件的 PaintStep 枚举，顺序一一对应）。
+# 状态帧 DATA[1] 报的就是这个数，上位机据此显示"第几条边"。
+# 以前这个字段一直没人用，人在树莓派前只能看车上那块 OLED。
+PAINT_STEP_LABELS = {
+    0: "空闲",
+    1: "第1条边", 2: "转弯1",
+    3: "第2条边", 4: "转弯2",
+    5: "第3条边", 6: "转弯3",
+    7: "第4条边", 8: "画完",
+}
 
 # CMD_GYRO 的子命令
 GYRO_OFF = 0x00         # 关闭环，直线交回视觉/开环
@@ -77,6 +89,16 @@ CMD_ACK = 0x81          # DATA[0]=原命令 DATA[1]=结果码
 CMD_STATUS = 0x82       # DATA[0]=状态 DATA[1]=段号 DATA[2]=标志 DATA[3:5]=脉冲
 CMD_HEADING = 0x83      # DATA[0:1]=int16 航向 0.01°，DATA[2:3]=int16 角速度 0.1dps
                         # DATA[4] 高 4 位=陀螺仪状态，低 4 位=掉线次数
+
+# STATUS 帧 DATA[2] 的标志位，和固件 SendStatusFrame 里那几行 |= 一一对应。
+# 以前是散落在 UI 里的魔法数字，加一位就要在两边各改一处，改漏了不报错。
+STATUS_FLAG_RUNNING = 0x01      # 电机正在输出脉冲
+STATUS_FLAG_SILENT = 0x02       # 还在上电静默期（只放行急停）
+STATUS_FLAG_DROPPED = 0x04      # 串口丢过字节
+STATUS_FLAG_GYRO_READY = 0x08   # 陀螺仪在线且已标零
+STATUS_FLAG_GYRO_CLOSED = 0x10  # 航向闭环正在跑
+STATUS_FLAG_GYRO_ERR = 0x20     # 这一局读过 I2C 错误（精度已打折扣）
+STATUS_FLAG_RESUME = 0x40       # 画车位有急停断点，可以续画
 
 # 陀螺仪状态码，和固件 heading.h 的 HeadingState 一一对应
 GYRO_STATE_NAMES = {
@@ -258,7 +280,7 @@ def build_pump(on: bool, seq: int = 0) -> bytes:
 
 
 def build_paint(length_mm: int = 0, width_mm: int = 0, heading: bool = False,
-                seq: int = 0) -> bytes:
+                resume: bool = False, seq: int = 0) -> bytes:
     """按尺寸画一个矩形车位。传 0 表示用固件里的默认值 5.3m x 2.5m。
 
     heading=True 让四条边走陀螺仪航向闭环：画车位的边是 ForwardFlat（匀速、
@@ -267,8 +289,17 @@ def build_paint(length_mm: int = 0, width_mm: int = 0, heading: bool = False,
 
     这个开关随帧走而不是单独一条命令：一帧原子，"尺寸和纠偏一起生效"，
     不会出现「开关改了但这次画车位没赶上」。
+
+    resume=True 是"从急停断点接着画"：只走那条边剩下的那段。此时长宽
+    不被采纳（断点里带着这一圈的尺寸），固件只认断点。没有断点时回
+    ERR_STATE，而不是默默当成新的一条从头画 —— 后者会把已经喷过的两条边
+    再喷一遍。
     """
-    flags = PAINT_FLAG_HEADING if heading else 0
+    flags = 0
+    if heading:
+        flags |= PAINT_FLAG_HEADING
+    if resume:
+        flags |= PAINT_FLAG_RESUME
     return build_frame(CMD_PAINT, seq,
                        _u16(length_mm) + _u16(width_mm) + bytes([flags]))
 
@@ -323,6 +354,9 @@ def describe(cmd: int, data: bytes) -> str:
     if cmd == CMD_PUMP:
         return "水泵 开" if data[0] else "水泵 关"
     if cmd == CMD_PAINT:
+        if data[4] & PAINT_FLAG_RESUME:
+            # 续画时帧里那四个字节不生效，日志再显示长宽会误导
+            return "画车位 从断点续画"
         length = (data[0] << 8) | data[1] or PAINT_LEN_DEFAULT_MM
         width = (data[2] << 8) | data[3] or PAINT_WID_DEFAULT_MM
         tail = " +陀螺仪纠偏" if data[4] & PAINT_FLAG_HEADING else ""
@@ -336,7 +370,8 @@ def describe(cmd: int, data: bytes) -> str:
     if cmd == CMD_STATUS:
         pulse = (data[3] << 8) | data[4]
         state = chr(data[0]) if 32 <= data[0] < 127 else str(data[0])
-        return f"状态 {state} 段{data[1]} 脉冲{pulse}"
+        step = PAINT_STEP_LABELS.get(data[1], str(data[1])) if state == "P" else str(data[1])
+        return f"状态 {state} 段{step} 脉冲{pulse}"
     if cmd == CMD_GYRO:
         names = {GYRO_OFF: "关闭环", GYRO_ON: "开闭环",
                  GYRO_RECAL: "重标零", GYRO_MEASURE: "标轮距"}
