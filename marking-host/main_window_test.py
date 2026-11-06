@@ -107,23 +107,53 @@ def test_checkbox_follows_firmware_not_clicks():
     w = make_window()
     assert not w.gyro_check.isEnabled(), "还没收到状态帧就能点"
 
-    # 陀螺仪就绪 + 闭环中
+    # 陀螺仪就绪 + 闭环中。文字由航向帧写，所以状态帧之后还得来一帧真实的
+    # 航向数据 —— 只发状态帧的话这行字根本不该变（见下一个用例）。
     w.on_data_received(status_frame(flags=0x08 | 0x10))
+    w.on_data_received(heading_frame(1.0))
     assert w.gyro_check.isEnabled()
     assert w.gyro_check.isChecked()
     assert "闭环" in w.gyro_label.text()
 
     # 就绪但闭环关着
     w.on_data_received(status_frame(flags=0x08))
+    w.on_data_received(heading_frame(1.0))
     assert w.gyro_check.isEnabled()
     assert not w.gyro_check.isChecked()
-    assert "就绪" in w.gyro_label.text()
+    assert "仅监视" in w.gyro_label.text()
 
-    # 未就绪
+    # 未就绪：没有航向帧可等，状态帧必须自己给出原因
     w.on_data_received(status_frame(flags=0x00))
     assert not w.gyro_check.isEnabled()
     assert not w.gyro_check.isChecked()
     assert "未就绪" in w.gyro_label.text()
+
+
+def test_gyro_label_does_not_flicker():
+    """状态帧和航向帧都是 5Hz，抢着写同一行字就会每秒跳五次。
+
+    就绪之后这行只归航向帧管，状态帧只更新勾选框和颜色依据。
+    """
+    w = make_window()
+    w.on_data_received(status_frame(flags=0x08 | 0x10))
+    w.on_data_received(heading_frame(2.0, rate=0.5))
+    first = w.gyro_label.text()
+    assert "闭环中" in first, first
+
+    for _ in range(5):
+        w.on_data_received(status_frame(flags=0x08 | 0x10))
+        assert w.gyro_label.text() == first, "状态帧把航向帧写的文字冲掉了"
+        w.on_data_received(heading_frame(2.0, rate=0.5))
+        assert w.gyro_label.text() == first
+
+
+def test_gyro_error_flag_is_shown():
+    """bit 0x20 是固件特意加的"这一局读错过"，上位机不能吞掉。"""
+    w = make_window()
+    w.on_data_received(status_frame(flags=0x08 | 0x20))
+    w.on_data_received(heading_frame(0.0))
+    assert "读错过" in w.gyro_label.text(), w.gyro_label.text()
+    assert "#c07000" in w.gyro_label.styleSheet()
 
 
 def test_toggle_sends_the_right_subcommand():

@@ -130,6 +130,13 @@ class MainWindow(QWidget):
         self.gyro_label.setStyleSheet("font-size:14px; color:#777;")
         left_layout.addWidget(self.gyro_label)
 
+        # 状态帧（5Hz）和航向帧（5Hz）都会想改上面这行字。两个源各写各的，
+        # 界面就会每秒跳五次。约定：就绪之后这行只归航向帧管，状态帧只
+        # 负责把这三个标记更新下来 —— 见 _apply_gyro_flags。
+        self._gyro_ready = False      # bit 0x08：在线且已标零
+        self._gyro_closed = False     # bit 0x10：下位机正在闭环
+        self._gyro_err = False        # bit 0x20：这一局读错过（接线/干扰）
+
         # 闭环开关。勾选状态由下位机的状态帧回填，不是"点了就认为成功"——
         # 传感器没标零时固件会回绝，勾选必须弹回去，否则界面在骗人。
         self.gyro_check = QCheckBox("陀螺仪闭环接管直线")
@@ -351,20 +358,23 @@ class MainWindow(QWidget):
         ready = bool(flags & 0x08)
         closed = bool(flags & 0x10)
 
+        self._gyro_ready = ready
+        self._gyro_closed = closed
+        # 0x20 = 这一局读到过 I2C 错误，角度精度已经打过折扣。
+        # 只能置位不能清，所以显示上说的是"读错过"，不是"正在错"。
+        self._gyro_err = bool(flags & 0x20)
+
         self.gyro_check.blockSignals(True)
         self.gyro_check.setChecked(closed)
         self.gyro_check.blockSignals(False)
         self.gyro_check.setEnabled(ready)
 
+        # 就绪之后不写文本：航向帧 5Hz 也在写同一行，两边交替覆盖会让
+        # 这行字每秒跳五次（"闭环中"和"READY +0.3 dps"来回切）。
+        # 未就绪时没有航向帧可等，必须在这里给出原因。
         if not ready:
             self.gyro_label.setText("陀螺仪：未就绪（没接 / 标零中 / 掉线）")
             self.gyro_label.setStyleSheet("font-size:14px; color:#c00000;")
-        elif closed:
-            self.gyro_label.setText("陀螺仪：闭环中 —— 视觉不再纠偏")
-            self.gyro_label.setStyleSheet("font-size:14px; color:#008000;")
-        else:
-            self.gyro_label.setText("陀螺仪：就绪（闭环关）")
-            self.gyro_label.setStyleSheet("font-size:14px; color:#c07000;")
 
     def _update_heading(self, item):
         deg = item.get("heading_deg", 0.0)
@@ -372,7 +382,21 @@ class MainWindow(QWidget):
         state = frame.GYRO_STATE_NAMES.get(item.get("gyro_state", 0), "?")
 
         self.heading_label.setText(f"航向 {deg:+.2f}\u00b0")
-        self.gyro_label.setText(f"陀螺仪：{state}   {rate:+.1f} dps")
+
+        # 就绪之后这一行只由航向帧写（理由见 _apply_gyro_flags）。
+        # 闭环状态从状态帧带过来的标记里取，不在这里自己猜。
+        tail = "闭环中" if self._gyro_closed else "仅监视"
+        if self._gyro_err:
+            tail += " · 读错过（查接线）"
+        self.gyro_label.setText(f"陀螺仪：{state}  {rate:+.1f} dps · {tail}")
+
+        if self._gyro_closed:
+            color = "#008000"
+        elif self._gyro_err:
+            color = "#c07000"
+        else:
+            color = "#555555"
+        self.gyro_label.setStyleSheet(f"font-size:14px; color:{color};")
 
         # 偏得多就变色：2 度以内算直，5 度以外已经能看出来了
         if abs(deg) < 2.0:

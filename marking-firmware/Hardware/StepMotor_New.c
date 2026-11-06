@@ -172,7 +172,10 @@ void StepMotor_SetSpeedTarget(uint16_t arr)
 
     for (i = 0; i < NUM_MOTORS; i++) {
         s_m[i].arr = arr;
-        if (!s_m[i].ramp_on) {
+        /* !ramp_enable 时也要写：调用方明确说了"这次不要斜坡"
+         * （Motion_ForwardFlat / DriveLR），ramp_on 里残留的是上一段的状态，
+         * 不该拿它拦住新速度 —— 拦住的后果是新段仍按旧 ARR 跑。 */
+        if (!s_m[i].ramp_on || !ramp_enable) {
             Motor_ApplyArr(i, arr);
         }
     }
@@ -198,7 +201,7 @@ void StepMotor_SetSpeedLR(uint16_t left_arr, uint16_t right_arr)
     s_m[3].arr = right_arr;   /* M4 右后 */
 
     for (i = 0; i < NUM_MOTORS; i++) {
-        if (!s_m[i].ramp_on) {
+        if (!s_m[i].ramp_on || !ramp_enable) {
             Motor_ApplyArr(i, s_m[i].arr);
         }
     }
@@ -212,7 +215,7 @@ void StepMotor_SetSpeedOf(uint8_t motor, uint16_t arr)
     }
     arr = Motor_ClampArr(arr);
     s_m[motor - 1].arr = arr;
-    if (!s_m[motor - 1].ramp_on) {
+    if (!s_m[motor - 1].ramp_on || !ramp_enable) {
         Motor_ApplyArr(motor - 1, arr);
     }
 }
@@ -269,6 +272,25 @@ void StepMotor_SetRampEnabled(uint8_t en)
     ramp_enable = en;
 }
 
+/* 四路目标 ARR 是否不一致 —— 也就是"左右正在分速"。
+ *
+ * 用比较当前值，而不是记一个"刚才分过速"的标志：标志会残留（Stop 之后
+ * 不清、走旧接口 SetPulse 时不经过 SetSpeedLR/SetSpeedTarget），一旦残留，
+ * 直线段就再也起不了坡，人按一下走一段会从静止直接跳到巡航频率，丢步。
+ * ARR 是此刻的真实状态，不会有这种历史包袱。
+ */
+static uint8_t Motor_IsSplit(void)
+{
+    uint8_t i;
+
+    for (i = 1; i < NUM_MOTORS; i++) {
+        if (s_m[i].arr != s_m[0].arr) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* ---------- 斜坡初始化：某一路从空闲启动时调用 ---------- */
 static void Motor_RampStart(uint8_t i, uint32_t pulse)
 {
@@ -276,6 +298,16 @@ static void Motor_RampStart(uint8_t i, uint32_t pulse)
     uint32_t steps;
 
     if (!ramp_enable || m->arr >= RAMP_SOFT_ARR) {   /* 斜坡被关掉，或本来就很慢 */
+        m->ramp_on = 0;
+        Motor_ApplyArr(i, m->arr);
+        return;
+    }
+
+    /* 左右在分速（同步）中：起坡会把比例抹平 —— 两路都从 1800 起步、
+     * 每 100 个脉冲各降一档，整个起坡段同速；短的那一路行程可能还没
+     * 走出起坡段，等于全程按同速跑，比目标比例更快，车头往反方向偏。
+     * 这种时候速度比例是这一段的目的，优先于柔和起停。 */
+    if (Motor_IsSplit()) {
         m->ramp_on = 0;
         Motor_ApplyArr(i, m->arr);
         return;
@@ -737,6 +769,11 @@ void TIM8_UP_IRQHandler(void)   { Motor_ISR(3); }   /* M4 右后 */
 /* 前进（直线） */
 void StepMotor_APPROACH(void)
 {
+    /* 先回到用户档位：上一段如果是原地转，四路的 ARR 还停在
+     * CHASSIS_TURN_ARR（差速车 900），不恢复的话"按前进"会一直用转弯
+     * 限速跑，界面上看是"车突然变慢了"，而速度档位一个都没动。 */
+    StepMotor_RestoreSpeed();
+
     StepMotor_SetDirection(MOTOR1, M1_FWD);
     StepMotor_SetDirection(MOTOR2, M2_FWD);
     StepMotor_SetDirection(MOTOR3, M3_FWD);
@@ -750,6 +787,8 @@ void StepMotor_APPROACH(void)
 /* 后退（直线） */
 void StepMotor_RETREAT(void)
 {
+    StepMotor_RestoreSpeed();     /* 同 APPROACH，别留着上一段的转弯限速 */
+
     StepMotor_SetDirection(MOTOR1, M1_REV);
     StepMotor_SetDirection(MOTOR2, M2_REV);
     StepMotor_SetDirection(MOTOR3, M3_REV);

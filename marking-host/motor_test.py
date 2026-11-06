@@ -150,6 +150,33 @@ def test_speed_split_api_declared():
         assert fn in text, f"头文件缺 {fn}"
 
 
+@test
+def test_ramp_skipped_when_speed_is_split():
+    """分速（左右不同 ARR）时不能起坡。
+
+    斜坡让四路都从 RAMP_SOFT_ARR 起步、每 100 个脉冲各降一档，两路档位
+    始终相同 —— 整个起坡段同速，同步白做。短的那一路行程可能根本没走出
+    起坡段，等于全程同速跑，比目标比例更快，车头往反方向偏。
+    """
+    text = read_gbk(SM_C)
+
+    helper = re.search(r"static uint8_t Motor_IsSplit\(void\)\s*\{(.*?)\n\}", text, re.S)
+    assert helper, "找不到 Motor_IsSplit()"
+    body = helper.group(1)
+    assert re.search(r"s_m\[\w+\]\.arr\s*!=\s*s_m\[0\]\.arr", body), \
+        "Motor_IsSplit 不是比较四路 ARR，判断依据不对"
+
+    ramp = re.search(r"static void Motor_RampStart\(.*?\n\}", text, re.S)
+    assert ramp, "找不到 Motor_RampStart"
+    fn = ramp.group(0)
+    assert "Motor_IsSplit()" in fn, "Motor_RampStart 没检查分速状态"
+    assert fn.index("Motor_IsSplit()") < fn.index("Motor_ApplyArr(i, RAMP_SOFT_ARR)"), \
+        "分速判断放在了起坡赋值之后，等于没判"
+
+    # 不能靠"记一个标志"：停止后不清会残留，直线段再也起不了坡
+    assert "s_split_lr" not in text, "又回到用标志记分速状态了"
+
+
 def main():
     for fn in TESTS:
         try:
