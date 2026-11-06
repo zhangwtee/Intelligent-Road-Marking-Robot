@@ -245,8 +245,7 @@ class MainWindow(QWidget):
 
         left_layout.addLayout(speed_row)
         self._speed_sent = None        # 上一次真的发出去的 ARR
-        self._firmware_speed = None     # 固件最近一次报回来的档位
-        self._speed_sent_at = 0.0       # 上一次发 CMD_SPEED 的时刻
+        self._speed_sent_at = 0.0      # 上一次发 CMD_SPEED 的时刻
 
         self.btn_paint = QPushButton(PAINT_BUTTON)
         self.btn_paint.setMinimumHeight(40)
@@ -690,7 +689,8 @@ class MainWindow(QWidget):
 
         为什么必须回填：改速有两条路（本界面滑条、手机蓝牙 +/-）。不回填的话，
         手机改完这里还停在老值，人按界面上的数字判断漆量 —— 而车跑的是另一个
-        速度。固件那边限幅（滑条给 140 会被夹成 150）也是靠这条帧才看得见。
+        速度。固件那边把值夹到边界（蓝牙连按 `+` 停在 150）也是靠这条帧才看得见。
+        滑条的取值范围本来就是 150~1500，所以这里的"限幅"只可能来自另一边。
 
         手指还按在滑条上时不回填：那会和用户抢，滑条自己跳回去。
         松手后我们会发一帧，固件再回一帧确认，中间的差异不会留到最后。
@@ -698,8 +698,6 @@ class MainWindow(QWidget):
         arr = item.get("speed_arr")
         if not isinstance(arr, int) or not (frame.SPEED_MIN_ARR <= arr <= frame.SPEED_MAX_ARR):
             return          # 帧坏了（CRC 放过但值不合理）就别拿它动界面
-
-        self._firmware_speed = arr
 
         # 刚发出去、还没被固件处理：这一两帧是旧值，别拿它把滑条拽回去。
         if (arr != self._speed_sent

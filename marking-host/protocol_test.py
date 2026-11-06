@@ -454,6 +454,27 @@ def test_speed_save_waits_until_the_car_is_standing_still():
     assert "SpeedSaveService();" in text, "主循环里没有调用，等于永远不保存"
 
 
+def test_speed_save_backs_off_after_a_failed_write():
+    """写 flash 失败之后不能每圈重试。
+
+    擦一页是 CPU 全程停住几十毫秒。失败原因（页被写保护、片子来路不正）
+    不会自己好，每圈重试一次等于把主循环钉在几十 Hz：串口收不进字节、
+    状态帧跟着断，而现场只会看到"连不上了"，没人会想到是存速度引起的。
+    所以重试之前必须有一次按时间计的退避。
+    """
+    text = FIRMWARE_C.read_bytes().decode("gbk", errors="replace")
+
+    match = re.search(r"static void SpeedSaveService\(void\)\s*\{(.*?)\n\}", text, re.S)
+    assert match, "固件里找不到 SpeedSaveService"
+    body = match.group(1)
+
+    guard = body.find("SPEED_SAVE_RETRY_MS")
+    call = body.find("Cfg_SaveSpeed(arr)")
+    assert guard != -1, "写失败后没有退避，会每圈擦一次页"
+    assert call != -1, "抠到的不是写 flash 那一段"
+    assert guard < call, "退避的判断排在写调用后面，等于没退避"
+
+
 def test_flash_page_is_the_last_page_of_the_image():
     """保存速度用的那一页，必须落在 IROM 声明的范围里，而且是最后一页。
 

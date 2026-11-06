@@ -249,10 +249,17 @@ static void PaintCaptureResume(void)
  * 静默失效在断电之后才被发现，查起来最远。 */
 #define SPEED_SAVE_DELAY_MS   2000
 
+/* 写失败之后的退避间隔。擦一页几十毫秒，失败还每圈重试的话，主循环
+ * 会从几千 Hz 掉到几十 Hz —— 串口收不进字节、状态帧跟着断，而失败原因
+ * （页被写保护之类）不会因为重试得密就好起来。 */
+#define SPEED_SAVE_RETRY_MS  10000
+
 static uint16_t speed_seen;
 static uint8_t  speed_seen_valid;
 static uint32_t speed_changed_ms;
 static uint8_t  speed_save_pending;
+static uint32_t speed_try_ms;         /* 上一次真去写 flash 的时刻 */
+static uint8_t  speed_tried;          /* 写过没有；0 时 speed_try_ms 不作数 */
 
 static void SpeedSaveService(void)
 {
@@ -277,6 +284,9 @@ static void SpeedSaveService(void)
         speed_seen         = arr;
         speed_save_pending = (uint8_t)(arr != Cfg_GetSavedSpeed());
         speed_changed_ms   = timer_counter;
+        /* 换了新值就从零开始计退避：退避针对的是"同一个值写不进去"，
+         * 拿上一次失败的等待去拖新值没有道理。 */
+        speed_tried        = 0;
     }
 
     if (!speed_save_pending) {
@@ -292,10 +302,20 @@ static void SpeedSaveService(void)
         return;                 /* 遥控点动里也在转，一样不能写 */
     }
 
-    /* 写失败（比如页被写保护）就让 pending 留着，下一圈再试 ——
-     * 界面上的"已保存"标记不会亮，人至少能看出来它没存上。 */
+    /* 失败要退避，不能下一圈接着试。擦一页几十毫秒是 CPU 全程停住的时间，
+     * 而失败原因（页被写保护、片子是打磨过的）不会自己好 —— 每圈重试等于
+     * 把主循环钉死在几十 Hz，串口和状态帧一起断，症状还看不出是 flash 引起
+     * 的。pending 保留着，界面上的"已保存"标记不亮，人至少能看出来没存上。 */
+    if (speed_tried
+        && (uint32_t)(timer_counter - speed_try_ms) < SPEED_SAVE_RETRY_MS) {
+        return;
+    }
+    speed_tried  = 1;
+    speed_try_ms = timer_counter;
+
     if (Cfg_SaveSpeed(arr)) {
         speed_save_pending = 0;
+        speed_tried        = 0;     /* 成功之后重新计：下次改速要能立刻存 */
     }
 }
 
