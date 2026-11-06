@@ -200,6 +200,94 @@ def test_recal_button_sends_recal():
     assert "静止" in w.send_log.toPlainText()
 
 
+def test_paint_button_sends_the_size_from_the_boxes():
+    """画车位要带尺寸走帧，不能只发单字节 'P'。
+
+    单字节 'P' 只能用固件里烧死的 5300x2500，现场换个规格就得重烧 ——
+    这个按钮存在的全部理由就是这两个数能改，所以发的帧里必须是框里的值。
+    """
+    w = make_window()
+
+    w.paint_len_spin.setValue(5000)
+    w.paint_wid_spin.setValue(2300)
+    w.send_paint()
+
+    sent = w.serial_mgr.sent
+    assert len(sent) == 1, sent
+    assert frame.check_frame(sent[0]), sent[0].hex()
+    assert sent[0][1] == frame.CMD_PAINT
+
+    length = (sent[0][3] << 8) | sent[0][4]
+    width = (sent[0][5] << 8) | sent[0][6]
+    assert (length, width) == (5000, 2300), (length, width)
+
+
+def test_paint_size_defaults_to_the_firmware_default():
+    """什么都不改就按下去，画出来得和以前的 'P' 一样大。"""
+    w = make_window()
+
+    assert w.paint_len_spin.value() == frame.PAINT_LEN_DEFAULT_MM
+    assert w.paint_wid_spin.value() == frame.PAINT_WID_DEFAULT_MM
+
+
+def test_paint_size_cannot_leave_the_firmware_range():
+    """越界的数发出去，固件回 ERR_RANGE，车一动不动只剩一个结果码。
+
+    输入框自己就该关住，别让人有机会发出一个注定被拒的尺寸。
+    """
+    w = make_window()
+
+    w.paint_len_spin.setValue(10)
+    assert w.paint_len_spin.value() == frame.PAINT_MIN_MM
+
+    w.paint_len_spin.setValue(99999)
+    assert w.paint_len_spin.value() == frame.PAINT_MAX_MM
+
+    w.paint_wid_spin.setValue(1)
+    assert w.paint_wid_spin.value() == frame.PAINT_MIN_MM
+
+
+def test_paint_cancels_the_vision_loop_before_it_starts():
+    """先撤视觉再画车位。
+
+    视觉那条线按 10Hz 发 MOVE / TRIM，抢在画车位前面到达时固件回
+    ERR_STATE —— 画不成，日志里只有一个结果码，看着像链路问题。
+    """
+    w = make_window()
+
+    class Stub:
+        tracking = True
+        mode = "track"
+        stopped = False
+
+        def stop_track(self):
+            self.stopped = True
+
+        def on_status(self, *a, **k):
+            pass
+
+    stub = Stub()
+    w.camera_widget = stub
+    w.btn_track.setChecked(True)
+
+    # 记下"发帧那一刻视觉停了没有"——只看最后有没有停，顺序错了也照样通过。
+    seen_at_send = []
+    send = w.serial_mgr.send
+
+    def spy(data):
+        seen_at_send.append(stub.stopped)
+        send(data)
+
+    w.serial_mgr.send = spy
+
+    w.send_paint()
+
+    assert seen_at_send == [True], "视觉还在跑就发了画车位"
+    assert w.btn_track.isChecked() is False
+
+    w.camera_widget = None
+
+
 def test_heading_frames_do_not_flood_the_log():
     """航向帧 5Hz，不能写进接收日志。
 

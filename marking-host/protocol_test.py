@@ -235,6 +235,67 @@ def test_frame_constants_match_firmware():
     assert not mismatched, f"固件与上位机常量不一致 (proto.h, frame.py): {mismatched}"
 
 
+def test_every_frame_the_host_sends_has_a_firmware_branch():
+    """上位机发得出去的每一种帧，固件 switch 里都要有 case。
+
+    单字节那条线有 test_panel_commands_reach_firmware 守着，帧这条线原来
+    没人看：常量对得上（proto.h 有 PROTO_CMD_PAINT）不等于固件真的处理它。
+    缺一个 case 的症状是回 ERR_TYPE、车不动 —— 和当年那个按了没反应的
+    `N` 是同一类事。画车位按钮改走帧之后，这条更不能少。
+    """
+    text = FIRMWARE_PROTO_H.read_bytes().decode("gbk", errors="replace")
+    defines = {
+        m.group(1): int(m.group(2), 0)
+        for m in re.finditer(
+            r"#define\s+(PROTO_CMD_\w+)\s+(0x[0-9A-Fa-f]+|\d+)", text
+        )
+    }
+
+    source = FIRMWARE_C.read_bytes().decode("gbk", errors="replace")
+    branches = set(re.findall(r"case\s+(PROTO_CMD_\w+)\s*:", source))
+
+    host_sent = {
+        "RESPRAY": frame.CMD_RESPRAY,
+        "MOVE": frame.CMD_MOVE,
+        "TRIM": frame.CMD_TRIM,
+        "PUMP": frame.CMD_PUMP,
+        "GYRO": frame.CMD_GYRO,
+        "PAINT": frame.CMD_PAINT,
+        "LEVEL": frame.CMD_LEVEL,
+        "PING": frame.CMD_PING,
+    }
+
+    broken = []
+    for name, value in host_sent.items():
+        macro = f"PROTO_CMD_{name}"
+        if defines.get(macro) != value:
+            broken.append(f"{macro}={defines.get(macro)} 与 frame.py 的 {value} 不符")
+        elif macro not in branches:
+            broken.append(f"{macro} 在 system.c 里没有 case")
+
+    assert not broken, broken
+
+
+def test_paint_default_size_matches_firmware():
+    """界面上预填的默认尺寸，得和固件里烧死的默认值一样。
+
+    帧里带了尺寸时以帧为准，所以不一致不会报错 —— 只是"什么都不改、
+    直接按画车位"画出来的大小和以前发单字节 'P' 不一样，而没人会想到
+    去看这个。真要改默认尺寸就两边一起改。
+    """
+    text = FIRMWARE_C.read_bytes().decode("gbk", errors="replace")
+
+    firmware_length = float(
+        re.search(r"#define\s+PAINT_LEN_DEFAULT_MM\s+([\d.]+)f", text).group(1)
+    )
+    firmware_width = float(
+        re.search(r"#define\s+PAINT_WID_DEFAULT_MM\s+([\d.]+)f", text).group(1)
+    )
+
+    assert firmware_length == frame.PAINT_LEN_DEFAULT_MM, firmware_length
+    assert firmware_width == frame.PAINT_WID_DEFAULT_MM, firmware_width
+
+
 def test_trim_cap_is_the_same_everywhere():
     """纠偏上限写在了四个地方，必须一样。
 

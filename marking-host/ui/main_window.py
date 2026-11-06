@@ -1,7 +1,8 @@
 import cv2
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QTextEdit, QLabel,
-    QComboBox, QCheckBox, QSlider, QStackedLayout, QSpacerItem, QSizePolicy
+    QComboBox, QCheckBox, QSlider, QStackedLayout, QSpacerItem, QSizePolicy,
+    QSpinBox
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QTextCursor
@@ -9,7 +10,9 @@ from PyQt5.QtGui import QTextCursor
 from ui.camera_widget import CameraWidget
 from core import frame
 from core.ack import AckTracker
-from core.protocol import PANEL_BUTTONS, CAMERA_BUTTONS, CAMERA_OFF_BUTTONS
+from core.protocol import (
+    PANEL_BUTTONS, CAMERA_BUTTONS, CAMERA_OFF_BUTTONS, PAINT_BUTTON
+)
 
 
 class MainWindow(QWidget):
@@ -93,6 +96,33 @@ class MainWindow(QWidget):
         self.append_send_log(raw, label)
         self._update_link_label()
 
+    # ---------------- 车位尺寸输入 ----------------
+    @staticmethod
+    def _make_size_label(text):
+        label = QLabel(text)
+        label.setStyleSheet("font-size:16px;")
+        return label
+
+    @staticmethod
+    def _make_size_spin(value):
+        """范围直接卡固件的 PROTO_PAINT_MIN/MAX_MM。
+
+        用 QSpinBox 而不是放行手输：超范围的数发出去，固件回 ERR_RANGE，
+        车一动不动而日志里只有一个结果码。这里从一开始就输不进去越界值。
+        """
+        spin = QSpinBox()
+        spin.setRange(frame.PAINT_MIN_MM, frame.PAINT_MAX_MM)
+        spin.setSingleStep(100)
+        spin.setSuffix(" mm")
+        spin.setValue(value)
+        spin.setMinimumWidth(100)
+        spin.setToolTip(
+            f"车位尺寸 {frame.PAINT_MIN_MM}~{frame.PAINT_MAX_MM}mm，"
+            "按上下键一次 100mm。改完直接按下面的「画车位」。"
+        )
+        spin.setStyleSheet("QSpinBox { font-size:16px; min-height:32px; }")
+        return spin
+
     def init_ui(self):
         self.resize(1000, 560)
         self.setWindowTitle("道路画线机控制面板")
@@ -144,6 +174,31 @@ class MainWindow(QWidget):
         self.gyro_check.setEnabled(False)      # 没收到状态帧之前不知道能不能开
         self.gyro_check.toggled.connect(self.on_gyro_toggle)
         left_layout.addWidget(self.gyro_check)
+
+        # ---------------- 车位尺寸 + 画车位 ----------------
+        # 这两个数字以前只能改 system.c 的 PAINT_*_DEFAULT_MM 再重烧固件。
+        # 现在面板直接发帧 CMD_PAINT，长宽随帧走：改一次尺寸不用动固件。
+        # 范围取 frame 里的常量，那两个又是和固件 proto.h 对账过的
+        # （protocol_test.test_frame_constants_match_firmware）。
+        size_row = QHBoxLayout()
+        size_row.setSpacing(6)
+
+        size_row.addWidget(self._make_size_label("长"))
+        self.paint_len_spin = self._make_size_spin(frame.PAINT_LEN_DEFAULT_MM)
+        size_row.addWidget(self.paint_len_spin)
+
+        size_row.addWidget(self._make_size_label("宽"))
+        self.paint_wid_spin = self._make_size_spin(frame.PAINT_WID_DEFAULT_MM)
+        size_row.addWidget(self.paint_wid_spin)
+
+        size_row.addStretch(1)
+        left_layout.addLayout(size_row)
+
+        self.btn_paint = QPushButton(PAINT_BUTTON)
+        self.btn_paint.setMinimumHeight(40)
+        self.btn_paint.setStyleSheet("font-size:20px;")
+        self.btn_paint.clicked.connect(self.send_paint)
+        left_layout.addWidget(self.btn_paint)
 
         # 按钮表在 core/protocol.py 里，和指令表放在一起，避免标签写两遍对不上
         self.control_buttons = []
@@ -430,6 +485,43 @@ class MainWindow(QWidget):
         )
 
     # ---------------- 核心按钮功能 ----------------
+    def _detach_camera_auto(self):
+        """把摄像头的自动流程撤下来。
+
+        按了面板上任何一个键 = 不想让它自己干活了。不撤的话按"停止复位"
+        或者"关水泵"，摄像头还在按帧下发指令 —— 人按的停停不停得住
+        全看手速，这不能接受。下位机那边也堵了一道：RESPRAY / MOVE
+        只在 STATE_WAIT 被接受。
+        """
+        widget = getattr(self, 'camera_widget', None)
+        if widget is None:
+            return
+
+        if widget.mode == CameraWidget.MODE_TRACK:
+            widget.stop_track()
+            self.btn_track.setChecked(False)
+        else:
+            widget.mode = CameraWidget.MODE_VIEW
+
+    def send_paint(self):
+        """按界面上的尺寸画一个车位。
+
+        改发帧而不是单字节 'P'，就为了这两个数能改。固件收到一帧会先校验
+        范围、再写尺寸、最后置 STATE_PAINT —— 三者一步完成，不存在
+        "尺寸改了但车没动"或者"用旧尺寸开跑"的中间态。
+
+        先撤相机再发帧：视觉那条线会周期发 MOVE / TRIM，抢在画车位前面
+        到达时固件回 ERR_STATE，画不成还只在日志里留一个结果码。
+        """
+        length = self.paint_len_spin.value()
+        width = self.paint_wid_spin.value()
+
+        self._detach_camera_auto()
+        self.send_frame(
+            frame.build_paint(length, width),
+            f"画车位 {length}x{width}mm",
+        )
+
     def send_button(self):
         label = self.sender().text()
         data = dict(PANEL_BUTTONS).get(label)
@@ -440,17 +532,8 @@ class MainWindow(QWidget):
         self.append_send_log(data, label)
         self.status_label.setText(f"状态:\n{label}")
 
-        # 按了面板上别的键 = 不想让它自己干活了，先把自动流程撤下来。
-        # 不撤的话按"停止复位"或者"关水泵"，摄像头还在按帧下发指令 ——
-        # 人按的停停不停得住全看手速，这不能接受。
-        # 下位机那边也堵了一道：RESPRAY / MOVE 只在 STATE_WAIT 被接受。
-        widget = getattr(self, 'camera_widget', None)
-        if widget is not None and label not in CAMERA_BUTTONS:
-            if widget.mode == CameraWidget.MODE_TRACK:
-                widget.stop_track()
-                self.btn_track.setChecked(False)
-            else:
-                widget.mode = CameraWidget.MODE_VIEW
+        if label not in CAMERA_BUTTONS:
+            self._detach_camera_auto()
 
         # ---------------- 摄像头弹窗 ----------------
         if label in CAMERA_BUTTONS:
