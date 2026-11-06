@@ -69,29 +69,16 @@ UV4.exe -b Project.uvprojx -t "4WD_Car" -j0 -o build_4wd.log
 消失，`Motion_MoveLeft` 这个符号在差速版固件里压根没有。现场也不会出现"这个
 版本忘了改回来"：两套 hex 分别归档，刷哪个就是哪套能力。
 
-### 实际差异（反汇编核对过）
+### 实际差异
 
 | | `Mec_Car` | `4WD_Car` |
 |---|---|---|
-| `Motion_MoveLeft` / `MoveRight` | 各 116 字节 | **符号不存在** |
+| `Motion_MoveLeft` / `MoveRight` | 真的横移 | **符号不存在**，`MOVE_LEFT/RIGHT` 帧编成 `ERR_HW` |
 | `Motion_HasMecanum` | 函数存在 | 常量折叠掉 |
-| `MOVE_LEFT/RIGHT` 帧 | 真的横移 | 编译期合成 `ERR_HW` |
 | 轮径补偿系数 | 四轮各一个 `CALIB_WHEEL_K1~K4` | 左右各一个，组内强制相同 |
 | 原地转速度 | 用当前档位 | 压到 `CHASSIS_TURN_ARR`（≈220mm/s） |
 | 转角补偿 | 1.000 | 1.050（现场量了再改） |
 | 段内纠偏累计上限 | 200mm | 80mm |
-| 固件体积 | Code = 20946 | Code = 20658 |
-
-体积是 ZET6 版（四路独立时基 + 左右同步之后）用 Keil 命令行实测的，两套都
-`0 Error(s), 0 Warning(s)`。差值 288 字节就是横移那两个函数，和换板前一样 ——
-说明同步逻辑是两边共用的，没有偷偷把麦轮的东西编进差速版。
-
-要确认条件编译生效，看符号表比看体积可靠：
-
-```bash
-fromelf --text -s Objects/4WD/Marking_4WD.axf | grep Motion_MoveLeft   # 空
-fromelf --text -s Objects/Mec/Marking_Mec.axf  | grep Motion_MoveLeft   # 有，116 字节
-```
 
 差速版为什么要“组内强制相同”的轮径系数：普通橡胶轮横向不能滑移，同一侧
 前后轮只要有一点行程差，多出来的部分只能靠某个轮子打滑消化，而哪个先打滑
