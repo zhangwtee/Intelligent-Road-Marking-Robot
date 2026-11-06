@@ -99,11 +99,17 @@ class MainWindow(QWidget):
     # ---------------- 帧发送 ----------------
     def send_frame(self, raw, label=""):
         """发一帧并登记 ACK。所有走帧协议的动作都要经过这里 ——
-        绕过它发送，链路健康度就少了这一条，而且永远不会被发现。"""
-        self.serial_mgr.send(raw)
-        self.ack.register(raw)
+        绕过它发送，链路健康度就少了这一条，而且永远不会被发现。
+
+        返回是否真的写进了串口。没写出去就不登记 ACK —— 登记了会在超时后
+        由 expire 重发，而串口还是断的，白白多刷一轮。
+        """
+        ok = self.serial_mgr.send(raw)
+        if ok:
+            self.ack.register(raw)
         self.append_send_log(raw, label)
         self._update_link_label()
+        return ok
 
     # ---------------- 车位尺寸输入 ----------------
     @staticmethod
@@ -750,9 +756,12 @@ class MainWindow(QWidget):
         # 每次都发一帧等于给日志刷噪声。
         if arr == self._speed_sent:
             return
-        self._speed_sent = arr
-        self._speed_sent_at = time.monotonic()
-        self.send_frame(frame.build_speed(arr), f"速度 {arr}")
+        # 写出去了才记账。串口断着的时候拖滑条，记成"已发"的话，之后
+        # 拖回同一个值会被上面那句"值没变"挡掉，界面上写着 600 而车
+        # 还按旧档跑。
+        if self.send_frame(frame.build_speed(arr), f"速度 {arr}"):
+            self._speed_sent = arr
+            self._speed_sent_at = time.monotonic()
 
     def send_button(self):
         label = self.sender().text()

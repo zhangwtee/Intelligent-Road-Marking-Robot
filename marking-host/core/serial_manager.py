@@ -75,25 +75,30 @@ class SerialManager(QObject):
                 print("[串口] 读取异常:", e)
 
     # ================= 发送 =================
-    def send(self, data: bytes):
+    def send(self, data: bytes) -> bool:
 
         # 串口没开（或已断开）时，原来这里 if self.ser 为假就直接返回，
         # 不 emit 任何东西 —— 用户按了按钮、日志写着「已发送」，车一动不动，
         # 而且没有任何提示。静默失败比报错更难查，所以这条必须走 error_signal。
+        #
+        # 返回值给调用方判断：这一帧到底出去没有。速度那一路要拿它决定
+        # 记不记账，见 main_window 的 _send_speed。
         if not self.ser:
             self.error_signal.emit("串口未打开，发送被丢弃")
             print("[串口] 未打开，丢弃发送:", data)
-            return
+            return False
 
         try:
 
             self.ser.write(data)
             print("[发送]", data)
+            return True
 
         except Exception as e:
 
             self.error_signal.emit(str(e))
             print("[串口] 发送失败:", e)
+            return False
 
     # ================= 关闭 =================
     def close(self):

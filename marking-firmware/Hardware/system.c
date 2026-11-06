@@ -395,7 +395,7 @@ StepMotor_SetPulse(MOTOR3, 1);
 StepMotor_SetPulse(MOTOR4, 1);
 
     /* 换算系数在这里算一次（一次浮点除法），之后全是乘法。
-     * F103 没有 FPU，运行时的浮点除法一次要几十微秒，放在状态机里
+     * F103 没有 FPU，运行时的浮点除法要拖进软浮点库，放在状态机里
      * 会让脉冲启停明显滞后。 */
     Motion_Init();
 

@@ -44,6 +44,7 @@ class FakeSerial(QObject):
 
     def send(self, data):
         self.sent.append(bytes(data))
+        return True         # 和真实 SerialManager.send 一样回报成功与否
 
 
 def make_window():
@@ -348,6 +349,25 @@ def test_speed_slider_does_not_flood_while_dragging():
     w.on_speed_released()
     assert len(w.serial_mgr.sent) == 1
     assert ((w.serial_mgr.sent[0][3] << 8) | w.serial_mgr.sent[0][4]) == 220
+
+
+def test_speed_retries_after_a_dropped_frame():
+    """串口没写出去的时候，不能记成"已发"。
+
+    记了的话，之后拖回同一个值会被"值没变"挡掉：界面上写着 600，车还
+    按旧档跑，人拿这个数字判断漆量。
+    """
+    w = make_window()
+
+    tried = []
+    w.serial_mgr.send = lambda data: (tried.append(bytes(data)), False)[1]
+    w.speed_slider.setValue(600)
+    assert len(tried) == 1, "滑条动了却没尝试发送"
+
+    # 串口恢复，同一个值再松一次手就该真的出去 —— 不能被"值没变"吃掉
+    w.serial_mgr.send = lambda data: (tried.append(bytes(data)), True)[1]
+    w.on_speed_released()
+    assert len(tried) == 2, "串口恢复后没有补发"
 
 
 def test_speed_is_not_resent_when_unchanged():
