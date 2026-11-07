@@ -457,20 +457,24 @@ void StepMotor_Init(void)
                            RCC_APB2Periph_GPIOB |
                            RCC_APB2Periph_GPIOC, ENABLE);
 
-    /* 2. 方向引脚：推挽输出（PA8 / PA12 / PA11 / PB12，与旧版一致） */
+    /* 2. 方向引脚：推挽输出。
+     *
+     * 一个脚一次 GPIO_Init，不按"几个都在同一个口"合并着配。合并之后，
+     * 谁把某一路挪到别的端口，那一路会静默失效：编译通过、其余三轮照转，
+     * 只有这一路方向不动，看起来像驱动器坏了。 */
     GPIO_InitStruct.GPIO_Mode  = GPIO_Mode_Out_PP;
     GPIO_InitStruct.GPIO_Speed = GPIO_Speed_50MHz;
-    GPIO_InitStruct.GPIO_Pin   = M1_DIR_PIN | M2_DIR_PIN | M3_DIR_PIN;
-    GPIO_Init(M1_DIR_PORT, &GPIO_InitStruct);      /* 三个都在 GPIOA */
-    GPIO_InitStruct.GPIO_Pin   = M4_DIR_PIN;
-    GPIO_Init(M4_DIR_PORT, &GPIO_InitStruct);
+    GPIO_InitStruct.GPIO_Pin   = M1_DIR_PIN;  GPIO_Init(M1_DIR_PORT, &GPIO_InitStruct);
+    GPIO_InitStruct.GPIO_Pin   = M2_DIR_PIN;  GPIO_Init(M2_DIR_PORT, &GPIO_InitStruct);
+    GPIO_InitStruct.GPIO_Pin   = M3_DIR_PIN;  GPIO_Init(M3_DIR_PORT, &GPIO_InitStruct);
+    GPIO_InitStruct.GPIO_Pin   = M4_DIR_PIN;  GPIO_Init(M4_DIR_PORT, &GPIO_InitStruct);
 
-    /* 3. 脉冲引脚：复用推挽。M1/M2/M3 都在 GPIOA，M4 在 GPIOC。 */
+    /* 3. 脉冲引脚：复用推挽，同样一个脚一次。 */
     GPIO_InitStruct.GPIO_Mode = GPIO_Mode_AF_PP;
-    GPIO_InitStruct.GPIO_Pin  = M1_PUL_PIN | M2_PUL_PIN | M3_PUL_PIN;
-    GPIO_Init(M1_PUL_PORT, &GPIO_InitStruct);      /* 三个都在 GPIOA */
-    GPIO_InitStruct.GPIO_Pin  = M4_PUL_PIN;
-    GPIO_Init(M4_PUL_PORT, &GPIO_InitStruct);      /* PC6，只有 RCT6/ZET6 才有 */
+    GPIO_InitStruct.GPIO_Pin  = M1_PUL_PIN;   GPIO_Init(M1_PUL_PORT, &GPIO_InitStruct);
+    GPIO_InitStruct.GPIO_Pin  = M2_PUL_PIN;   GPIO_Init(M2_PUL_PORT, &GPIO_InitStruct);
+    GPIO_InitStruct.GPIO_Pin  = M3_PUL_PIN;   GPIO_Init(M3_PUL_PORT, &GPIO_InitStruct);
+    GPIO_InitStruct.GPIO_Pin  = M4_PUL_PIN;   GPIO_Init(M4_PUL_PORT, &GPIO_InitStruct);
 
     /* 4. 四路定时器 */
     for (uint8_t i = 0; i < NUM_MOTORS; i++) {

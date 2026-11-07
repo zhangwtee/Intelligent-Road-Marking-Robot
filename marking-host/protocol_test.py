@@ -1035,6 +1035,78 @@ def test_battery_oled_code_survives_a_24v_system():
         "batt_oled_code 要用 16 位"
 
 
+def test_no_two_peripherals_share_a_pin():
+    """全板引脚不重样。
+
+    两个外设配到同一个脚不会报错：两边都"初始化成功"，然后轮流改对方
+    的电平。症状取决于谁最后写，看起来像其中一个坏了，实际是两个都还在。
+    这种问题只有上电才看得见，所以在这里对一遍。
+
+    泵、蜂鸣器、OLED、指示灯、串口这几路的脚是各写各的，没有集中的宏，
+    所以下面写死，并且逐条回到源码里确认 —— 源码挪了脚而测试没跟，
+    这条会先红，不会悄悄过期。
+    """
+    pins = {}
+
+    def take(port, pin_no, who):
+        key = (port, pin_no)
+        assert key not in pins, \
+            f"{who} 和 {pins[key]} 都在 {port} 的 Pin_{pin_no} 上"
+        pins[key] = who
+
+    def port_pin(text, prefix):
+        port = re.search(rf"#define\s+{prefix}_PORT\s+(GPIO[A-G])", text)
+        pin = re.search(rf"#define\s+{prefix}_PIN\s+GPIO_Pin_(\d+)", text)
+        assert port and pin, f"{prefix} 的端口 / 脚号宏不全"
+        return port.group(1), int(pin.group(1))
+
+    def source(name, encoding="gbk"):
+        return (FIRMWARE_HW / name).read_bytes().decode(encoding, errors="replace")
+
+    # 电机八根
+    motor_h = source("StepMotor_New.h")
+    for i in range(1, 5):
+        take(*port_pin(motor_h, f"M{i}_DIR"), f"M{i}_DIR")
+        take(*port_pin(motor_h, f"M{i}_PUL"), f"M{i}_PUL")
+
+    # 电池采样
+    take(*port_pin(source("battery.h"), "BATT_GPIO"), "电池采样")
+
+    # 陀螺仪
+    mpu_h = source("mpu6050.h")
+    take(*port_pin(mpu_h, "MPU_SCL"), "MPU6050 SCL")
+    take(*port_pin(mpu_h, "MPU_SDA"), "MPU6050 SDA")
+
+    # 硬编码的几路
+    hardcoded = [
+        ("PumpBuzzer.c", "#define PUMP_PIN    GPIO_Pin_13", ("GPIOB", 13), "水泵"),
+        ("PumpBuzzer.c", "#define BUZZER_PIN  GPIO_Pin_14", ("GPIOB", 14), "蜂鸣器"),
+        ("OLED.c", "GPIO_WriteBit(GPIOB, GPIO_Pin_8", ("GPIOB", 8), "OLED SCL"),
+        ("OLED.c", "GPIO_WriteBit(GPIOB, GPIO_Pin_9", ("GPIOB", 9), "OLED SDA"),
+        ("system.c", "GPIO_InitStructure.GPIO_Pin = GPIO_Pin_15;", ("GPIOB", 15), "心跳灯"),
+        ("DPWM.c", "GPIO_InitStructure.GPIO_Pin = GPIO_Pin_6;", ("GPIOB", 6), "舵机 1"),
+        ("DPWM.c", "GPIO_InitStructure.GPIO_Pin = GPIO_Pin_7;", ("GPIOB", 7), "舵机 2"),
+    ]
+    for fname, needle, key, who in hardcoded:
+        assert needle in source(fname), \
+            f"{fname} 里找不到 {needle!r}，这张引脚表要跟着改"
+        take(*key, who)
+
+    # 两路串口。USART.c 是 UTF-8，其余固件文件是 GBK。
+    uart = source("USART.c", encoding="utf-8")
+    for needle, key, who in (
+        ("GPIO_Pin_9;                 // PA9", ("GPIOA", 9), "USART1_TX"),
+        ("GPIO_Pin_10;                // PA10", ("GPIOA", 10), "USART1_RX"),
+        ("GPIO_Pin_2;                 // PA2", ("GPIOA", 2), "USART2_TX"),
+        ("GPIO_Pin_3;                 // PA3", ("GPIOA", 3), "USART2_RX"),
+    ):
+        assert needle in uart, f"USART.c 里找不到 {needle!r}，这张引脚表要跟着改"
+        take(*key, who)
+
+    # 上面一共 22 个脚。数不对说明有一条被漏掉了 —— 漏掉的那条正好可能是撞的。
+    assert len(pins) == 22, f"表里只有 {len(pins)} 个脚，应为 22"
+
+
 if __name__ == "__main__":
     for name in sorted(n for n in globals() if n.startswith("test_")):
         globals()[name]()
