@@ -142,16 +142,30 @@ static uint8_t paint_trim_exhausted;   /* 这条边纠偏累计到顶，别再调 */
  * T 停在某条边中途时记一份，之后 CMD_PAINT 带 RESUME 位就从这儿接着走。
  *
  * 存"还剩多少毫米"而不是"已经走了多少"：续画时 SetPulse 会把 CNT 清零
- * 重新计数（见 StepMotor_SetPulse 的说明），只有剩余量能直接喂给
- * Motion_ForwardFlat。
+ * 重新计数（见 StepMotor_SetPulse 的说明），只有剩余量能直接喂给运动层。
  *
- * 生命周期：T 记下 -> RESUME 用掉/失败清掉 -> W（停止复位）也清掉。
- * W 清掉是有意的：W 的语义是"这条活不干了"，留着一个更早的断点，
- * 会让"续画"按钮在几天后仍然亮着。 */
+ * 左右分开存。急停那一刻两侧本来就不等长 —— 差速纠偏改的就是左右各自的
+ * 目标脉冲。只记一路再喂给四路，等于把那笔还没走完的差速丢掉。
+ *
+ * 还落一份到 flash：断电重启之后"这条边还剩多少"仍然成立，而车停下的
+ * 位置不会自己变，所以续画照样接得上。它记的不是位置，车要是被人推走了，
+ * 续出来的框就是歪的 —— 这一点和不断电时按续画按钮完全一样，靠人看着车
+ * 判断。
+ *
+ * 生命周期：T 记下 -> RESUME 用掉后立刻从 flash 抹掉 -> W（停止复位）也
+ * 抹掉。W 抹掉是有意的：W 的语义是"这条活不干了"，留着一个更早的断点，
+ * 会让"续画"按钮在几天后仍然亮着。
+ *
+ * 写 flash 不能当场做：擦一页期间取指是停的，而按下急停的这一刻电机可能
+ * 还在转。所以只记脏标记，由 PaintResumeService 等车停稳再写。 */
 static uint8_t   paint_resume_valid;
 static PaintStep paint_resume_step;
-static float     paint_resume_mm;
+static float     paint_resume_left_mm;
+static float     paint_resume_right_mm;
 static uint8_t   paint_resume_heading;   /* 断点那条边当时有没有在纠偏 */
+static uint8_t   paint_resume_dirty;     /* 断点变了，等车停着再写 flash */
+static uint32_t  paint_resume_try_ms;    /* 上一次真去写 flash 的时刻 */
+static uint8_t   paint_resume_tried;     /* 写过没有；0 时 try_ms 不作数 */
 
 /* 轮距自标定时单侧走的距离。
  * 300mm 的取法：若轮距 500mm，车会转 300/500 = 0.6 rad ≈ 34 度。
@@ -190,13 +204,13 @@ static SystemCtrl sys_ctrl = {STATE_WAIT, (SystemState)0, 0};
  * 没标定，人会去调错地方。宁可让续画直接失败（上位机那个按钮是灰的），
  * 也不要给一个"看起来成功、实际接不上"的结果。
  *
- * 换算取 MOTOR1 作代表：这条边四路的目标都是 M1 的脉冲乘轮径系数得来的，
- * 相差在 1% 以内；而 Motion_ForwardFlat 续画时四路仍然等长，用哪一路的
- * 剩余都是同一个数。
+ * 左右各取各的剩余：M1/M3 是左侧、M2/M4 是右侧，纠偏改的正是这两组各自
+ * 的目标脉冲。同组两轮由轮径系数保证同步，取前轮即可。
  */
 static void PaintCaptureResume(void)
 {
-    int32_t remain;
+    int32_t remain_l;
+    int32_t remain_r;
 
     /* 不在"画车位"里：这次急停和画车位无关，已有的断点别动。
      *
@@ -212,7 +226,15 @@ static void PaintCaptureResume(void)
         return;
     }
 
-    paint_resume_valid = 0;
+    /* 这里只清 RAM，flash 里的那份交给 service。此刻电机可能还在停的过程中
+     * （急停是"先切状态、电机下一拍才停"），擦一页期间取指是停的，不能插在这儿。
+     *
+     * 但标脏是必须的：flash 里可能还存着上一次的断点，不一起抹掉，断电重启
+     * 之后那个旧断点会自己冒出来，而车早就不在那个位置了。 */
+    if (paint_resume_valid) {
+        paint_resume_valid = 0;
+        paint_resume_dirty = 1;
+    }
 
     if (!PaintEdgeRunning()) {
         return;
@@ -221,19 +243,78 @@ static void PaintCaptureResume(void)
         return;              /* 这条边已经走完，只是状态机还没轮到 */
     }
 
-    remain = StepMotor_GetRemainOf(MOTOR1);
-    if (remain <= 0) {
-        return;              /* 纠偏把目标压过头了，等于已经走完 */
-    }
+    remain_l = StepMotor_GetRemainOf(MOTOR1);
+    remain_r = StepMotor_GetRemainOf(MOTOR2);
 
-    if (Motion_PulseToMm((uint32_t)remain) < PAINT_RESUME_MIN_MM) {
+    if (remain_l <= 0 || remain_r <= 0) {
+        /* 一侧已经走完、另一侧还在走，说明车这会儿正在拧。接着走"剩下的
+         * 直线"只会把它拧得更歪，而且歪法很像转角系数没标定。宁可不给
+         * 这个续画，让人重新画一圈。 */
         return;
     }
 
-    paint_resume_step    = paint_step;
-    paint_resume_mm      = Motion_PulseToMm((uint32_t)remain);
-    paint_resume_heading = paint_heading;
-    paint_resume_valid   = 1;
+    if (Motion_PulseToMm((uint32_t)remain_l) < PAINT_RESUME_MIN_MM
+        && Motion_PulseToMm((uint32_t)remain_r) < PAINT_RESUME_MIN_MM) {
+        return;
+    }
+
+    paint_resume_step     = paint_step;
+    paint_resume_left_mm  = Motion_PulseToMm((uint32_t)remain_l);
+    paint_resume_right_mm = Motion_PulseToMm((uint32_t)remain_r);
+    paint_resume_heading  = paint_heading;
+    paint_resume_valid    = 1;
+    paint_resume_dirty    = 1;      /* 等车停稳，由 service 写 flash */
+}
+
+/* 断点作废：RAM 立刻清，flash 交给 service 等车停稳再擦。
+ *
+ * 用在"停止复位"上：那一下车可能还在跑，擦一页期间取指是停的，不能插在
+ * 这个位置。确认新开一条画车位时用下面的 PaintResumeClearNow —— 那种时刻
+ * 车本来就停着（WAIT 才放行），当场擦更安全。 */
+static void PaintResumeForget(void)
+{
+    paint_resume_valid = 0;
+    paint_resume_dirty = 1;
+}
+
+/* 车已经停着的时候（新开一条画车位），当场把 flash 里的断点抹掉，
+ * 不必等 service。
+ *
+ * 为什么这两处不能只置脏标记：接下来车就要开始走了，而 service 只在车停下
+ * 的时候才写 —— 也就是说整条画车位期间，flash 里都留着上一份断点。中途
+ * 断电，上电之后那个旧断点会自己冒出来，按下去就是从"上一次停下的地方"
+ * 再走一段，而车已经往前走了几条边。 */
+static void PaintResumeClearNow(void)
+{
+    paint_resume_valid = 0;
+    if (Cfg_ClearResume()) {
+        paint_resume_dirty = 0;     /* 已经擦掉了，别再让 service 跑一趟 */
+    } else {
+        paint_resume_dirty = 1;     /* 擦不掉就退回老办法，车停稳后重试 */
+    }
+}
+
+/* 上电把断点捡回来。
+ *
+ * 只依赖"这条边还剩多少毫米"，不需要知道位置 —— 和不断电时按续画按钮是
+ * 同一条路。长宽也要一起还原：续完这条边还要转三次弯、走三条边，用错
+ * 尺寸画出来的框，前一条边和后三条边对不上。 */
+static void PaintResumeBootLoad(void)
+{
+    CfgResume rec;
+
+    if (!Cfg_LoadResume(&rec)) {
+        return;
+    }
+
+    paint_resume_step     = (PaintStep)rec.step;
+    paint_resume_left_mm  = (float)rec.left_mm;
+    paint_resume_right_mm = (float)rec.right_mm;
+    paint_resume_heading  = rec.heading;
+    paint_len_mm          = (float)rec.len_mm;
+    paint_wid_mm          = (float)rec.wid_mm;
+    paint_resume_valid    = 1;
+    paint_resume_dirty    = 0;      /* flash 里就是这一份，不用再写 */
 }
 
 /* ---- 速度档位的掉电保存 ----
@@ -317,6 +398,51 @@ static void SpeedSaveService(void)
     if (Cfg_SaveSpeed(arr)) {
         speed_save_pending = 0;
         speed_tried        = 0;     /* 成功之后重新计：下次改速要能立刻存 */
+    }
+}
+
+/* ---- 断点写 flash ----
+ *
+ * 和速度保存同一个套路：车停稳才写、失败退避。擦一页期间取指是停的，
+ * 这一步要是落在正在发脉冲的时候，那一小段就走少了。
+ *
+ * 单独一个脏标记而不是在 T 分支里直接写：按下急停的那一刻，状态刚切成
+ * TING，电机是紧随其后那一拍才停的。 */
+#define PAINT_RESUME_RETRY_MS  10000
+
+static void PaintResumeService(void)
+{
+    CfgResume rec;
+
+    if (!paint_resume_dirty) {
+        return;
+    }
+    if (StepMotor_IsAnyRunning()) {
+        return;
+    }
+    if (paint_resume_tried
+        && (uint32_t)(timer_counter - paint_resume_try_ms) < PAINT_RESUME_RETRY_MS) {
+        return;
+    }
+    paint_resume_tried  = 1;
+    paint_resume_try_ms = timer_counter;
+
+    if (paint_resume_valid) {
+        rec.valid    = 1;
+        rec.step     = (uint8_t)paint_resume_step;
+        rec.heading  = (uint8_t)(paint_resume_heading ? 1 : 0);
+        rec.left_mm  = (uint16_t)(paint_resume_left_mm + 0.5f);
+        rec.right_mm = (uint16_t)(paint_resume_right_mm + 0.5f);
+        rec.len_mm   = (uint16_t)(paint_len_mm + 0.5f);
+        rec.wid_mm   = (uint16_t)(paint_wid_mm + 0.5f);
+
+        if (Cfg_SaveResume(&rec)) {
+            paint_resume_dirty = 0;
+            paint_resume_tried = 0;
+        }
+    } else if (Cfg_ClearResume()) {
+        paint_resume_dirty = 0;
+        paint_resume_tried = 0;
     }
 }
 
@@ -415,6 +541,10 @@ StepMotor_SetPulse(MOTOR4, 1);
             StepMotor_SetUserSpeed(saved_speed);
         }
     }
+
+    /* 断点也从上电这一页里捡回来。它只是把"续画"点亮，不驱动任何东西 ——
+     * 真要续，得等人发 CMD_PAINT 带 RESUME 位。 */
+    PaintResumeBootLoad();
 
     /* 陀螺仪放在最后初始化：MPU6050_Init 里有 200 多毫秒的上电等待
      * （手册 tPOWERUP + 软复位恢复时间），放在前面会把串口、舵机、电机
@@ -859,7 +989,7 @@ static void HandleFrame(const uint8_t *f, uint8_t from)
             paint_len_mm       = (float)len_mm;
             paint_wid_mm       = (float)wid_mm;
             paint_heading      = (d[4] & PROTO_PAINT_FLAG_HEADING) ? 1 : 0;
-            paint_resume_valid = 0;   /* 新画一条，旧断点作废 */
+            PaintResumeClearNow();    /* 新画一条，旧断点当场作废 */
             sys_ctrl.state     = STATE_PAINT;
         }
         break;
@@ -1190,7 +1320,7 @@ static void HandleCmd(uint8_t cmd, uint8_t from) {
 					OLED_ShowString(3, 1, "Wait            ");
         /* W = 这条活不干了，断点跟着作废。留着的话，"续画"按钮会在
          * 几天后仍然亮着，按下去接到一个早就不存在的位置。 */
-        paint_resume_valid = 0;
+        PaintResumeForget();
         sys_ctrl.state = STATE_WAIT;
 				break;
 		case 'K'://开水泵
@@ -1284,7 +1414,7 @@ static void HandleCmd(uint8_t cmd, uint8_t from) {
         paint_len_mm       = PAINT_LEN_DEFAULT_MM;
         paint_wid_mm       = PAINT_WID_DEFAULT_MM;
         paint_heading      = 0;   /* 单字节通道不带纠偏 */
-        paint_resume_valid = 0;   /* 更不是续画 */
+        PaintResumeClearNow();    /* 更不是续画，旧断点当场作废 */
         sys_ctrl.state     = STATE_PAINT;
     } else {
         /* 正在画 / 走段 / 补喷时发 P：不打断，明确回绝。
@@ -1475,6 +1605,7 @@ void System_StateMachine(void) {
      * 放在状态机之前 —— 状态机里那一轮可能刚把车开起来，先让这里
      * 看一眼"停没停"，比在状态机里到处埋点可靠。 */
     SpeedSaveService();
+    PaintResumeService();   /* 断点：车停着才写 flash，同上 */
     uint32_t current_time = GetTick();
 	 // 检测状态是否改变
     if (sys_ctrl.state != sys_ctrl.last_state) {
@@ -1618,10 +1749,26 @@ void System_StateMachine(void) {
             Pump_On();
 
             if (resume) {
+                /* 先把 flash 里这条断点抹掉，再起步。
+                 *
+                 * 顺序不能反：擦一页期间取指是停的，而脉冲是硬件定时器在
+                 * 发 —— 车要是已经在走了，主循环被按住的那几十毫秒里串口
+                 * 收到的字节就丢了。这一步失败也不挡着走，交给 service
+                 * 有空再擦：断点已经取进 RAM 了，不会再用第二次。
+                 *
+                 * 抹掉是必须的。这条边还没走完之前，flash 里留着一份旧断点
+                 * 就等于"车已经往前走了，断点还在老地方"，这时候断电，
+                 * 上电再续就是从头再走一遍那段。 */
+                if (!Cfg_ClearResume()) {
+                    paint_resume_dirty = 1;
+                }
+
                 /* 只走这条边剩下的那段。SetPulse 会把 CNT 清零，所以
-                 * "续"在这里等于"从当前位置再走 remain 毫米"。 */
-                Motion_ForwardFlat(paint_resume_mm);
-                paint_resume_mm = 0.0f;
+                 * "续"在这里等于"从当前位置再走 remain 毫米"。
+                 * 左右各走各的：断点记的就是两侧各自的剩余。 */
+                Motion_ForwardFlatLR(paint_resume_left_mm, paint_resume_right_mm);
+                paint_resume_left_mm  = 0.0f;
+                paint_resume_right_mm = 0.0f;
             } else {
                 paint_step = PAINT_EDGE1;
                 Motion_ForwardFlat(paint_len_mm);

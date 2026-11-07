@@ -586,14 +586,30 @@ def test_status_bar_shows_which_edge_is_being_painted():
     w = make_window()
 
     w.on_data_received(status_frame(state_char="P", step=5))
-    assert "第3条边" in w.status_label.text(), w.status_label.text()
+    assert "第3条边" in w.paint_label.text(), w.paint_label.text()
 
     w.on_data_received(status_frame(state_char="P", step=6))
-    assert "转弯3" in w.status_label.text(), w.status_label.text()
+    assert "转弯3" in w.paint_label.text(), w.paint_label.text()
 
     # 别的状态还按原来的方式显示，别把段号硬套到所有状态上
     w.on_data_received(status_frame(state_char="M", step=0))
-    assert "第" not in w.status_label.text(), w.status_label.text()
+    assert "第" not in w.paint_label.text(), w.paint_label.text()
+
+
+def test_paint_progress_is_not_overwritten_by_a_command_echo():
+    """画线期间来一条 ACK，不能把"第几条边"盖成"状态: OK"。
+
+    进度和"最后按了哪个键"挤同一个 label 的时候，就是这样闪的：ACK 先盖掉
+    进度，200ms 后 5Hz 的状态帧再盖回来。画线时命令很少，所以现场偶尔才
+    看到闪一下 —— 而闪掉的那一行正好是画线时最需要看的。
+    """
+    w = make_window()
+
+    w.on_data_received(status_frame(state_char="P", step=5))
+    w.on_data_received(frame.build_frame(frame.CMD_ACK, 0, bytes([0x10, 0])))
+
+    assert "第3条边" in w.paint_label.text(), w.paint_label.text()
+    assert "OK" in w.status_label.text(), w.status_label.text()
 
 
 def battery_frame(mv, valid=True, low=False):

@@ -308,6 +308,34 @@ void Motion_ForwardFlat(float mm)
     StepMotor_SetRampEnabled(1);
 }
 
+void Motion_ForwardFlatLR(float left_mm, float right_mm)
+{
+    uint32_t pl;
+    uint32_t pr;
+
+    if (!s_ready) {
+        return;
+    }
+    if (left_mm <= 0.0f && right_mm <= 0.0f) {
+        return;
+    }
+
+    pl = Motion_MmToPulse(left_mm);
+    pr = Motion_MmToPulse(right_mm);
+
+    /* 直接按脉冲喂 DriveAll，不走 DriveLR。
+     *
+     * DriveLR 会按轮径系数 k 再乘一次。而这两个数是拿 StepMotor 的剩余
+     * 脉冲反算回来的，本身已经含过 k 了 —— 再乘一次，这一截就会走成 k 倍。
+     *
+     * DriveAll 就是 Motion_Forward 走的那条路：复位累计纠偏、按左右脉冲
+     * 定两组 ARR、四路一起启动。除了左右可以不同，和 Motion_ForwardFlat
+     * 完全一致。单侧给 0 时 DriveAll 会抬到 1 个脉冲，不会停掉那一路。 */
+    StepMotor_SetRampEnabled(0);
+    DriveAll(1, pl, pr, pl, pr);
+    StepMotor_SetRampEnabled(1);
+}
+
 void Motion_TurnRight(float deg)
 {
     uint32_t p;

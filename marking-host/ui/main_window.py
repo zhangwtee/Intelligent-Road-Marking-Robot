@@ -159,6 +159,14 @@ class MainWindow(QWidget):
         left_layout.addSpacerItem(QSpacerItem(20, 40, QSizePolicy.Minimum, QSizePolicy.Fixed))
         left_layout.addWidget(self.status_label)
 
+        # 画车位进度单独一行。它和"最后按了哪个键"是两件事：共用一个 label
+        # 的时候，画线期间来一条 ACK 就把进度盖成"状态: OK"，200ms 后状态帧
+        # 再盖回来 —— 看着就是在闪，而且刚好盖住最需要看的那一行。
+        self.paint_label = QLabel("")
+        self.paint_label.setAlignment(Qt.AlignCenter)
+        self.paint_label.setStyleSheet("font-size:22px; font-weight:bold; color:#1a7f37;")
+        left_layout.addWidget(self.paint_label)
+
         self.link_label = QLabel("链路：还没发过帧")
         self.link_label.setAlignment(Qt.AlignCenter)
         left_layout.addWidget(self.link_label)
@@ -524,9 +532,10 @@ class MainWindow(QWidget):
                 # 状态帧的 DATA[1] 是画车位子状态，固件一直在发，之前没人用。
                 # 人在树莓派前只能扭头看车上那块 OLED 才知道画到第几条边。
                 step = frame.PAINT_STEP_LABELS.get(data[1], str(data[1]))
-                self.status_label.setText(f"画车位:\n{step}")
+                self.paint_label.setText(f"画车位:\n{step}")
             else:
-                self.status_label.setText(f"状态:\n{item['status']}")
+                self.paint_label.setText("")
+            self.status_label.setText(f"状态:\n{item['status']}")
             return
 
         # 航向帧同样是 5Hz，只更新界面，不进日志 ——

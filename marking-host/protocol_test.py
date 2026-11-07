@@ -388,7 +388,7 @@ def test_second_estop_does_not_wipe_the_breakpoint():
     assert match, "固件里找不到 PaintCaptureResume"
     body = match.group(1)
 
-    assert "paint_resume_valid   = 1" in body, "抠到的不是断点那段代码"
+    assert re.search(r"paint_resume_valid\s*=\s*1", body), "抠到的不是断点那段代码"
 
     guard = body.find("sys_ctrl.state != STATE_PAINT")
     clear = body.find("paint_resume_valid = 0")
@@ -1105,6 +1105,198 @@ def test_no_two_peripherals_share_a_pin():
 
     # 上面一共 22 个脚。数不对说明有一条被漏掉了 —— 漏掉的那条正好可能是撞的。
     assert len(pins) == 22, f"表里只有 {len(pins)} 个脚，应为 22"
+
+
+def _firmware_body(text, signature):
+    """抠出一个函数的函数体。签名按正则给，函数体到行首的 } 为止。"""
+    match = re.search(signature + r"\s*\{(.*?)\n\}", text, re.S)
+    assert match, "固件里找不到 " + signature
+    return match.group(1)
+
+
+def test_breakpoint_survives_a_power_cut():
+    """断点要能过掉电。
+
+    以前它只活在 RAM 里：干完活关机、或者干脆电池掉了，这条边剩多少就没了，
+    上电只能整圈重画 —— 前几条边白喷，而且人是在"车已经停在那儿"的位置上
+    重画，框必然对不齐。
+
+    存的是"还剩多少毫米"，不是位置。车要是被人推走了，续出来还是歪的 ——
+    和不掉电时按续画按钮完全一样，靠人看着车判断，代码不假装知道。
+    """
+    cfg_c = (FIRMWARE_HW / "cfg.c").read_bytes().decode("gbk", errors="replace")
+    cfg_h = (FIRMWARE_HW / "cfg.h").read_bytes().decode("gbk", errors="replace")
+    text = FIRMWARE_C.read_bytes().decode("gbk", errors="replace")
+
+    for name in ("Cfg_LoadResume", "Cfg_SaveResume", "Cfg_ClearResume"):
+        assert name + "(" in cfg_c, f"cfg.c 里没有 {name}"
+
+    # 记录里必须有左右两侧和这次的长宽：只存一侧，续画会把另一侧也按它走；
+    # 不存长宽，续完这条边就不知道后面三条边该多长。
+    for field in ("left_mm", "right_mm", "len_mm", "wid_mm"):
+        assert field in cfg_h, f"CfgResume 里少了 {field}"
+
+    boot = _firmware_body(text, r"static void PaintResumeBootLoad\(void\)")
+    assert "Cfg_LoadResume" in boot, "上电时没有把断点读回来"
+    assert "paint_resume_valid" in boot, "读回来没有点亮续画"
+
+    # 读回来的长宽要还原：续完这条边还要转三次弯、走三条边。
+    assert "paint_len_mm" in boot and "paint_wid_mm" in boot, \
+        "断点没把长宽一起还原，后面三条边会用默认尺寸"
+
+    # 上电路径里真的调了它，而不是写了个没人用的函数。
+    assert "PaintResumeBootLoad();" in text, "Hardware_Init 里没调 PaintResumeBootLoad"
+
+
+def test_breakpoint_on_a_turn_step_is_rejected():
+    """段号是 PaintStep 的原值，只认"边"。
+
+    PaintStep 是 IDLE、EDGE1、TURN1、EDGE2 …… 交替排下来的，边在奇数位。
+    认了一个 TURN 当断点，续画会顺着转弯那一步直接往前开 —— 框歪掉，而且
+    歪得特别像 CHASSIS_TURN_SCALE 没标定，人会去调错地方。
+    """
+    text = FIRMWARE_C.read_bytes().decode("gbk", errors="replace")
+
+    # 断点只在边上记
+    body = _firmware_body(text, r"static void PaintCaptureResume\(void\)")
+    assert "PaintEdgeRunning()" in body, "断点没有限制在「边」上记"
+
+    # 读回来的时候也要挡一道：flash 里的值可能是半截的、或者被别的东西写过。
+    cfg_c = (FIRMWARE_HW / "cfg.c").read_bytes().decode("gbk", errors="replace")
+    sane = _firmware_body(cfg_c, r"static uint8_t CfgResumeLooksSane\(const CfgResume \*rec\)")
+    assert "rec->step & 1u" in sane, \
+        "CfgResumeLooksSane 没有排除偶数段号（TURN1/TURN2/TURN3）"
+
+
+def test_starting_a_new_frame_clears_the_stored_breakpoint_first():
+    """新画一条之前，flash 里的旧断点要当场擦掉。
+
+    service 只在车停着的时候写 flash。只置一个脏标记的话，整条画车位期间
+    flash 里都留着上一份断点 —— 中途断电，上电之后那个旧断点会自己冒出来，
+    按下去就是从"上一次停下的地方"再走一段，而车已经往前走了几条边。
+
+    两个入口都是"车正停着"的时刻（WAIT 才让开），当场擦是安全的。
+    """
+    text = FIRMWARE_C.read_bytes().decode("gbk", errors="replace")
+
+    head_frame = "paint_heading      = (d[4] & PROTO_PAINT_FLAG_HEADING) ? 1 : 0;"
+    head_char = "paint_heading      = 0;"
+
+    for head, who in ((head_frame, "帧版画车位"), (head_char, "单字节 P")):
+        i = text.find(head)
+        assert i != -1, f"{who}：找不到那条赋值"
+        nxt = text[i + len(head):i + len(head) + 120]
+        assert "PaintResumeClearNow" in nxt, (
+            f"{who}：起步前没有当场擦断点，只置了脏标记 —— service 要等车停下才写，"
+            f"整条画车位期间 flash 里都是旧断点"
+        )
+
+    # W（停止复位）仍然交给 service：那一下车可能还在跑，不能插一次擦除。
+    forget = text.find("PaintResumeForget();")
+    assert forget != -1, "W 那条路上没有作废断点"
+
+    body = _firmware_body(text, r"static void PaintResumeClearNow\(void\)")
+    assert "Cfg_ClearResume" in body, "当场擦的入口没有真去擦"
+    assert "paint_resume_dirty = 0" in body, "擦成功之后还留着脏标记，service 会再跑一趟"
+
+
+def test_clearing_the_breakpoint_updates_the_ram_copy():
+    """擦掉之后，RAM 里那份"flash 里有什么"的副本也要跟着清。
+
+    抄漏这一句，下一次判断会以为断点还在，把一次成功的擦除报成失败：
+    上层于是每 10 秒重试一次，而每次只是读一页 —— 现象是"擦不掉"，
+    实际早就擦掉了。
+    """
+    cfg_c = (FIRMWARE_HW / "cfg.c").read_bytes().decode("gbk", errors="replace")
+    body = _firmware_body(cfg_c, r"uint8_t Cfg_ClearResume\(void\)")
+
+    write = body.find("CfgWritePage")
+    clear = body.find("cfg_resume.valid = 0")
+    assert write != -1, "Cfg_ClearResume 里没写 flash"
+    assert clear != -1, "擦完没有更新 RAM 里的副本"
+    assert clear > write, "先清副本再写 flash，写失败了副本就已经是错的"
+
+
+def test_breakpoint_is_written_only_when_the_car_is_standing_still():
+    """擦一页期间取指是停的。落在一个正在发脉冲的时刻，那一段就走少了。
+
+    所以按下急停的那一刻只置脏标记，真正的写由 service 等车停稳再做 ——
+    急停是"状态先切 TING、电机下一拍才停"，当场写必然撞上还在转的那几拍。
+    """
+    text = FIRMWARE_C.read_bytes().decode("gbk", errors="replace")
+
+    capture = _firmware_body(text, r"static void PaintCaptureResume\(void\)")
+    assert "paint_resume_dirty" in capture, "记断点时没有置脏标记"
+    assert "Cfg_SaveResume" not in capture, \
+        "在急停那一刻直接写 flash 了：电机可能还在转"
+
+    service = _firmware_body(text, r"static void PaintResumeService\(void\)")
+    stop = service.find("StepMotor_IsAnyRunning")
+    write = service.find("Cfg_SaveResume")
+    assert stop != -1, "写断点之前没有查车停没停"
+    assert write != -1, "PaintResumeService 里没有写 flash"
+    assert stop < write, "先写 flash 再查车停没停，顺序反了"
+
+    # 失败要退避，不然每一圈都重擦一次页，主循环一直被它按住。
+    assert "PAINT_RESUME_RETRY_MS" in service, "写失败没有退避"
+
+    # 主循环里真的调了这个 service。
+    assert "PaintResumeService();" in text, "主循环里没调 PaintResumeService"
+
+
+def test_resume_keeps_the_two_sides_apart():
+    """续画不能拿一侧的剩余喂给四路。
+
+    急停那一刻左右本来就不等长 —— 差速纠偏改的就是左右各自的目标脉冲。
+    拿 MOTOR1 的剩余给四路统一用，等于把那笔还没走完的差速丢掉：车会先
+    回正再接着走，续出来的那条边接不上前一段。
+    """
+    text = FIRMWARE_C.read_bytes().decode("gbk", errors="replace")
+
+    capture = _firmware_body(text, r"static void PaintCaptureResume\(void\)")
+    assert "StepMotor_GetRemainOf(MOTOR1)" in capture, "没取左侧剩余"
+    assert "StepMotor_GetRemainOf(MOTOR2)" in capture, "没取右侧剩余"
+
+    call = re.search(r"Motion_ForwardFlatLR\(([^;]*)\);", text)
+    assert call, "续画没有走左右分开的那条路径"
+    assert call.group(1).count(",") == 1, "Motion_ForwardFlatLR 只传了一个数"
+
+    # 两侧的剩余都要清零，不然下一次续画会复用一个早就走完的数
+    tail = text[call.end():call.end() + 400]
+    assert "paint_resume_left_mm" in tail and "paint_resume_right_mm" in tail, \
+        "用完没有清掉两侧的剩余"
+
+
+def test_resume_clears_flash_before_it_starts_moving():
+    """先抹 flash 再起步，顺序不能反。
+
+    反过来就是：车已经在走了，主循环被擦除按住，那几十毫秒里串口收到的
+    字节丢掉。而这一条断点还留在 flash 里 —— 这条边没走完之前断电，上电
+    再续就会把那一段从头再走一遍。
+    """
+    text = FIRMWARE_C.read_bytes().decode("gbk", errors="replace")
+
+    call = text.find("Motion_ForwardFlatLR(")
+    assert call != -1, "找不到续画那段"
+
+    window = text[max(0, call - 1200):call]
+    clear = window.rfind("Cfg_ClearResume()")
+    assert clear != -1, "续画之前没有抹掉 flash 里的断点"
+
+
+def test_resume_does_not_apply_the_wheel_factor_twice():
+    """续画的脉冲是"真剩多少"，不能再乘一次轮径系数。
+
+    Motion_DriveLR 会按 k 再乘一次，而这两个数是从 StepMotor 的剩余脉冲
+    反算回来的，已经含过 k 了。再乘一次，这一截就走成 k 倍 —— 轮径系数
+    标到 1.02，五米多的边就要多走一截，而界面上一切正常。
+    """
+    motion = (FIRMWARE_HW / "motion.c").read_bytes().decode("gbk", errors="replace")
+    body = _firmware_body(motion, r"void Motion_ForwardFlatLR\(float left_mm, float right_mm\)")
+
+    assert "DriveAll" in body, "没有走按脉冲直接驱动的路径"
+    assert "Motion_DriveLR" not in body, \
+        "Motion_ForwardFlatLR 走了 DriveLR：轮径系数会被乘两次"
 
 
 if __name__ == "__main__":

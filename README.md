@@ -197,9 +197,9 @@ Intelligent-Road-Marking-Robot/
 │   ├── core/frame.py        # 帧协议（与固件 proto.c 逐字节对齐）
 │   ├── core/lane_control.py # 视觉纠偏控制律（纯函数，带闭环仿真）
 │   ├── core/ack.py          # ACK 配对表 + 超时重发
-│   ├── protocol_test.py     # 上下位机指令集 + 帧常量 + 状态位对账 + 闪存页 + 分压比 + 采样超时 + 全板引脚（53 项）
+│   ├── protocol_test.py     # 上下位机指令集 + 帧常量 + 状态位对账 + 闪存页 + 分压比 + 采样超时 + 全板引脚 + 断点落盘（61 项）
 │   ├── chassis_test.py      # 双 Target 配置 / 条件编译是否真的生效（10 项）
-│   ├── main_window_test.py  # 航向显示 / 陀螺仪开关 / 车位尺寸 / 调速与回填 / 续画 / 电池显示 / 发送失败不记账（offscreen 跑）（31 项）
+│   ├── main_window_test.py  # 航向显示 / 陀螺仪开关 / 车位尺寸 / 调速与回填 / 续画 / 电池显示 / 发送失败不记账（offscreen 跑）（32 项）
 │   ├── motor_test.py        # 四路定时器 / 引脚 / 中断 / MOE / 起坡（13 项）
 │   ├── motion_sync_test.py  # 左右同步的接线与数学（13 项）
 │   ├── lane_control_test.py # 控制律符号/限幅 + 闭环仿真（17 项）
@@ -214,7 +214,7 @@ Intelligent-Road-Marking-Robot/
     ├── Hardware/            # 外设驱动（电机/舵机/水泵蜂鸣器/OLED/串口/状态机）
     │                        # proto.c/h = 帧协议，motion.c/h = 毫米->脉冲
     │                        # chassis.h = 车型配置中心（麦轮 / 四轮差速）
-    │                        # cfg.c/h = 掉电保存（目前只有速度档位）
+    │                        # cfg.c/h = 掉电保存（速度档位 + 画车位断点）
     ├── User/                # main.c、stm32f10x_it.c、stm32f10x_conf.h
     ├── Library/             # STM32F10x 标准外设库
     ├── Start/               # 启动文件、system_stm32f10x、core_cm3
@@ -358,6 +358,20 @@ CRC 用标准校验值 `crc8(b"123456789") == 0xF4` 双向锚定 —— 不是�
 不会动它 —— 急了连点两下是常事，第二下进来时状态已经是 `TING`，要是照旧
 清零，刚记好的断点就没了，而人只看到「按了两下，续画不见了」。
 
+断点存在 flash 里（和速度同一页），**断电重启之后按钮还亮着**。干完活关机、
+或者电池掉了，这条边剩多少不会跟着没掉 —— 车停的位置本来也不会自己变。
+它记的是「还剩多少毫米」，不是位置：车要是被人推走了，续出来照样是歪的，
+和不掉电时按续画按钮一样，靠人看着车判断。长宽也一起存，续完这条边还要
+转三次弯、走三条边，用错尺寸后三条边就对不上前一条。
+
+两侧的剩余分开记。急停那一刻左右本来就不等长 —— 差速纠偏改的就是左右各自
+的目标脉冲，拿一侧的数喂给四路，等于把那笔还没走完的差速丢掉。
+
+断点在「新画一条」和「停止复位」时作废，而且要在车动起来之前擦掉。只记一个
+「该擦了」的标记、等车停稳再擦是不行的：整条画车位期间 flash 里都留着上一份
+断点，中途断电，上电之后那个旧断点会自己冒出来，按下去就是从早就过去的位置
+再走一段。
+
 停在**转弯**上不记断点，按钮不亮。那不是少喷一段，是少转了 90 度：接一段直线
 上去框是歪的，而且歪得很像 `CHASSIS_TURN_SCALE` 没标定，人会去调错地方。剩不到
 50mm 也不记 —— 续一段 3mm 的线，泵开一下关一下，只会在断点那儿滴一个点。
@@ -366,8 +380,10 @@ CRC 用标准校验值 `crc8(b"123456789") == 0xF4` 双向锚定 —— 不是�
 「前两条边白喷」，不是「线是连续的」。
 
 状态帧的 `DATA[1]` 是画车位子状态（1~8 对应第几条边 / 第几次转弯），固件一直在发。
-以前没人用，人在树莓派前面得扭头看车上那块 OLED 才知道画到哪儿；现在状态栏直接写
-「画车位：第3条边」。
+以前没人用，人在树莓派前面得扭头看车上那块 OLED 才知道画到哪儿；现在状态区单独一行
+写「画车位：第3条边」。单独一行不是为了好看：和「最后按了哪个键」挤同一个位置时，
+画线期间来一条 ACK 就把进度盖回去，两百毫秒后状态帧再盖回来 —— 看着在闪，闪掉的
+正好是画线时最需要看的那一行。
 
 速度也上了面板：一条滑条，值就是固件的 ARR（帧 `0x08`，越小越快），右拖变快。以前只有蓝牙的 `+`/`-` 能调速，用树莓派跑的时候速度只能靠手机改，或者烧死在一个档位 —— 而速度直接决定漆量和拐角冲击。拖动过程中一帧都不发、松手才发最后一次（9600 下一帧 10.4ms，不挡的话拖一下就是几十帧，ACK 和错误码全被冲干净），值没变也不发。段内（画车位 / 走段 / 补喷）固件回 `ERR_STATE` 拒绝：段首按脉冲比例定好的左右速度比，中途改会把四路拉平。
 
@@ -592,7 +608,7 @@ python3 main.py
   3. 落地但空跑，不接泵，跑一遍 `P`，量实际画出来的尺寸对不对。
   4. 最后才接漆，头几次跑把手放在电源开关上。
 - 上下位机的指令集对齐由测试守着：`python3 protocol_test.py` 直接从固件 `system.c` 抠 `case '...'`、从 `proto.h` 抠 `#define`，和面板按钮表、`frame.py` 逐项对账，加了指令忘了同步会当场报。面板上**不许挂固件还没实现的按钮** —— 以前 `N`（画车位（路沿））就挂在这儿，按下去是空操作，靠一个白名单放行；现在功能整个撤掉了，白名单也没了，谁再挂一个空按钮这条测试就拦。
-- 测试一共 177 项，都不需要硬件：`python3 protocol_test.py`（53）、`lane_control_test.py`（17）、`camera_widget_test.py`（22）、`ack_test.py`（13）、`motion_sync_test.py`（13）、`motor_test.py`（13）、`chassis_test.py`（10）、`main_window_test.py`（31）、`vision_test.py`（5）。其中 `motor_test` / `motion_sync_test` / `chassis_test` 是读固件源码的静态检查（不需要编译器）；其余只需要 numpy，`camera_widget_test.py` 和 `vision_test.py` 还要 `opencv-python-headless`，没有 PyQt5 也行（测试里有个只够本文件用的替身）。
+- 测试一共 186 项，都不需要硬件：`python3 protocol_test.py`（61）、`lane_control_test.py`（17）、`camera_widget_test.py`（22）、`ack_test.py`（13）、`motion_sync_test.py`（13）、`motor_test.py`（13）、`chassis_test.py`（10）、`main_window_test.py`（32）、`vision_test.py`（5）。其中 `motor_test` / `motion_sync_test` / `chassis_test` 是读固件源码的静态检查（不需要编译器）；其余只需要 numpy，`camera_widget_test.py` 和 `vision_test.py` 还要 `opencv-python-headless`，没有 PyQt5 也行（测试里有个只够本文件用的替身）。
 - **纠偏的三个上限写在两个地方，必须一致**：`proto.h` 的 `PROTO_TRIM_MAX_MM`、`motion.c` 的 `MOTION_TRIM_MAX_MM`、`lane_control.py` 的 `GAINS["MAX_TRIM_MM"]`。`protocol_test.py::test_trim_cap_is_the_same_everywhere` 盯着。不一致的症状各不相同而且都不报错：上位机给大了是「帧被回 ERR_RANGE，车完全不纠」，给中了大是「被 `Motion_Trim` 静默夹掉，ACK 还是 OK」。
 - 上位机串口默认 `/dev/serial0`（`main.py` / `serial_manager.py` / `serial_test.py`）。`serial0` 是 udev 符号链接，永远指向当前接在排针上的那个串口，所以底下换 UART 不用改代码。临时换口（比如 USB 转串口）用环境变量：`MARKING_PORT=/dev/ttyUSB0 ./start.sh`。
 - 树莓派 4B 的排针串口是哪个 UART 取决于配置，别写死成 `ttyAMA0`：

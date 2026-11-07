@@ -41,6 +41,13 @@ float    Motion_PulseToDeg(uint32_t pulse);
 void Motion_Forward(float mm);        /* 带软起软停，用于普通移动 */
 void Motion_Backward(float mm);       /* 带软起软停，用于普通后退 */
 void Motion_ForwardFlat(float mm);    /* 匀速无斜坡，用于喷漆段（漆量随速度变） */
+/* 同上，但左右两侧各走各的距离。续画用。
+ *
+ * 急停那一刻两侧本来就不等长：差速纠偏改的是左右各自的目标脉冲，
+ * 右侧可能已经比左侧少了几十毫米。续画拿一个数喂给四路，等于把那笔
+ * 还没走完的差速丢掉，车就从"正在纠偏的位置"变成"回正"再接着走。
+ */
+void Motion_ForwardFlatLR(float left_mm, float right_mm);
 void Motion_TurnRight(float deg);     /* 原地右转，四轮同向（左反右正） */
 
 /* ---------- 视觉纠偏 ---------- */
