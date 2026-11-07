@@ -101,8 +101,7 @@ UV4.exe -b Project.uvprojx -t "4WD_Car" -j0 -o build_4wd.log
 | `CHASSIS_HAS_MECANUM` | 1 | 0 | 横移代码编不编进去 |
 | `CHASSIS_TURN_ARR` | 0（不限速） | 900（≈220mm/s） | 橡胶轮转弯是「拧」，必须慢 |
 | `CHASSIS_TURN_SCALE` | 1.000 | 1.050 | 拖胎转不够，多给 5% 脉冲 |
-| `CHASSIS_TRIM_MAX_MM` | 20 | 20 | 单次纠偏上限，两车相同 |
-| `CHASSIS_TRIM_ACCUM_MAX_MM` | 200 | 80 | 差速每纠一次都要靠轮胎横向变形消化 |
+| `CHASSIS_TRIM_ACCUM_MAX_MM` | 200 | 80 | 段内累计纠偏上限；差速每纠一次都要靠轮胎横向变形消化 |
 | `CHASSIS_K_*` | 四轮各自 K1~K4 | 左组 K1、右组 K2 | 组内差只能靠打滑消化，宁可整组差 2% |
 
 两个两车共用的同步参数也在 `chassis.h` 的公共段里（不属于哪个车型分支）：
@@ -207,7 +206,8 @@ Intelligent-Road-Marking-Robot/
 │   ├── vision_test.py       # 破损判据（5 项）
 │   ├── camera_widget_test.py# 三态 / 投票 / 纠偏 / 泵滞回 / 两模式同判据（22 项）
 │   ├── camera_test.py       # 黄色标线检测（独立脚本，调试用可视化）
-│   ├── serial_test.py       # 串口收发测试
+│   ├── serial_test.py       # 串口收发（独立脚本，要真串口）
+│   ├── serial_manager_test.py # 拔线后接收线程会退出、不留死句柄
 │   ├── install.sh           # 树莓派部署脚本
 │   └── start.sh             # 桌面启动脚本
 └── marking-firmware/        # 下位机（STM32 Keil 工程）
@@ -570,9 +570,10 @@ MPU6050 给角速度，10ms 采一次、按实测 dt 积分成角度。积分精
 
 | 情况 | 判据（`battery.h`） | OLED 第 2 行 | 面板 |
 |---|---|---|---|
-| 正常 | 换算出来在 3~33V；最近 8 次采样的极差 ≤ 2V | `BAT 12.5V` | `电池 12.5V`，低压变红 |
-| 分压没接 / 线掉了 | 低于 `BATT_MIN_MV` 或高于 `BATT_MAX_MV`，或者极差大于 `BATT_UNSTABLE_MV` | `BAT no sense` | `电池 未接` |
+| 正常 | 换算出来在 3~33V | `BAT 12.5V` | `电池 12.5V`，低压变红 |
+| 分压没接 / 线掉了 | 低于 `BATT_MIN_MV` 或高于 `BATT_MAX_MV` | `BAT no sense` | `电池 未接` |
 | 这一轮 ADC 超时 | 8 次里有一次没等到 EOC | `BAT --.-V` | `电池 ---` |
+| 采样在跳 | 最近 8 次极差超过 `BATT_UNSTABLE_MV` | 沿用上一次可信读数 | 同左 |
 
 后两种分开报是因为处理完全不同：超时等一轮就好，没接得有人去焊电阻。它们都
 不显示 0.0V —— 那会把人支去充电，而电池其实是满的，坏的是那根线。
@@ -580,11 +581,15 @@ MPU6050 给角速度，10ms 采一次、按实测 dt 积分成角度。积分精
 根本没信号。上一轮已经判成没接的话，这一轮超时仍显示「未接」：缺的是电阻，
 不是这一轮的读数。
 
-**极差那条是为悬空脚准备的。** PC0 不接任何东西时 ADC 读回来的不是 0，是一串
-到处乱跳的数。按「读到的就是电压」显示，界面上会出现一个看着挺像样的电压 ——
-像一块快没电的电池，人端着万用表去量，电池是满的。2V 的阈值是给电机启停留的
-余量：那一下真电池也会掉一截压，但落在合理范围内，不该被判成没接。上电头四秒
-样本不够 8 个，只按前两条判。
+**极差那条只拒绝这一次读数，不改状态。** PC0 不接任何东西时 ADC 读回来的不是
+0，是一串到处乱跳的数；按「读到的就是电压」显示，界面上会出现一个看着挺像样
+的电压 —— 像一块快没电的电池，人端着万用表去量，电池是满的。
+
+但不能像前两条那样直接判成「没接」：电机启停那一下真电池也会掉一两伏，一并判
+没接就会清掉 `batt_valid`，而 `Battery_IsLow()` 一旦看到 `valid == 0` 就恒返回 0
+—— 低压告警正好在最该响的那一刻消失。所以极差超限时只是不更新这一次读数、
+保留上一次可信值，并把历史窗口清空重攒。悬空脚本身会被上面那条超量程抓住
+（读数会大段落在 3~33V 之外）。上电头四秒样本不够 8 个，只按前两条判。
 
 改电阻只改 `battery.h` 里 `BATT_DIV_TOP_OHM` / `BATT_DIV_BOT_OHM` 两个宏，
 别的都不用动。`protocol_test.py` 会算一遍满量程和源阻抗，电阻换得离谱当场报。
@@ -658,8 +663,26 @@ python3 main.py
   3. 落地但空跑，不接泵，跑一遍 `P`，量实际画出来的尺寸对不对。
   4. 最后才接漆，头几次跑把手放在电源开关上。
 - 上下位机的指令集对齐由测试守着：`python3 protocol_test.py` 直接从固件 `system.c` 抠 `case '...'`、从 `proto.h` 抠 `#define`，和面板按钮表、`frame.py` 逐项对账，加了指令忘了同步会当场报。面板上**不许挂固件还没实现的按钮** —— 以前 `N`（画车位（路沿））就挂在这儿，按下去是空操作，靠一个白名单放行；现在功能整个撤掉了，白名单也没了，谁再挂一个空按钮这条测试就拦。
-- 测试一共 188 项，都不需要硬件：`python3 protocol_test.py`（63）、`lane_control_test.py`（17）、`camera_widget_test.py`（22）、`ack_test.py`（13）、`motion_sync_test.py`（13）、`motor_test.py`（13）、`chassis_test.py`（10）、`main_window_test.py`（32）、`vision_test.py`（5）。其中 `motor_test` / `motion_sync_test` / `chassis_test` 是读固件源码的静态检查（不需要编译器）；其余只需要 numpy，`camera_widget_test.py` 和 `vision_test.py` 还要 `opencv-python-headless`，没有 PyQt5 也行（测试里有个只够本文件用的替身）。
-- **纠偏的三个上限写在两个地方，必须一致**：`proto.h` 的 `PROTO_TRIM_MAX_MM`、`motion.c` 的 `MOTION_TRIM_MAX_MM`、`lane_control.py` 的 `GAINS["MAX_TRIM_MM"]`。`protocol_test.py::test_trim_cap_is_the_same_everywhere` 盯着。不一致的症状各不相同而且都不报错：上位机给大了是「帧被回 ERR_RANGE，车完全不纠」，给中了大是「被 `Motion_Trim` 静默夹掉，ACK 还是 OK」。
+- 测试都不需要硬件：`protocol_test.py`、`lane_control_test.py`、`camera_widget_test.py`、`ack_test.py`、`motion_sync_test.py`、`motor_test.py`、`chassis_test.py`、`main_window_test.py`、`vision_test.py`、`serial_manager_test.py`。其中 `motor_test` / `motion_sync_test` / `chassis_test` 是读固件源码的静态检查（不需要编译器）；`serial_manager_test.py` 用一个「拔掉的端口」验证接收线程会退出，不打开任何串口；其余只需要 numpy，`camera_widget_test.py` 和 `vision_test.py` 还要 `opencv-python-headless`，没有 PyQt5 也行（测试里有个只够本文件用的替身）。
+- **纠偏上限分三层，`MAX_TRIM` 和 `ACCUM_MAX` 不是一回事**：`proto.h` 的 `PROTO_TRIM_MAX_MM` 管「一帧能发多大」，`lane_control.py` 的 `GAINS["MAX_TRIM_MM"]` 是控制律输出，`chassis.h` 的 `CHASSIS_TRIM_ACCUM_MAX_MM` 管「这一段累计能纠多少」。`Motion_Trim` 的入参是**累计量**，所以只按后者钳位；以前还多一层 20mm 的单次限幅，那是增量语义的遗留，改成累计量之后把整段能纠的量锁在两度多，`return 2` 也成了死代码。`protocol_test.py` 盯着这三个数的层次关系（协议层 ≤ 一帧的量 ≤ 累计上限），不一致的表现分别是「帧被回 ERR_RANGE，车完全不纠」和「被静默夹掉，ACK 还是 OK」。
+
+- **原地转的方向必须从 `M*_FWD` / `M*_REV` 派生**，不能写死 `DIR_CW`。四个轮子镜像接线，`M1_FWD` 是 `DIR_CCW`、`M2_FWD` 是 `DIR_CW`，写死一个电平等于假设四个驱动器极性一致 —— 那样另外两个轮子反着转，车不是转弯而是两两对拧。
+
+- **点动和自检要作废断点**。`U`/`R`/`Y`/`Z`/`A`/`X` 和 `D` 都会让车离开断点记下的位置（点动几百毫米，自检 400mm）。不作废的话，急停 → 点动挪车 → 按续画，车会从偏了的位置把整条边重走一遍，泵还开着，地上的表现很像转角系数标错。
+
+- **`W` 要自己关泵**，不能只靠状态退出块。`CMD_PUMP` 可以在 `WAIT` 下把泵打开而不改状态，之后按 `W` 时 `last_state` 已经是 `WAIT`，退出块不跑。
+
+- **上电不要给四路下发脉冲**。`StepMotor_SetPulse(motor, 1)` 是真的会发一个脉冲，不是「把通道置成确定状态」；四路各来一次就是每轮上电四个轮子各走一步。要清状态用 `StepMotor_StopAll()`。
+
+- **补喷的超时按「脉冲还在不在动」判，不按固定时长**。慢档 133mm/s 走 3000mm 要 22 秒，固定 10 秒总时限会在 1.3 米处把一次正常的补喷掐断，回 `WAIT` 且不给错误码。
+
+- **ACK 重发要看「第一次发出去的时刻」**。固件按 `(seq, cmd)` 做 1 秒去重：窗口内重发只回 ACK 不执行，超出窗口再发就是一条全新命令，`MOVE` 会多走一段。主线程卡一下（刷日志、弹窗、GC）就可能把这一条推过窗口。
+
+- **残帧清空之后，同一批到达的字节要一起丢掉**。串口把一次发送切成两段、中间卡过 250ms 时，后一段就是半帧的尾巴；逐字节执行等于把 payload 重放一遍，里面一个 `T` 就是急停。孤立的帧头（长度 1）不算，它后面不可能有尾巴。
+
+- **覆盖率不能按整数截断分箱**。`(t - t0).astype(int)` 等于把沿线投影按 1px 一格切，45 度时沿线相邻像素间距 1.41，截断后正好每隔一格空一次 —— 一根完好的 45 度线只有 0.71 的覆盖率，30% 磨损会被判成 50%。分箱宽度取 2px（`np.histogram`），任何角度下每格都落得到点。
+
+- **串口接收线程读到异常要退出，不能空转**。拔线之后 `read()` 每次都会立刻抛，原来的异常分支既不退避也不清 `ser`，一秒上万次 emit + print，CPU 打满、日志刷屏，而且永远不会重连。
 - 上位机串口默认 `/dev/serial0`（`main.py` / `serial_manager.py` / `serial_test.py`）。`serial0` 是 udev 符号链接，永远指向当前接在排针上的那个串口，所以底下换 UART 不用改代码。临时换口（比如 USB 转串口）用环境变量：`MARKING_PORT=/dev/ttyUSB0 ./start.sh`。
 - 树莓派 4B 的排针串口是哪个 UART 取决于配置，别写死成 `ttyAMA0`：
 

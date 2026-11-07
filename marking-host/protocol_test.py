@@ -539,57 +539,68 @@ def test_paint_default_size_matches_firmware():
     assert firmware_width == frame.PAINT_WID_DEFAULT_MM, firmware_width
 
 
-def test_trim_cap_is_the_same_everywhere():
-    """纠偏上限写在了四个地方，必须一样。
+def test_trim_limits_line_up_with_the_axis_they_belong_to():
+    """纠偏上限有三层，各管一件事，不是一个数。
 
-        proto.h        PROTO_TRIM_MAX_MM      固件收帧时判越界用
-        motion.c       MOTION_TRIM_MAX_MM     Motion_Trim 自己再夹一次
-        heading.h      HDG_TRIM_ONCE_MAX_MM   陀螺仪闭环的单次输出
-        lane_control   GAINS["MAX_TRIM_MM"]   视觉控制律输出
+        proto.h        PROTO_TRIM_MAX_MM         上位机一帧能发多大差速
+        lane_control   GAINS["MAX_TRIM_MM"]      视觉控制律的输出上限
+        chassis.h      CHASSIS_TRIM_ACCUM_MAX_MM 这一段累计能纠多少（按车型）
 
-    四处不一致的症状各不相同，而且都不会报错：
-        上位机给得比固件大 -> 帧被回 ERR_RANGE，车的表现是"完全不纠"
-        上位机给得比 motion 大 -> Motion_Trim 静默夹掉，ACK 还是 OK
-        陀螺仪给得比 motion 大 -> 同样被静默夹掉，但闭环还以为自己修了
-                                 那么多，下次接着按这个量算，越纠越偏
-    前两条像"协议不兼容"或"纠偏没效果"，第三条最隐蔽 —— 查起来都很远。
+    以前四处（加上 motion.c 和 heading.h）都写 20，看起来整齐，但那是
+    “每次纠一点”时代的每步限幅。入参改成累计量以后，20mm 差速在 500mm
+    轮距上只折合两度多 —— 5 度的偏差永远纠不回来，而且永远撞不到累计
+    上限，Motion_Trim 的 return 2 成了死代码，_exhausted 再也不会置位。
+
+    现在的关系只有两条，都是“不能比中间那个小”：
+        协议层   <= 一帧能发的量   小了 -> 帧回 ERR_RANGE，车完全不纠
+        累计上限 >= 一帧能发的量   小了 -> Motion_Trim 静默夹掉，ACK 还是 OK
     """
     from core import lane_control
 
     proto_h = FIRMWARE_PROTO_H.read_bytes().decode("gbk", errors="replace")
     motion_c = (FIRMWARE_HW / "motion.c").read_bytes().decode("gbk", errors="replace")
+    motion_h = (FIRMWARE_HW / "motion.h").read_bytes().decode("gbk", errors="replace")
     heading_h = (FIRMWARE_HW / "heading.h").read_bytes().decode("gbk", errors="replace")
     chassis_h = (FIRMWARE_HW / "chassis.h").read_bytes().decode("gbk", errors="replace")
 
     firmware_proto = int(
         re.search(r"#define\s+PROTO_TRIM_MAX_MM\s+(\d+)", proto_h).group(1)
     )
-    firmware_heading = float(
-        re.search(r"#define\s+HDG_TRIM_ONCE_MAX_MM\s+([\d.]+)f", heading_h).group(1)
-    )
 
-    # chassis.h 里每个车型分支各写了一遍，都要查。
-    # 只查第一个的话，改车型参数时漏掉另一支（比如差速车给 30mm）不会被发现，
-    # 而那一支恰恰是这台车要跑的那一支。
-    chassis_limits = [
-        float(v) for v in
-        re.findall(r"#define\s+CHASSIS_TRIM_MAX_MM\s+([\d.]+)f", chassis_h)
-    ]
-    assert len(chassis_limits) >= 2, (
-        f"chassis.h 里应该有每个车型一份 CHASSIS_TRIM_MAX_MM，实际 {chassis_limits}"
-    )
-
-    # motion.c 必须引用 chassis.h，不能又写死一个数字。
-    # 写死的话，chassis.h 改了它不跟着变，而编译不报错、运行也不报错。
-    assert re.search(
-        r"#define\s+MOTION_TRIM_MAX_MM\s+CHASSIS_TRIM_MAX_MM", motion_c
-    ), "motion.c 的 MOTION_TRIM_MAX_MM 必须引用 CHASSIS_TRIM_MAX_MM"
-
-    assert firmware_proto == frame.TRIM_MAX_MM == firmware_heading
-    assert all(v == frame.TRIM_MAX_MM for v in chassis_limits), (
-        f"chassis.h 各车型上限 {chassis_limits} 与上位机 {frame.TRIM_MAX_MM} 不一致"
+    assert firmware_proto == frame.TRIM_MAX_MM, (
+        f"proto.h 的 {firmware_proto} 与上位机的 {frame.TRIM_MAX_MM} 不一致"
     )
     assert lane_control.GAINS["MAX_TRIM_MM"] <= frame.TRIM_MAX_MM
+
+    # 累计上限按车型分，每个分支都要查。只查第一个的话，改车型参数时漏掉
+    # 另一支不会被发现，而那一支恰恰是这台车要跑的那一支。
+    chassis_accum = [
+        float(v) for v in
+        re.findall(r"#define\s+CHASSIS_TRIM_ACCUM_MAX_MM\s+([\d.]+)f", chassis_h)
+    ]
+
+    assert len(chassis_accum) >= 2, (
+        f"chassis.h 里应该有每个车型一份 CHASSIS_TRIM_ACCUM_MAX_MM，实际 {chassis_accum}"
+    )
+    assert all(v >= frame.TRIM_MAX_MM for v in chassis_accum), (
+        f"累计上限 {chassis_accum} 比一帧能发的 {frame.TRIM_MAX_MM} 还小，"
+        "Motion_Trim 会静默夹掉，ACK 还是 OK"
+    )
+
+    assert re.search(
+        r"#define\s+MOTION_TRIM_ACCUM_MAX_MM\s+CHASSIS_TRIM_ACCUM_MAX_MM", motion_h
+    ), "motion.h 的 MOTION_TRIM_ACCUM_MAX_MM 没有引用 chassis.h"
+
+    assert "MOTION_TRIM_ACCUM_MAX_MM" in motion_c, "Motion_Trim 没按累计上限钳位"
+    assert not re.search(r"#define\s+MOTION_TRIM_MAX_MM", motion_c), (
+        "motion.c 里还留着一个 20mm 的 MOTION_TRIM_MAX_MM —— 那是增量语义的"
+        "每步限幅，改成累计量之后会把这一段能纠的总量锁在两度多"
+    )
+
+    # 陀螺仪的单次输出也要能给出几何上真正需要的量（偏 5 度要 43mm）。
+    assert re.search(
+        r"#define\s+HDG_TRIM_ONCE_MAX_MM\s+CHASSIS_TRIM_ACCUM_MAX_MM", heading_h
+    ), "heading.h 的 HDG_TRIM_ONCE_MAX_MM 还在写死一个数"
 
 
 def test_move_frame_carries_both_wheels():
@@ -1509,8 +1520,20 @@ def test_battery_can_tell_a_missing_divider_from_a_flat_battery():
     assert "mv < BATT_MIN_MV" in body and "mv > BATT_MAX_MV" in body, \
         "只按“读不到”判：读到一个离谱的值照样会显示成人话"
     assert "BATT_UNSTABLE_MV" in body, "没有按极差判悬空脚"
-    assert body.count("batt_absent = 1") >= 3, \
-        "三个判据里有的只清了 valid、没标 absent"
+
+    # 前两条（读数落进电池不可能出现的区间）才是真的没接。
+    assert body.count("batt_absent = 1") >= 2, \
+        "“读不到”和“超量程”这两条应该标成没接"
+
+    # 极差那条不能跟着标 absent、更不能清 valid：电机启停那一下真电池也会
+    # 掉一两伏，一并判成“没接”就等于把低压保护关掉，而那正是最需要它的
+    # 时刻（batt_valid=0 → IsLow() 恒 0 → 0x80 告警消失）。它只拒绝这一次读数。
+    tail = body[body.find("BATT_UNSTABLE_MV"):]
+    branch = tail[:tail.find("return;")]
+    assert "batt_absent = 1" not in branch, \
+        "极差判据把“带载波动”当成了“没接”，0x80 低压告警会跟着消失"
+    assert "batt_valid = 0" not in branch, \
+        "极差判据清了 valid，低压保护也一起关了"
 
     assert "Battery_IsAbsent" in c, "没有对外报“没接”的接口"
 
@@ -1648,6 +1671,158 @@ def test_every_downstream_frame_carries_a_seq():
 
     assert "self._next_seq()" in src
     assert "build_paint(length, width, heading=heading," in src
+
+
+def test_jogging_voids_the_stale_breakpoint():
+    """点动、自检之后断点必须作废。
+
+    这些命令会让车离开断点记下的那个位置（点动几百毫米，'D' 自检 400mm）。
+    不作废的话，急停 -> 点动挪车 -> 按续画，车会从偏了的位置把整条边重走
+    一遍，泵还开着。地上的表现是"歪了一条边"，很像转角系数标错。
+    """
+    src = FIRMWARE_C.read_bytes().decode("gbk", errors="replace")
+
+    guard = src.find("&& paint_resume_valid) {")
+    assert guard != -1, "点动 / 自检没有任何作废断点的动作"
+
+    switch = src.find("switch(cmd) {")
+    assert 0 < guard < switch, "作废断点那段应该在 switch 之前，否则点动还会先动起来"
+
+    cond = src[max(0, guard - 320):guard]
+    for key in ("'U'", "'R'", "'Y'", "'Z'", "'A'", "'X'", "'D'"):
+        assert key in cond, f"{key} 不在作废断点的条件里"
+
+    seg = src[guard:guard + 200]
+    assert "PaintResumeForget()" in seg
+    assert "PaintResumeShowOnOled()" in seg, "清了断点但 OLED 第 4 行还挂着 Resume"
+
+
+def test_w_turns_the_pump_off():
+    """'W' 必须自己关泵。
+
+    CMD_PUMP 能在 WAIT 下把泵打开而不改状态。之后按 'W'，last_state 已经是
+    WAIT，状态退出块不跑，泵就一直转着 —— 人以为按了停止，地上还在出漆。
+    """
+    src = FIRMWARE_C.read_bytes().decode("gbk", errors="replace")
+
+    i = src.find("case 'W':")
+    assert i != -1
+    seg = src[i:i + 700]
+    assert "Pump_Off();" in seg, "'W' 没关泵"
+
+
+def test_respray_gives_up_when_the_pulses_stop_not_when_the_clock_runs_out():
+    """补喷的超时按"脉冲还在不在动"判，不按固定总时长。
+
+    慢档 133mm/s 走 3000mm 要 22 秒，固定 10 秒总时限会在 1.3 米处把一次
+    正常的补喷掐断，回 WAIT 且不给错误码。按脉冲判与速度无关。
+    """
+    src = FIRMWARE_C.read_bytes().decode("gbk", errors="replace")
+
+    assert "RESPRAY_TIMEOUT_MS" not in src, "还留着固定的总时长"
+    assert "RESPRAY_STALL_MS" in src
+
+    i = src.find("respray_last_remain = remain")
+    assert i != -1, "没按剩余脉冲判卡死"
+
+    seg = src[max(0, i - 900):i + 300]
+    assert "StepMotor_GetRemainOf(MOTOR1)" in seg, "没按剩余脉冲判卡死"
+    assert "RESPRAY_STALL_MS" in seg, "没有卡死判据的时间窗口"
+
+
+def test_turning_derives_direction_from_the_forward_table():
+    """原地转的方向不能写死 DIR 电平。
+
+    四个轮子装在车两侧、镜像接线，"物理向前"对应的电平本来就左右相反
+    （M1_FWD 是 CCW、M2_FWD 是 CW）。写死一个电平等于假设四个驱动器极性
+    一致 —— 那样左后、右后两个轮子会反着转，车不是转弯，是两两对拧。
+    """
+    src = (FIRMWARE_HW / "motion.c").read_bytes().decode("gbk", errors="replace")
+    body = _firmware_body(src, r"void Motion_TurnRight\(float deg\)")
+
+    assert "DIR_CW" not in body and "DIR_CCW" not in body, \
+        "转弯还在写死 DIR 电平"
+
+    for name in ("M1_REV", "M2_FWD", "M3_REV", "M4_FWD"):
+        assert name in body, f"转弯没用 {name} 派生方向 —— 左反右正就对不上"
+
+
+def test_mecanum_turn_restores_the_speed():
+    """麦轮转弯也要把左右 ARR 恢复成同一档。
+
+    上一段可能是 DriveLR 设成左右不同 ARR 的（差速纠偏改完目标会按剩余
+    脉冲重算）。不恢复的话，转弯这四个轮子同脉冲不同频：先到的一侧停住，
+    另一侧继续拧。
+    """
+    src = (FIRMWARE_HW / "motion.c").read_bytes().decode("gbk", errors="replace")
+    body = _firmware_body(src, r"void Motion_TurnRight\(float deg\)")
+
+    i = body.find("CHASSIS_TURN_ARR")
+    assert i != -1
+    seg = body[i:i + 900]
+    assert "StepMotor_RestoreSpeed()" in seg, "麦轮转弯没恢复同速"
+
+
+def test_power_up_does_not_step_the_wheels():
+    """上电不能给四路下发脉冲。
+
+    SetPulse 是真的会发脉冲，不是"把通道置成确定状态"。原来那句
+    SetPulse(MOTORx, 1) 等于每轮上电四个轮子各走一步。
+    """
+    src = FIRMWARE_C.read_bytes().decode("gbk", errors="replace")
+
+    i = src.find("void Hardware_Init")
+    assert i != -1
+    i = src.find("{", i)
+    seg = src[i:i + 2200]
+
+    assert "StepMotor_SetPulse" not in seg, "上电还在下发脉冲，每轮上电各走一步"
+    assert "StepMotor_StopAll()" in seg, "四路的目标没有清成确定状态"
+
+
+def test_gyro_bias_uses_the_same_sign_as_the_runtime():
+    """标定算出的零偏必须和运行时用同一个符号。
+
+    标定时累加的是传感器原始读数，运行时先乘 HDG_Z_SIGN 再减零偏。两边不
+    统一的话静止时 rate = -2*bias：零偏 1dps 就是每秒 2 度漂移，5.3 米一段
+    走 24 秒差 48 度；而且静止判据恒等于 2|bias|，超过 0.6dps 就再也进不了
+    "静止"分支，零偏连自愈的路都没有。
+    """
+    src = (FIRMWARE_HW / "heading.c").read_bytes().decode("gbk", errors="replace")
+
+    i = src.find("hdg_bias_dps = ((float)cal_sum")
+    assert i != -1, "找不到零偏的计算"
+
+    seg = src[i:i + 240]
+    assert "HDG_Z_SIGN" in seg, "标定没乘 HDG_Z_SIGN"
+
+
+def test_truncated_frame_tail_is_not_executed():
+    """残帧超时清掉之后，紧接着到的字节不能当命令执行。
+
+    串口把一次发送切成两段、中间卡 250ms 以上时，后一段就是半帧的尾巴。
+    逐字节执行等于把 payload 重放一遍 —— 里面随便一个 'T' 就是急停，
+    一个 'C' 就是开泵补喷。
+    """
+    from core import frame
+
+    buf = bytearray()
+
+    # 帧头 + 两个 payload 字节，然后断流
+    recs, last_rx, dropped, resync = frame.parse_stream(
+        buf, bytes([frame.SOF, 0x01, 0x02]), last_rx=0.0, now=0.0)
+    assert recs == []
+
+    # 尾巴到了：这一批必须整批丢掉
+    recs, last_rx, dropped, resync = frame.parse_stream(
+        buf, b"T", last_rx=last_rx, now=0.4)
+    assert recs == [], f"残帧的尾巴被当成命令执行了: {recs}"
+    assert buf == bytearray()
+
+    # 之后来一条正常命令，必须照样收得到
+    recs, last_rx, dropped, resync = frame.parse_stream(
+        buf, b"W", last_rx=last_rx, now=0.45)
+    assert [r["char"] for r in recs] == ["W"], "丢尾巴把后面的正常命令也堵住了"
 
 
 if __name__ == "__main__":

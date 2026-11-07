@@ -47,16 +47,27 @@ ACK_TIMEOUT_S = 0.30
 # 最多重发几次。见文件头。
 MAX_RETRIES = 1
 
+# 固件对 (seq, cmd) 的去重窗口。同一个 SEQ 同一个 CMD 在这个窗口内再来一次，
+# 它只回 ACK 不执行 —— 这正是"重发是安全的"的依据。
+#
+# 但它只管这么久。超出窗口再重发，固件会当成一条新命令真的执行一遍：
+# MOVE 会多走一段，PAINT 会多画一圈。所以重发的判据必须看**第一次发出去**
+# 的时刻，不是上一次重发的时刻。主线程卡一下（刷日志、弹窗、GC）就可能
+# 把 sent_at 推到这个窗口之外。
+DEDUP_WINDOW_S = 1.0
+
 
 class Pending:
     """一条发出去还没被确认的帧。"""
 
-    __slots__ = ("seq", "cmd", "payload", "sent_at", "retries", "rtt", "result")
+    __slots__ = ("seq", "cmd", "payload", "born_at", "sent_at",
+                 "retries", "rtt", "result")
 
     def __init__(self, seq, cmd, payload, sent_at):
         self.seq = seq
         self.cmd = cmd
         self.payload = payload
+        self.born_at = sent_at     # 第一次发出去的时刻，重发窗口按它算
         self.sent_at = sent_at
         self.retries = 0
         self.rtt = None
@@ -164,6 +175,15 @@ class AckTracker:
                 continue
 
             if resend is not None and item.retries < self.max_retries:
+                # 超出固件去重窗口就不能再重发了：那已经不是"再试一次同一条
+                # 命令"，而是一条全新的命令。中途卡顿（刷日志、弹窗、GC）
+                # 很容易把这一次推到窗口之外。判据用 born_at 而不是 sent_at。
+                if now - item.born_at > DEDUP_WINDOW_S:
+                    del self.pending[seq]
+                    self.timed_out += 1
+                    dead.append(item)
+                    continue
+
                 # 先看写没写出去再记账。写失败（串口断了、写异常）时把
                 # retries 加一、把计时推到 now，等于告诉调用方"这条重发过"——
                 # 真正断线要再等一个超时才暴露，retried 也是虚的。

@@ -7,6 +7,8 @@
     python3 vision_test.py     # 或 pytest vision_test.py
 """
 
+import math
+
 import cv2
 import numpy as np
 
@@ -98,6 +100,28 @@ def test_double_line_not_falsely_worn():
     need, level, reason = evaluate_line_quality(m)
     assert not need, f"健康的双黄线被误报: {reason}"
     assert cov_of(reason) > 0.9, f"中间空隙被算进没漆了: {reason}"
+
+
+def test_coverage_does_not_depend_on_line_angle():
+    """同一根完好的线，斜着拍和正着拍得出的覆盖率应该一样。
+
+    原来按 (t - t0).astype(int) 分箱：整数截断等于把沿线投影按 1px 一格切。
+    45 度时沿线相邻像素的投影间距是 1.41，截断之后正好每隔一格空一次 ——
+    一根完好的 45 度线只有 0.71 的覆盖率，30% 磨损会被判成 50%。
+    """
+    for deg in (0, 30, 45, 60):
+        a = math.radians(deg)
+        cx, cy, half = 320, 240, 200
+
+        m = np.zeros((480, 640), np.uint8)
+        cv2.line(m,
+                 (int(cx - math.cos(a) * half), int(cy - math.sin(a) * half)),
+                 (int(cx + math.cos(a) * half), int(cy + math.sin(a) * half)),
+                 255, 5)
+
+        need, level, reason = evaluate_line_quality(m)
+        assert not need, f"{deg} 度的完好线被判成要补: {reason}"
+        assert cov_of(reason) > 0.85, f"{deg} 度的完好线覆盖率只有 {reason}"
 
 
 if __name__ == "__main__":

@@ -71,8 +71,17 @@ class SerialManager(QObject):
 
             except Exception as e:
 
+                # 拔线之后 read() 每次都会立刻抛，而这里原来既不退避，
+                # 也不把 self.ser 置空 —— 于是每秒上万次 emit + print，
+                # CPU 打满、日志刷屏，而且永远不会重连。线程直接退出，
+                # 状态交回上层：一个已经停掉的接收线程 + 一条 error 信号，
+                # 比一个还在空转的线程更容易被发现，也不会掩盖真正的故障。
                 self.error_signal.emit(str(e))
-                print("[串口] 读取异常:", e)
+                print("[串口] 读取异常，接收线程退出:", e)
+
+                self.running = False
+                self.ser = None
+                break
 
     # ================= 发送 =================
     def send(self, data: bytes) -> bool:

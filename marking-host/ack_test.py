@@ -223,6 +223,31 @@ def test_pending_does_not_leak_on_seq_wrap():
     assert len(t.pending) == 1
 
 
+def test_resend_past_the_dedup_window_is_not_sent():
+    """超出固件去重窗口就不能再重发了 —— 那已经不是同一条命令。
+
+    固件按 (seq, cmd) 做 1 秒去重：窗口内重发只回 ACK 不执行，这正是
+    "重发是安全的"的依据。超出窗口再发，它当成一条全新命令真的执行一遍，
+    MOVE 会多走一段、PAINT 会多画一圈。
+
+    主线程卡一下（刷日志、弹窗、GC）就可能把这一次推到窗口之外，所以判据
+    必须看第一次发出去的时刻。
+    """
+    t = AckTracker(timeout_s=0.3, max_retries=1)
+    t.register(_sent_frame(frame.CMD_MOVE, 4), now=0.0)
+
+    calls = []
+
+    # 主线程卡了 1.5 秒才轮到 expire：窗口早就过了
+    dead, resent = t.expire(now=1.5, resend=_recorder(calls))
+
+    assert calls == [], "超出窗口还在重发，固件会把它当成新命令执行第二遍"
+    assert resent == []
+    assert len(dead) == 1, "这条应该当场判超时"
+    assert t.timed_out == 1
+    assert t.retried == 0
+
+
 if __name__ == "__main__":
     for name in sorted(n for n in globals() if n.startswith("test_")):
         globals()[name]()

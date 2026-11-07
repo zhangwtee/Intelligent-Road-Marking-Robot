@@ -45,6 +45,8 @@ static float paint_wid_mm = PAINT_WID_DEFAULT_MM;
  * respray_level 退化成「显示用的档位」，由毫米反算，不再参与执行。 */
 static uint16_t respray_mm = 1000;
 static uint8_t  respray_level = 4;
+/* 上一拍看到的第一路剩余脉冲，用来判"还在不在往前走"。 */
+static int32_t  respray_last_remain = 0;
 
 /* ---- 看护时限 ----
  * 上电静默：timer_counter 从上电起 1ms 递增，头 3 秒里除急停外什么都不执行。
@@ -57,8 +59,13 @@ static uint8_t  respray_level = 4;
  * —— 这时候泵还开着，漆会在原地积成一滩。 */
 #define PAINT_TIMEOUT_MS    120000
 
-/* 补喷总时限：一段最长 1.0m，正常 1.5s 内结束。10s 是 6 倍余量。 */
-#define RESPRAY_TIMEOUT_MS  10000
+/* 补喷的卡死判据：连续这么久一个脉冲都没往前挪，才判成卡住。
+ *
+ * 以前是固定 10 秒总时限，而慢档 133mm/s 走 3000mm 要 22 秒 —— 补喷会在
+ * 1.3 米处被强行掐断，回 WAIT，不给任何错误码。按"脉冲还在不在动"判就
+ * 与速度无关：卡死 3 秒停泵，走得慢只会一直重新起算。
+ */
+#define RESPRAY_STALL_MS    3000
 
 /* 续画的最小剩余行程。
  *
@@ -613,11 +620,11 @@ void Hardware_Init(void)  //外设初始化
 	GPIO15_Init();
 	TIM1_Init();
 	Battery_Init();      // 电池电压采样（ADC1_IN10 = PC0）
-	StepMotor_Init();   
-StepMotor_SetPulse(MOTOR1, 1);           
-StepMotor_SetPulse(MOTOR2, 1);
-StepMotor_SetPulse(MOTOR3, 1);
-StepMotor_SetPulse(MOTOR4, 1);
+	StepMotor_Init();
+    /* 这里以前给四路各下发 1 个脉冲，本意是"把通道置成一个确定状态"。
+     * 但 SetPulse 是真的会发脉冲 —— 每轮上电四个轮子各走一步。StopAll 同样把
+     * 目标清零、通道关断，而且不会动。 */
+    StepMotor_StopAll();
 
     /* 换算系数在这里算一次（一次浮点除法），之后全是乘法。
      * F103 没有 FPU，运行时的浮点除法要拖进软浮点库，放在状态机里
@@ -1488,10 +1495,25 @@ static void HandleCmd(uint8_t cmd, uint8_t from) {
         sys_ctrl.state_timestamp = timer_counter;
     }
 
+    /* 这些命令会让车离开断点记下的那个位置：点动是几百毫米，'D' 自检是 400mm。
+     * 挪完再按续画，车会从偏了的位置把整条边重走一遍，泵还开着 —— 地上的表现
+     * 是歪了一条边，很像转角系数标错。动一下就作废，和 'P' 的处理一致。
+     *
+     * 只在真有断点时清：点动是按住就重复发的，每来一个字节擦一次 flash、刷一次
+     * OLED 会把主循环拖住。 */
+    if ((cmd=='U'||cmd=='R'||cmd=='Y'||cmd=='Z'||cmd=='A'||cmd=='X'||cmd=='D')
+        && paint_resume_valid) {
+        PaintResumeForget();
+        PaintResumeShowOnOled();
+    }
+
     switch(cmd) {
 			
 		case 'W'://等待指令  串口'W'
 			    StepMotor_StopAll();
+        /* 泵也要在这里关。帧命令 CMD_PUMP 能在 WAIT 下把泵打开而不改状态，
+         * 之后按 'W' 时 last_state 已经是 WAIT，退出块不跑，泵就一直转着。 */
+        Pump_Off();
 					OLED_ShowString(3, 1, "Wait            ");
         /* W = 这条活不干了，断点跟着作废。留着的话，"续画"按钮会在
          * 几天后仍然亮着，按下去接到一个早就不存在的位置。 */
@@ -1873,6 +1895,7 @@ void System_StateMachine(void) {
 		{
 		        Pump_On();
 		        Motion_ForwardFlat((float)respray_mm);   /* 毫米是真值，档位只用于显示 */
+		        respray_last_remain = StepMotor_GetRemainOf(MOTOR1);
 		        OLED_ShowString(3, 1, "Respray         ");
 		        OLED_ShowNum(3, 9, respray_mm, 4);
 		        OLED_ShowString(3, 13, "mm ");
@@ -2164,16 +2187,25 @@ void System_StateMachine(void) {
                 }
                 break;
             case STATE_RESPRAY:
+            {
+                int32_t remain = StepMotor_GetRemainOf(MOTOR1);
+
                 if (!StepMotor_IsAnyRunning()) {
                     Pump_Off();
                     sys_ctrl.state = STATE_WAIT;
-                } else if (current_time - sys_ctrl.state_timestamp > RESPRAY_TIMEOUT_MS) {
-                    /* 电机没停但时间超了：驱动器报警、机械卡死、或者脉冲根本
+                } else if (remain != respray_last_remain) {
+                    /* 还在往前走：重新起算。按固定总时限判会把慢速的长补喷
+                     * 在半路上掐断，而这时候一切正常。 */
+                    respray_last_remain = remain;
+                    sys_ctrl.state_timestamp = current_time;
+                } else if ((uint32_t)(current_time - sys_ctrl.state_timestamp) > RESPRAY_STALL_MS) {
+                    /* 电机没停但脉冲不动了：驱动器报警、机械卡死、或者脉冲根本
                      * 没发出去。泵还在转，漆会在一处积成一滩。
                      * 强制回 WAIT —— 退出块会统一 Pump_Off + StopAll。 */
                     sys_ctrl.state = STATE_WAIT;
                 }
                 break;
+            }
             case STATE_PAINT:
             {
                 /* 同一段停留太久 = 卡住了。按段计不按整圈计，理由见

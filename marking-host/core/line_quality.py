@@ -183,11 +183,22 @@ def classify_line_quality(line_mask):
     # 线弯了也没关系（弯了也每一行都有漆）。
     t0 = float(t.min())
 
-    rows = np.bincount((t - t0).astype(np.int32))
+    # 分箱宽度取 2 像素，而不是 1。
+    #
+    # 原来的写法是 np.bincount((t - t0).astype(np.int32))：整数截断等于把
+    # 沿线投影按 1px 一格切。线是斜的时候（45 度），沿线相邻像素的投影间距
+    # 是 1.41，截断之后正好每隔一格空一次 —— 一根完好的 45 度线只有 0.7 的
+    # 覆盖率，30% 的磨损会被判成 50%。取 2px 之后任何角度下每格都落得到点；
+    # 缺口判据要的是"整段没漆"，宽度远大于 2px，不受影响。
+    bin_px = 2.0
+    n_bins = max(8, int(span / bin_px) + 1)
+    rows, _ = np.histogram(t, bins=n_bins)
 
     full = float(np.percentile(rows[rows > 0], 75))
 
-    if full < th["MIN_ROW_PIXELS"]:
+    # 阈值的意思还是"每像素线宽能有几个像素"，箱宽变成 2 就要换算回去，
+    # 否则"线太细"这条会跟着放松一倍。
+    if full / bin_px < th["MIN_ROW_PIXELS"]:
         return QUALITY_UNSURE, 0, "Too thin"
 
     cover = np.clip(rows / full, 0.0, 1.0)

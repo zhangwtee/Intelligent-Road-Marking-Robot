@@ -75,9 +75,12 @@
  * 1.0 = 不做补偿，把误差统一交给 CALIB_TURN_RADIUS_MM 吸收。 */
 #define CHASSIS_TURN_SCALE      1.000f
 
-/* 单次纠偏上限和段内累计上限。麦轮能横滑，差速不会让轮子互顶，
- * 可以纠得狠一点、久一点。 */
-#define CHASSIS_TRIM_MAX_MM       20.0f
+/* 段内累计纠偏上限。麦轮能横滑，差速不会让轮子互顶，可以纠得狠一点、
+ * 久一点。
+ *
+ * 这里只有"累计"一个上限。以前还有一个 CHASSIS_TRIM_MAX_MM = 20mm，
+ * 是入参按增量用时的每步限幅 —— 改成累计量之后它是"这一整段只能纠
+ * 20mm"，折合两度多，闭环根本追不上。 */
 #define CHASSIS_TRIM_ACCUM_MAX_MM 200.0f
 
 /* 轮径补偿系数：四个轮子各管各的。
@@ -117,7 +120,6 @@
  *
  * 80mm 不是"更快修好"，是"别修太久才去重新对一次线"：到 80mm 就该发
  * 新的一段 MOVE 重新对齐，而不是在这一段里继续硬纠。 */
-#define CHASSIS_TRIM_MAX_MM       20.0f
 #define CHASSIS_TRIM_ACCUM_MAX_MM  80.0f
 
 /* 轮径补偿系数：左右各一个，组内强制相同。

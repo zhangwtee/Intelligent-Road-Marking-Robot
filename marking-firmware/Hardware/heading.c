@@ -138,7 +138,14 @@ static void heading_cal_sample(int16_t raw)
         return;
     }
 
-    hdg_bias_dps = ((float)cal_sum / (float)HDG_CAL_SAMPLES) / MPU_GYRO_LSB_PER_DPS;
+    /* 必须乘 HDG_Z_SIGN：cal_sum 累加的是传感器的原始读数，而运行时
+     * 的 dps 是"原始读数 × HDG_Z_SIGN"（见 heading_update）。两边不统一
+     * 的话，静止时 rate = -bias - bias = -2·bias —— 零偏 1dps 就是每秒
+     * 2 度的漂移，5.3 米一段走 24 秒差 48 度。同时静止判据
+     * fabsf(dps - bias) 恒等于 2|bias|，超过 0.6dps 就再也进不了"静止"
+     * 分支，零偏连自愈的路都没有（MPU6050 未校准 ZRO 常在 1~3dps）。 */
+    hdg_bias_dps = ((float)cal_sum / (float)HDG_CAL_SAMPLES) / MPU_GYRO_LSB_PER_DPS
+                 * HDG_Z_SIGN;
     hdg_abs_deg = 0.0f;
     hdg_ref_deg = 0.0f;
 

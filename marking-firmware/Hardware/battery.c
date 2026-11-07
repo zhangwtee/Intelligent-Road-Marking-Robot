@@ -169,9 +169,16 @@ void Battery_Poll(void)
             if (batt_hist[k] > hi) { hi = batt_hist[k]; }
         }
         if ((uint16_t)(hi - lo) > BATT_UNSTABLE_MV) {
-            batt_mv     = 0;
-            batt_valid  = 0;
-            batt_absent = 1;
+            /* 跳得厉害：这一次的读数不能当电压用，但也仅限这一次。
+             *
+             * 以前这里和"超量程"走同一条路，一并置 batt_absent、清
+             * batt_valid。后果是电机启停那一下的压降（真电池也会掉一两伏）
+             * 会把低压保护整个关掉：batt_valid=0 → IsLow() 恒 0 → 0x80 告警
+             * 消失，而那一刻正是最需要它的。悬空脚和"带载波动"是两件事：
+             * 悬空脚靠上面那条超量程就能认出来（读数会大段落在 3~33V 之外），
+             * 这里只拒绝这一次，不清 valid、也不改 absent —— 保持上一次
+             * 可信的读数，显示和告警都继续按它走。 */
+            batt_hist_n = 0;        /* 重新攒：把这段波动排除出窗口 */
             return;
         }
     }

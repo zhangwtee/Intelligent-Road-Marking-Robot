@@ -9,14 +9,12 @@
  * 这里只留一个别名，方便老代码继续引用 MOTION_HAS_MECANUM。 */
 #define MOTION_HAS_MECANUM   CHASSIS_HAS_MECANUM
 
-/* 单次纠偏的限幅（毫米，指整车中心再多走/少走多少）。
- * 100mm 一段的节拍下，一次纠 20mm 相当于把左右轮差开到 20mm，
- * 折算成航向约 2~4 度 —— 已经是很猛的修正了。再大就是原地画弧。
- * 限幅的意义不在于"温和"，在于防止上位机算飞了（比如线跳到了画面外）
- * 时把一段 5.3 米的直线改成两个大圈。 */
-#ifndef MOTION_TRIM_MAX_MM
-#define MOTION_TRIM_MAX_MM   CHASSIS_TRIM_MAX_MM
-#endif
+/* 纠偏限幅只有一个：MOTION_TRIM_ACCUM_MAX_MM，即"这一段累计能纠多少"，
+ * 定义在 motion.h（按车型分 80 / 200mm）。
+ *
+ * 以前这里还有一个 MOTION_TRIM_MAX_MM = 20mm，是"每次纠一点"那个年代
+ * 的每步限幅。入参改成累计量之后它变成"这一段总共只能纠 20mm"，
+ * 折合两度多，把闭环整个卡死，所以删掉了。 */
 
 /* 纠偏方向的符号。+1 = delta 为正时车头向右。
  * 相机左右装反、或者某一侧电机接线反了，只改这个宏，别去翻协议层。 */
@@ -356,14 +354,17 @@ void Motion_TurnRight(float deg)
         p = 1;
     }
 
-    /* 原地右转：四个 DIR 同电平。
-     * 本机 DIR 为左右镜像接线，四个 DIR_CW 等于"左侧后退 + 右侧前进"。
-     * 注意：这里不能用 M1_FWD..M4_FWD —— 那组宏编码的是前进语义，
-     * 原地转需要的是纯粹的"四个同电平"。 */
-    StepMotor_SetDirection(MOTOR1, DIR_CW);
-    StepMotor_SetDirection(MOTOR2, DIR_CW);
-    StepMotor_SetDirection(MOTOR3, DIR_CW);
-    StepMotor_SetDirection(MOTOR4, DIR_CW);
+    /* 原地右转：左侧后退、右侧前进，四个轮子同脉冲。
+     *
+     * 这里必须从 M*_FWD / M*_REV 派生，不能写死一个 DIR 电平。四个轮子装在
+     * 车两侧、镜像接线，"物理向前"对应的电平本来就左右相反（见
+     * StepMotor_New.h 的方向表：M1_FWD 和 M2_FWD 就不是同一个值）。写死
+     * 一个电平等于假设四个驱动器极性一致 —— 那样左后、右后两个轮子会反着
+     * 转，车不是转弯，是四个轮子两两对拧。 */
+    StepMotor_SetDirection(MOTOR1, M1_REV);   /* 左前：后退 */
+    StepMotor_SetDirection(MOTOR2, M2_FWD);   /* 右前：前进 */
+    StepMotor_SetDirection(MOTOR3, M3_REV);   /* 左后：后退 */
+    StepMotor_SetDirection(MOTOR4, M4_FWD);   /* 右后：前进 */
 
     /* 差速车减速转（CHASSIS_TURN_ARR > 0），麦轮不限速（= 0）。
      *
@@ -372,10 +373,15 @@ void Motion_TurnRight(float deg)
      * 消除拖胎，只能让每次跳动变小、变密，看起来是连续的。
      *
      * 限速是"本段"的：下一次前进时由 Motion_Forward / DriveLR 恢复，
-     * 所以这里不保存也不恢复原档位 —— 转弯之后必定还有一个走直线的段，
-     * 那一段开头的恢复动作就是天然的收尾。 */
+     * 调完这里不用再存原档位 —— 转弯之后必定还有一个走直线的段，那一段
+     * 开头的恢复动作就是天然的收尾。 */
     if (CHASSIS_TURN_ARR > 0) {
         StepMotor_SetSpeedTarget(CHASSIS_TURN_ARR);
+    } else {
+        /* 麦轮不限速。但上一段可能是 DriveLR 设成左右不同 ARR 的（差速纠偏
+         * 改完目标会按剩余脉冲重算左右 ARR），不恢复的话转弯这四个轮子同
+         * 脉冲不同频：先到的一侧停住，另一侧继续拧。 */
+        StepMotor_RestoreSpeed();
     }
 
     /* 转弯同样不做软起软停。
@@ -405,18 +411,21 @@ uint8_t Motion_Trim(float delta_mm)
         return 0;
     }
 
-    /* delta_mm 是"这一段累计该纠到这么多"，不是"再纠这么多"。
+    /* 单次期望值不超过"这一段累计能纠多少"本身。
      *
-     * 两个调用方算出来的都是几何上的绝对量：陀螺仪那边是"转过 err 度需要
-     * 的左右行程差"，视觉那边是带速率限制的比例输出。以前这里按增量处理，
-     * 等于每 100ms 就把整个修正量再加一遍 —— 误差 2 度时一次十几毫米，
-     * 不到一秒就撞上累计上限，这条边剩下的路一个脉冲都不纠，而队列里已经
-     * 压了一大截转向。 */
-    if (delta_mm > MOTION_TRIM_MAX_MM) {
-        delta_mm = MOTION_TRIM_MAX_MM;
+     * 这里以前钳的是 MOTION_TRIM_MAX_MM（20mm）—— 那是按增量用时的每步
+     * 限幅。改成累计量语义之后，钳的是"这一段总共能纠多少"：20mm 差速在
+     * 500mm 轮距上只折合两度多，偏差再大也压不下去，而且永远撞不到上面
+     * 那个 80mm / 200mm 的累计上限，返回 2 成了死代码，上层再也不知道
+     * 这一段该重新对齐了。
+     *
+     * 真正的"别一下改太多"由两件事保证：调用方的速率限制（视觉那条有
+     * MAX_STEP_MM，陀螺仪那条按几何量给），以及这里的累计上限。 */
+    if (delta_mm > MOTION_TRIM_ACCUM_MAX_MM) {
+        delta_mm = MOTION_TRIM_ACCUM_MAX_MM;
     }
-    if (delta_mm < -MOTION_TRIM_MAX_MM) {
-        delta_mm = -MOTION_TRIM_MAX_MM;
+    if (delta_mm < -MOTION_TRIM_ACCUM_MAX_MM) {
+        delta_mm = -MOTION_TRIM_ACCUM_MAX_MM;
     }
 
     /* 差速的一半摊到每一侧。先取绝对值再定符号，免得负数截断和 +0.5f
@@ -444,11 +453,14 @@ uint8_t Motion_Trim(float delta_mm)
     /* 累计上限。见头文件里的 MOTION_TRIM_ACCUM_MAX_MM ——
      * 一段里一直往同一个方向纠，内侧轮会越停越早，累计到一米的时候
      * 车已经在原地转了 90 度，而每一步单独看都只是"小小的修正"。
-     * 撞上限时返回 2，让上层知道"这段该结束了"，而不是继续硬纠。 */
+     * 撞上限时返回 2，让上层知道"这段该结束了"，而不是继续硬纠。
+     *
+     * 用 >= 而不是 >：上面已经把期望值钳到这个上限，落在边界上的那个值
+     * 正是最该报"到顶"的。 */
     {
         int32_t limit = (int32_t)(MOTION_TRIM_ACCUM_MAX_MM * s_pulse_per_mm);
 
-        if (want > limit || want < -limit) {
+        if (want >= limit || want <= -limit) {
             return 2;
         }
     }

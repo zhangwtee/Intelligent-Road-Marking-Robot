@@ -185,8 +185,13 @@
 #define PROTO_RESPRAY_MIN_MM    50
 #define PROTO_RESPRAY_MAX_MM    3000
 #define PROTO_MOVE_MAX_MM       5000
-#define PROTO_TRIM_MAX_MM       20      /* 必须和 motion.c 的 MOTION_TRIM_MAX_MM
-                                         * 一致，protocol_test 会对账这两个数 */
+/* 一帧最多能发多大差速。这个是"单帧值"的上限，不是"这一段总共能纠多少"
+ * —— 后者按车型分（CHASSIS_TRIM_ACCUM_MAX_MM，80 / 200mm），由
+ * Motion_Trim 自己判，超了回 2 让上层重新对齐。
+ *
+ * 必须和上位机 frame.py 的 TRIM_MAX_MM 一致：这边小，帧直接被回
+ * ERR_RANGE，车的表现是"完全不纠"。 */
+#define PROTO_TRIM_MAX_MM       20
 #define PROTO_PAINT_MIN_MM      1000
 #define PROTO_PAINT_MAX_MM      8000
 

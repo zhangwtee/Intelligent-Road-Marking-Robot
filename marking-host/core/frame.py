@@ -520,13 +520,32 @@ def parse_stream(buffer: bytearray, data: bytes = b"",
     # 一个孤立的 0x7B（噪声）如果一直躺在队首，后面每条命令都会被当成
     # "帧的第 2、3…个字节"，永远等不齐 10 字节，整条链路静默失效。
     #
-    # 这里不进静默期：能卡到超时，说明后面已经没有连续的字节正在到达了，
-    # 没有"残余"需要防；此刻进来的新数据是新的一次发送，不该被吞。
+    # 清掉的不只是缓冲：如果残帧里已经有 payload（长度 > 1），这一拍同时
+    # 到达的字节很可能就是它的尾巴，也要一起丢 —— 下面的分支处理这个。
+    partial_timed_out = False
+    partial_had_payload = False
+
     if (prev_rx is not None and buffer and buffer[0] == SOF
             and len(buffer) < FRAME_LEN
             and (now - prev_rx) > PARTIAL_TIMEOUT_S):
+        # 只有"帧头 + 至少一个字节"才算收到了 payload。孤立的 0x7B（长度 1）
+        # 后面不可能有它的尾巴，清掉就该正常往下走 —— 那是噪声，不是半帧。
+        partial_had_payload = len(buffer) > 1
         dropped += len(buffer)
         buffer.clear()
+        partial_timed_out = True
+
+    if data and partial_timed_out and partial_had_payload:
+        # 刚清掉的是一个有 payload 的残帧，而这批字节很可能是它的尾巴
+        # （串口把一次发送切成两段，中间卡了 200ms 以上）。逐字节执行等于
+        # 把半个帧的 payload 当命令重放一遍 —— 里面随便一个 'T' 就是急停、
+        # 一个 'C' 就是开泵补喷。
+        #
+        # 整批丢掉。代价是"如果它其实是一条新的单字节命令，这条会丢一次"，
+        # 但丢一条命令远好过执行半帧里恰好凑成合法字符的那几个字节。
+        dropped += len(data)
+        last_rx = now
+        data = b""
 
     if data:
         # 上一段数据之后空闲了很久，说明新数据是新的一次发送，不是坏帧的尾巴
