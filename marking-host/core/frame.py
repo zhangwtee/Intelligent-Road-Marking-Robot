@@ -92,6 +92,10 @@ CMD_HEADING = 0x83      # DATA[0:1]=int16 航向 0.01°，DATA[2:3]=int16 角速
 CMD_SPEED_INFO = 0x84   # DATA[0:1]=固件当前档位 ARR 大端，DATA[2]=标志
                         # 1Hz 兜底、值一变立刻补发。以前速度只有下行：
                         # 手机上按 +/- 改完，这边滑条还停在老值。
+CMD_BATTERY = 0x85      # DATA[0:1]=电池电压 mV 大端，DATA[2]=标志
+                        # 1Hz 一帧。以前车上还剩多少电只有那块 OLED 知道，
+                        # 人在树莓派前跑到一半断电，事后再回想是"电池没电"
+                        # 还是"车停了"根本分不清。
 
 # STATUS 帧 DATA[2] 的标志位，和固件 SendStatusFrame 里那几行 |= 一一对应。
 # 以前是散落在 UI 里的魔法数字，加一位就要在两边各改一处，改漏了不报错。
@@ -102,9 +106,17 @@ STATUS_FLAG_GYRO_READY = 0x08   # 陀螺仪在线且已标零
 STATUS_FLAG_GYRO_CLOSED = 0x10  # 航向闭环正在跑
 STATUS_FLAG_GYRO_ERR = 0x20     # 这一局读过 I2C 错误（精度已打折扣）
 STATUS_FLAG_RESUME = 0x40       # 画车位有急停断点，可以续画
+STATUS_FLAG_BATTERY_LOW = 0x80  # 电池低于门限。分压线断了不算 —— 采样无效时
+                                # 固件不置这一位，界面显示 --- 而不是报警
 
 # SPEED_INFO 帧 DATA[2] 的标志位
 SPEED_FLAG_SAVED = 0x01     # 已写进固件 flash，断电不丢
+
+# BATTERY 帧 DATA[2] 的标志位。门限值不在这一侧 —— 只认固件给的 LOW 位。
+# 两边各写一遍门限，改一处忘另一处就会出现"车上在响、界面还是绿的"，
+# 而且这种不一致只在真没电那天才暴露。
+BATT_FLAG_VALID = 0x01      # 采样有效，电压可信
+BATT_FLAG_LOW = 0x02        # 低于固件 battery.h 的门限
 
 # 陀螺仪状态码，和固件 heading.h 的 HeadingState 一一对应
 GYRO_STATE_NAMES = {
@@ -154,11 +166,13 @@ CMD_NAMES = {
     CMD_PAINT: "画车位",
     CMD_GYRO: "陀螺仪",
     CMD_SPEED: "速度",
+    CMD_BATTERY: "电池",
     CMD_PING: "PING",
     CMD_ACK: "ACK",
     CMD_STATUS: "状态",
     CMD_HEADING: "航向",
     CMD_SPEED_INFO: "当前速度",
+    CMD_BATTERY: "电池",
 }
 
 # 参数范围（和固件 proto.h 里的 PROTO_* 一一对应）
@@ -387,6 +401,14 @@ def describe(cmd: int, data: bytes) -> str:
         arr = (data[0] << 8) | data[1]
         tail = " 已存" if data[2] & SPEED_FLAG_SAVED else " 待存"
         return f"速度 {arr}{tail}"
+    if cmd == CMD_BATTERY:
+        mv = (data[0] << 8) | data[1]
+        if not data[2] & BATT_FLAG_VALID:
+            # 没接分压线时固件读到的是 0。显示 0.0V 会让人去充电，
+            # 而真正坏的是那根线。
+            return "电池 未接"
+        tail = " 低压" if data[2] & BATT_FLAG_LOW else ""
+        return f"电池 {mv / 1000.0:.1f}V{tail}"
     if cmd == CMD_HEADING:
         deg = _s16(data[0], data[1]) / 100.0
         rate = _s16(data[2], data[3]) / 10.0
@@ -416,6 +438,11 @@ def make_frame_record(frame: bytes) -> dict:
         # 和航向帧同一个理由：UI 不该为了拿个整数去自己切片。
         record["speed_arr"] = (data[0] << 8) | data[1]
         record["speed_saved"] = bool(data[2] & SPEED_FLAG_SAVED)
+
+    if cmd == CMD_BATTERY:
+        record["batt_mv"] = (data[0] << 8) | data[1]
+        record["batt_valid"] = bool(data[2] & BATT_FLAG_VALID)
+        record["batt_low"] = bool(data[2] & BATT_FLAG_LOW)
 
     if cmd == CMD_HEADING:
         record["heading_deg"] = _s16(data[0], data[1]) / 100.0

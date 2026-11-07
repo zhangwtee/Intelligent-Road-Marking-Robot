@@ -6,6 +6,7 @@
 #include "heading.h"    /* 陀螺仪航向估计与直线闭环 */
 #include "mpu6050.h"    /* 只为了拿错误计数给状态帧用 */
 #include "cfg.h"        /* 速度档位的掉电保存 */
+#include "battery.h"    /* 电池电压：ADC1_IN10 = PC0 */
 /* 画车位的尺寸和转角。
  *
  * 改造前这里是三个脉冲数（26500 / 12500 / 3000）—— 它们等于多少米、多少度，
@@ -388,6 +389,7 @@ void Hardware_Init(void)  //外设初始化
 	Serial1_Init();
 	GPIO15_Init();
 	TIM1_Init();
+	Battery_Init();      // 电池电压采样（ADC1_IN10 = PC0）
 	StepMotor_Init();   
 StepMotor_SetPulse(MOTOR1, 1);           
 StepMotor_SetPulse(MOTOR2, 1);
@@ -935,6 +937,10 @@ void SendStatusFrame(void)
      * 上位机据此决定"续画"按钮能不能按 —— 按钮常亮、按下去回 ERR_STATE
      * 是最糟的交互：人以为在续画，其实一个字都没动。 */
     if (paint_resume_valid)                flags |= 0x40;
+    /* 0x80 = 电池电压低于门限。Battery_IsLow 内部已经带"采样有效"
+     * 判断：分压线断了不能报"没电"，那会让人去充电，而真正该修的
+     * 是那根线。 */
+    if (Battery_IsLow())                   flags |= 0x80;
 
     d[0] = (uint8_t)sys_ctrl.state;
     d[1] = (uint8_t)((sys_ctrl.state == STATE_PAINT) ? paint_step : selfcheck_step);
@@ -1039,6 +1045,122 @@ static void SendSpeedInfoFrame(void)
     }
 
     SendFrame(SOURCE_PI, PROTO_CMD_SPEED_INFO, 0, d);
+}
+
+/* OLED 第 2 行（电池）上次画上去的内容。
+ *
+ * 提成文件级，是为了让 OLED_Clear 那两处能把"画过"这个标记清掉 ——
+ * 否则清屏之后电池行要等电压真的变了 0.1V 才回来，而放电到那个程度
+ * 可能是几分钟以后，中间这段时间第 2 行一直是空的。 */
+static uint8_t batt_oled_code;
+static uint8_t batt_oled_drawn;
+
+/* 电池电压帧：1Hz。
+ *
+ * 只负责发。采样、OLED、提示音都在 BatteryService 里 —— 三者节拍差得远，
+ * 混在一个函数里改一处就会牵动另外两处。 */
+static void SendBatteryFrame(void)
+{
+    static uint32_t last_ms = 0;
+
+    uint8_t  d[PROTO_DATA_LEN] = {0, 0, 0, 0, 0};
+    uint16_t mv;
+
+    if ((uint32_t)(timer_counter - last_ms) < PROTO_BATTERY_PERIOD_MS) {
+        return;
+    }
+    last_ms = timer_counter;
+
+    mv = Battery_GetMv();
+    d[0] = (uint8_t)((mv >> 8) & 0xFF);
+    d[1] = (uint8_t)(mv & 0xFF);
+    if (Battery_IsValid()) {
+        d[2] |= PROTO_BATT_FLAG_VALID;
+    }
+    if (Battery_IsLow()) {
+        d[2] |= PROTO_BATT_FLAG_LOW;
+    }
+
+    SendFrame(SOURCE_PI, PROTO_CMD_BATTERY, 0, d);
+}
+
+/* 电池：采样 + OLED 第 2 行 + 低压提示音。每圈都调，内部自己节流。
+ *
+ * OLED 只在"画上去的内容真的变了"才写：按 0.1V 取整之后一般几十秒才动
+ * 一次，而刷一屏是几十毫秒的量级，每圈都刷会把主循环整个拖住 —— 串口那
+ * 点环形缓冲（见 uart_ring.c）根本不够它吃的。
+ */
+static void BatteryService(void)
+{
+    static uint8_t  chirp_left;         /* 这一轮还要响几声 */
+    static uint8_t  chirp_on;           /* 正在响 */
+    static uint32_t chirp_ms;
+    uint32_t now = timer_counter;
+    uint16_t mv;
+    uint8_t  code;
+
+    Battery_Poll();
+    SendBatteryFrame();
+
+    mv = Battery_GetMv();
+
+    /* ---- OLED 第 2 行 ---- */
+    if (!Battery_IsValid()) {
+        code = 0xFE;
+    } else {
+        code = (uint8_t)(mv / 100u);    /* 0.1V 一格，比这更细的位数人眼也看不出 */
+        if (Battery_IsLow()) {
+            code = (uint8_t)(code | 0x80);
+        }
+    }
+
+    if (!batt_oled_drawn || code != batt_oled_code) {
+        batt_oled_drawn = 1;
+        batt_oled_code  = code;
+        if (!Battery_IsValid()) {
+            /* 没接分压线时显示 --.-，不是 0.0 —— 后者会让人以为电池挂了 */
+            OLED_ShowString(2, 1, "BAT --.-V       ");
+        } else {
+            OLED_ShowString(2, 1, "BAT ");
+            OLED_ShowNum(2, 5, mv / 1000u, 2);
+            OLED_ShowChar(2, 7, '.');
+            OLED_ShowNum(2, 8, (mv % 1000u) / 100u, 1);
+            OLED_ShowString(2, 9, (Battery_IsLow() ? "V LOW  " : "V      "));
+        }
+    }
+
+    /* ---- 低压提示音：每 30 秒"嘀嘀"两声 ----
+     * 不用长鸣：状态一切换就会 Buzzer_Off（见 System_StateMachine 的
+     * "打断就关"那几句），长鸣反而响不满一秒；两声短的听得见，也不至于
+     * 吵到人把它当成故障。 */
+    if (chirp_on) {
+        if ((uint32_t)(now - chirp_ms) >= BATT_CHIRP_ON_MS) {
+            Buzzer_Off();
+            chirp_on = 0;
+            chirp_ms = now;
+        }
+        return;
+    }
+
+    if (chirp_left > 0) {
+        if ((uint32_t)(now - chirp_ms) >= BATT_CHIRP_GAP_MS) {
+            Buzzer_On();
+            chirp_on = 1;
+            chirp_ms = now;
+            chirp_left--;
+        }
+        return;
+    }
+
+    if (Battery_IsLow()) {
+        /* 已经掉到临界值以下就别再等 30 秒 —— 那时候每一步都可能在丢步。 */
+        uint32_t period = Battery_IsCritical() ? BATT_CRIT_ALARM_PERIOD_MS
+                                               : BATT_ALARM_PERIOD_MS;
+        if ((uint32_t)(now - chirp_ms) >= period) {
+            chirp_left = 2;
+            chirp_ms   = now;
+        }
+    }
 }
 
 static void HandleCmd(uint8_t cmd, uint8_t from) {
@@ -1339,6 +1461,7 @@ void System_StateMachine(void) {
      * 舵机插值），采样就会被推迟，而 dt 是实测的 —— 角度不会因此算错，
      * 但采样间隔越大，转弯时的角度就越像"折线"。 */
     Heading_Poll();
+    BatteryService();      /* 电池电压：采样 + OLED + 低压提示音，内部自己节流 */
 
     ProcessCommand();
     SendStatusFrame();     /* 5Hz 上行状态，只发给树莓派 */
@@ -1403,6 +1526,7 @@ void System_StateMachine(void) {
 					break;
 		case STATE_RETREAT:    // 后退
         OLED_Clear();
+        batt_oled_drawn = 0;    // 清屏了，电池那一行要重画
         OLED_ShowString(3, 1, "Retreat Done    ");
 				StepMotor_RETREAT();
 //        if(current_time - sys_ctrl.state_timestamp > 30000) {
@@ -1548,6 +1672,7 @@ void System_StateMachine(void) {
 			case STATE_RETREAT_BEEP://蜂鸣器，结束后到等待状态
 						Buzzer_On();
 						OLED_Clear();
+						batt_oled_drawn = 0;    // 清屏了，电池那一行要重画
 						OLED_ShowString(3, 1, "FMQ             ");
 //        if(current_time - sys_ctrl.state_timestamp > 2000) {
 //            Buzzer_Off();

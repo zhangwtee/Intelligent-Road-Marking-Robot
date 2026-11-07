@@ -13,11 +13,13 @@
 - 舵机走 TIM4 双路 PWM，20ms 周期，三次 Hermite 缓起缓停
 - `P` 一条指令画出完整矩形，长 5.3m × 宽 2.5m，水泵随行喷漆
 - 两路串口：USART1 接蓝牙手机，USART2 接树莓派，都是 9600 8N1 中断接收
-- OLED 用软件 I2C，显示当前状态
+- OLED 用软件 I2C，显示当前状态、当前档位、电池电压
+- 电池电压采样：ADC1_IN10（PC0）加分压，1Hz 上报；低于门限时 OLED 标 LOW，
+  每 30 秒「嘀嘀」两声
 
 **上位机（marking-host，树莓派）**
 
-- PyQt5 面板：画车位（尺寸和「要不要陀螺仪纠偏」都在界面上现选）、急停后**续画**、速度滑条、二次喷涂、自动巡线喷涂、整机自检、水泵清洗、紧急停止（固定在栏底，任何窗口高度都可见），带串口收发日志和链路健康度
+- PyQt5 面板：画车位（尺寸和「要不要陀螺仪纠偏」都在界面上现选）、急停后**续画**、速度滑条、二次喷涂、自动巡线喷涂、整机自检、水泵清洗、紧急停止（固定在栏底，任何窗口高度都可见），带串口收发日志和链路健康度；状态区还显示电池电压（低压变红，采样无效显示 `---`）
 - 两种下发路径：单字节 ASCII（调试/手机，敲一个字母车就动）和 10 字节帧（带参数、CRC、SEQ、ACK）
 - 黄色标线检测：HSV 提黄 → 形态学去噪 → 闭运算补裂缝 → 轮廓长宽比筛线状 → PCA 主方向定矩形 → 在矩形内量原始黄像素覆盖率。阈值集中在 `core/line_quality.py`，不依赖 Qt，可单独跑 `vision_test.py`
 - 检测结论是**四态**（完好 / 磨损 / 断裂 / 看不清），不是「补 / 不补」两种。看不清单独一态，因为它和"完好"混在一起的时候，相机被挡住、线太细、画面全反光这几种情况的表现都是"它不工作，但日志一切正常"
@@ -129,6 +131,7 @@ Keil 保持打开时不要改 `Project.uvprojx`，它退出时会覆盖回去。
 | 串口 USART1（蓝牙手机） | PA9 = TX，PA10 = RX | UART | 9600 8N1，RX 上拉输入 |
 | 串口 USART2（树莓派） | PA2 = TX，PA3 = RX | UART | 9600 8N1，RX 上拉输入 |
 | 陀螺仪 MPU6050 | PB10 = SCL，PB11 = SDA | 软件 I2C | 从机地址 0x68（AD0 接地），±500dps |
+| 电池电压采样 | PC0 | ADC1_IN10 | 分压 100k / 10k，见下文「电池电压」 |
 
 ### 烧这版之前必须换三根脉冲线
 
@@ -168,9 +171,9 @@ Intelligent-Road-Marking-Robot/
 │   ├── core/frame.py        # 帧协议（与固件 proto.c 逐字节对齐）
 │   ├── core/lane_control.py # 视觉纠偏控制律（纯函数，带闭环仿真）
 │   ├── core/ack.py          # ACK 配对表 + 超时重发
-│   ├── protocol_test.py     # 上下位机指令集 + 帧常量 + 状态位对账 + 闪存页（46 项）
+│   ├── protocol_test.py     # 上下位机指令集 + 帧常量 + 状态位对账 + 闪存页 + 分压比（49 项）
 │   ├── chassis_test.py      # 双 Target 配置 / 条件编译是否真的生效（10 项）
-│   ├── main_window_test.py  # 航向显示 / 陀螺仪开关 / 车位尺寸 / 调速与回填 / 续画 / 发送失败不记账（offscreen 跑）（29 项）
+│   ├── main_window_test.py  # 航向显示 / 陀螺仪开关 / 车位尺寸 / 调速与回填 / 续画 / 电池显示 / 发送失败不记账（offscreen 跑）（31 项）
 │   ├── motor_test.py        # 四路定时器 / 引脚 / 中断 / MOE / 起坡（13 项）
 │   ├── motion_sync_test.py  # 左右同步的接线与数学（13 项）
 │   ├── lane_control_test.py # 控制律符号/限幅 + 闭环仿真（17 项）
@@ -269,10 +272,11 @@ Intelligent-Road-Marking-Robot/
 | `0x82` | STATUS | 状态字符 / 段号 / 标志 / 已走脉冲（16 位），5Hz |
 | `0x83` | HEADING | `DATA[0:1]` 航向 int16（0.01°，右正）/ `DATA[2:3]` 角速度 int16（0.1dps）/ `DATA[4]` 高 4 位状态、低 4 位掉线次数，5Hz |
 | `0x84` | SPEED_INFO | `DATA[0:1]` 当前档位 ARR（大端），`DATA[2]` bit0 = 这个值已写进 flash。值一变立刻发，否则 1Hz 兜底 |
+| `0x85` | BATTERY | `DATA[0:1]` 电池电压 mV（大端），`DATA[2]` bit0 = 采样有效、bit1 = 低于门限，1Hz |
 
 STATUS 的标志位：`0x01` 电机在跑、`0x02` 上电静默、`0x04` 丢过字节、
 `0x08` 陀螺仪可用、`0x10` 航向闭环正在跑、`0x20` 陀螺仪掉过线、
-`0x40` 画车位有急停断点可续。取值由 `protocol_test.test_status_flag_bits_match_firmware`
+`0x40` 画车位有急停断点可续、`0x80` 电池低于门限。取值由 `protocol_test.test_status_flag_bits_match_firmware`
 直接扫 `system.c` 对账 —— 这些位在固件里是硬编码的 `|=`，没有协议常量可对。
 
 结果码：`0x00` OK、`0x01` 状态不允许、`0x02` 参数越界、`0x03` 未知命令、
@@ -453,6 +457,46 @@ MPU6050 给角速度，10ms 采一次、按实测 dt 积分成角度。积分精
 而本工程约定"车头向右为正"是顺时针，两者相反。代码里用 `HDG_Z_SIGN = -1` 处理。
 核对办法：手扶着车原地向右转 30 度，界面上的航向应该显示 `+30`。显示 `-30` 就是装反了。
 
+### 电池电压
+
+步进是开环的，而电池电压掉下去第一个体现就是丢步 —— 画到第四条边车头歪了，人
+会先去怀疑轮径和转角系数。所以这个数要能看见。
+
+**接线**（三个元件）：
+
+```
+电池正极 ──┬── 100k ──┬── PC0 (ADC1_IN10)
+           │          │
+           │         100nF
+           │          │
+           └──────────┴──── 地（电池负极 / 板子 GND）
+                 10k
+                  │
+                 地
+```
+
+100k / 10k 是 11:1，满量程 3.3V 对应 36.3V，12V 和 24V 系统都留了余量，
+每 LSB 约 8.9mV。那颗 100nF 别省：步进驱动器的开关噪声直接从电源线耦合
+进来，单次读数能差上百毫伏，靠软件平均去不掉低频的那部分。
+
+**为什么是 PC0，不是空出来的 PA7。** PA7 是 C8 版 M2 的脉冲脚，换四路独立
+时基之后空出来了，但那根线在大多数车上还接着步进驱动器 —— 接上去读回来的是
+脉冲方波。这块板子上 GPIOC 只被 PC6（M4 脉冲）占了，PC0 一直是空的。
+
+**门限**在 `Hardware/battery.h`：`BATT_LOW_MV` 11500（开始告警）、
+`BATT_CRIT_MV` 10800。按 12V 铅酸取的，换 3 串锂电或 24V 系统要重新取，
+别照抄。低位那个 `0x02` 位由固件判断，上位机不自己算 —— 两边各写一遍门限，
+改一处忘另一处就会出现「车上在响、界面还是绿的」，而这种不一致只在真没电
+那天才暴露。
+
+**分压线断了怎么办。** ADC 读到接近 0，固件把「采样有效」位清掉：OLED 显示
+`BAT --.-V`，界面显示「电池 ---」。不显示 0.0V —— 那会把人支去充电，而电池
+其实是满的，坏的是那根线。判断阈值 `BATT_RAW_MIN` 是 16 个字（约 13mV 引脚
+电压），底噪和漏电都在它下面。
+
+改电阻只改 `battery.h` 里 `BATT_DIV_TOP_OHM` / `BATT_DIV_BOT_OHM` 两个宏，
+别的都不用动。`protocol_test.py` 会算一遍满量程和源阻抗，电阻换得离谱当场报。
+
 ### 现场标定顺序
 
 纠偏能不能用，取决于三个数。**按这个顺序调，不要跳步**：
@@ -522,7 +566,7 @@ python3 main.py
   3. 落地但空跑，不接泵，跑一遍 `P`，量实际画出来的尺寸对不对。
   4. 最后才接漆，头几次跑把手放在电源开关上。
 - 上下位机的指令集对齐由测试守着：`python3 protocol_test.py` 直接从固件 `system.c` 抠 `case '...'`、从 `proto.h` 抠 `#define`，和面板按钮表、`frame.py` 逐项对账，加了指令忘了同步会当场报。面板上**不许挂固件还没实现的按钮** —— 以前 `N`（画车位（路沿））就挂在这儿，按下去是空操作，靠一个白名单放行；现在功能整个撤掉了，白名单也没了，谁再挂一个空按钮这条测试就拦。
-- 测试一共 156 项，都不需要硬件：`python3 protocol_test.py`（40）、`lane_control_test.py`（17）、`camera_widget_test.py`（22）、`ack_test.py`（13）、`motion_sync_test.py`（13）、`motor_test.py`（13）、`chassis_test.py`（10）、`main_window_test.py`（23）、`vision_test.py`（5）。其中 `motor_test` / `motion_sync_test` / `chassis_test` 是读固件源码的静态检查（不需要编译器）；其余只需要 numpy，`camera_widget_test.py` 和 `vision_test.py` 还要 `opencv-python-headless`，没有 PyQt5 也行（测试里有个只够本文件用的替身）。
+- 测试一共 173 项，都不需要硬件：`python3 protocol_test.py`（49）、`lane_control_test.py`（17）、`camera_widget_test.py`（22）、`ack_test.py`（13）、`motion_sync_test.py`（13）、`motor_test.py`（13）、`chassis_test.py`（10）、`main_window_test.py`（31）、`vision_test.py`（5）。其中 `motor_test` / `motion_sync_test` / `chassis_test` 是读固件源码的静态检查（不需要编译器）；其余只需要 numpy，`camera_widget_test.py` 和 `vision_test.py` 还要 `opencv-python-headless`，没有 PyQt5 也行（测试里有个只够本文件用的替身）。
 - **纠偏的三个上限写在两个地方，必须一致**：`proto.h` 的 `PROTO_TRIM_MAX_MM`、`motion.c` 的 `MOTION_TRIM_MAX_MM`、`lane_control.py` 的 `GAINS["MAX_TRIM_MM"]`。`protocol_test.py::test_trim_cap_is_the_same_everywhere` 盯着。不一致的症状各不相同而且都不报错：上位机给大了是「帧被回 ERR_RANGE，车完全不纠」，给中了大是「被 `Motion_Trim` 静默夹掉，ACK 还是 OK」。
 - 上位机串口默认 `/dev/serial0`（`main.py` / `serial_manager.py` / `serial_test.py`）。`serial0` 是 udev 符号链接，永远指向当前接在排针上的那个串口，所以底下换 UART 不用改代码。临时换口（比如 USB 转串口）用环境变量：`MARKING_PORT=/dev/ttyUSB0 ./start.sh`。
 - 树莓派 4B 的排针串口是哪个 UART 取决于配置，别写死成 `ttyAMA0`：

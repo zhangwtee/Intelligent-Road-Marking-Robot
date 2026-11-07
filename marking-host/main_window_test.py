@@ -596,6 +596,50 @@ def test_status_bar_shows_which_edge_is_being_painted():
     assert "第" not in w.status_label.text(), w.status_label.text()
 
 
+def battery_frame(mv, valid=True, low=False):
+    flags = 0
+    if valid:
+        flags |= frame.BATT_FLAG_VALID
+    if low:
+        flags |= frame.BATT_FLAG_LOW
+    return frame.build_frame(
+        frame.CMD_BATTERY, 0,
+        bytes([(mv >> 8) & 0xFF, mv & 0xFF, flags, 0, 0]),
+    )
+
+
+def test_battery_label_shows_voltage_and_turns_red():
+    """电压要显示成 12.5V；低压变红；采样无效显示 --- 而不是 0.0V。
+
+    显示 0.0V 会把人的注意力引到"电池没电"上，而分压线掉了的时候电池
+    其实是满的。现场被支到错误的方向，比没有这个读数更贵。
+    """
+    w = make_window()
+
+    w.on_data_received(battery_frame(12500))
+    assert "12.5V" in w.battery_label.text(), w.battery_label.text()
+    assert "#c00000" not in w.battery_label.styleSheet(), "正常电压不该是红的"
+
+    w.on_data_received(battery_frame(11400, low=True))
+    assert "11.4V" in w.battery_label.text(), w.battery_label.text()
+    assert "#c00000" in w.battery_label.styleSheet(), "低压没有变红"
+
+    w.on_data_received(battery_frame(0, valid=False))
+    assert "---" in w.battery_label.text(), w.battery_label.text()
+    assert "0.0V" not in w.battery_label.text(), "分压线断了却显示 0.0V"
+
+
+def test_battery_frame_stays_out_of_the_log():
+    """1Hz 的电池帧进日志会把 ACK 和错误码冲掉，和速度帧一个道理。"""
+    w = make_window()
+    before = w.recv_log.document().blockCount()
+
+    for _ in range(5):
+        w.on_data_received(battery_frame(12500))
+
+    assert w.recv_log.document().blockCount() == before, "电池帧刷进接收日志了"
+
+
 if __name__ == "__main__":
     for name in sorted(n for n in globals() if n.startswith("test_")):
         globals()[name]()

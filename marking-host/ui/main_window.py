@@ -175,6 +175,14 @@ class MainWindow(QWidget):
         self.gyro_label.setStyleSheet("font-size:14px; color:#777;")
         left_layout.addWidget(self.gyro_label)
 
+        # 电池电压。放状态区而不是日志里：这是"还能不能干完这一趟"的判断
+        # 依据，滚在日志里没人会回头翻。1Hz 的电池帧进了日志反而会把
+        # ACK 和错误码冲干净（和速度帧同一个理由）。
+        self.battery_label = QLabel("电池  --")
+        self.battery_label.setAlignment(Qt.AlignCenter)
+        self.battery_label.setStyleSheet("font-size:14px; color:#777;")
+        left_layout.addWidget(self.battery_label)
+
         # 状态帧（5Hz）和航向帧（5Hz）都会想改上面这行字。两个源各写各的，
         # 界面就会每秒跳五次。约定：就绪之后这行只归航向帧管，状态帧只
         # 负责把这三个标记更新下来 —— 见 _apply_gyro_flags。
@@ -499,6 +507,9 @@ class MainWindow(QWidget):
         elif cmd == frame.CMD_SPEED_INFO and len(payload) >= 2:
             self._apply_speed_info(item)
 
+        elif cmd == frame.CMD_BATTERY:
+            self._apply_battery(item)
+
         elif cmd == frame.CMD_HEADING:
             self._update_heading(item)
 
@@ -525,6 +536,10 @@ class MainWindow(QWidget):
 
         # 速度帧 1Hz，同理由：只更新滑条，不进日志。
         if item.get("kind") == "frame" and item.get("cmd") == frame.CMD_SPEED_INFO:
+            return
+
+        # 电池帧 1Hz，同上：只更新上面那行字。
+        if item.get("kind") == "frame" and item.get("cmd") == frame.CMD_BATTERY:
             return
 
         if not self.recv_pause_checkbox.isChecked():
@@ -731,6 +746,35 @@ class MainWindow(QWidget):
             "已写进固件 flash，断电不丢" if saved
             else "固件还没写 flash（改完 2 秒、车停着才写），现在断电会回到上次存的档位"
         )
+
+    def _apply_battery(self, item):
+        """把电池帧画到状态区。
+
+        采样无效（分压线掉了、ADC 读到接近 0）显示 `---`，不显示 0.0V ——
+        后者会让人去充电，而真正的问题是那根线。
+
+        门限不由这一侧判断，只认固件给的 BATT_FLAG_LOW：两边各写一遍，
+        改一处忘另一处就会出现"车上在响、界面还是绿的"。
+        """
+        if not item.get("batt_valid"):
+            self.battery_label.setText("电池  ---")
+            self.battery_label.setStyleSheet("font-size:14px; color:#777;")
+            self.battery_label.setToolTip(
+                "固件报采样无效：分压线没接好，或 ADC 读到的接近 0。"
+                "接法是电池正极 -> 100k -> PC0 -> 10k -> 地。"
+            )
+            return
+
+        mv = item.get("batt_mv", 0)
+        self.battery_label.setText(f"电池  {mv / 1000.0:.1f}V")
+        if item.get("batt_low"):
+            self.battery_label.setStyleSheet(
+                "font-size:14px; font-weight:bold; color:#c00000;"
+            )
+            self.battery_label.setToolTip("低于固件门限，画完这一圈就换电池")
+        else:
+            self.battery_label.setStyleSheet("font-size:14px; color:#2a7d2a;")
+            self.battery_label.setToolTip("电压正常")
 
     def on_speed_changed(self, arr):
         self.speed_label.setText(str(arr))

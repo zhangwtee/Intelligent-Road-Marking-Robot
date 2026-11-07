@@ -22,6 +22,7 @@ FIRMWARE_HW = (
 
 FIRMWARE_C = FIRMWARE_HW / "system.c"
 FIRMWARE_PROTO_H = FIRMWARE_HW / "proto.h"
+FIRMWARE_BATTERY_H = FIRMWARE_HW / "battery.h"
 
 FIRMWARE_COMMANDS = set(
     re.findall(r"case '([^']+)':", FIRMWARE_C.read_text(encoding="gbk"))
@@ -200,6 +201,9 @@ def test_frame_constants_match_firmware():
         "PROTO_CMD_PING": frame.CMD_PING,
         "PROTO_CMD_ACK": frame.CMD_ACK,
         "PROTO_CMD_STATUS": frame.CMD_STATUS,
+        "PROTO_CMD_BATTERY": frame.CMD_BATTERY,
+        "PROTO_BATT_FLAG_VALID": frame.BATT_FLAG_VALID,
+        "PROTO_BATT_FLAG_LOW": frame.BATT_FLAG_LOW,
         "PROTO_OK": frame.RESULT_OK,
         "PROTO_ERR_STATE": frame.RESULT_ERR_STATE,
         "PROTO_ERR_RANGE": frame.RESULT_ERR_RANGE,
@@ -351,6 +355,7 @@ def test_status_flag_bits_match_firmware():
         "STATUS_FLAG_GYRO_CLOSED": 0x10,
         "STATUS_FLAG_GYRO_ERR": 0x20,
         "STATUS_FLAG_RESUME": 0x40,
+        "STATUS_FLAG_BATTERY_LOW": 0x80,
     }
     missing = []
     for name, value in pairs.items():
@@ -910,6 +915,73 @@ def test_gyro_frame_roundtrip():
         assert f[1] == frame.CMD_GYRO
         assert f[3] == sub
         assert frame.describe(f[1], f[3:8]) == f"陀螺仪 {name}"
+
+
+def test_battery_frame_roundtrip():
+    """电池帧的字节和显示。
+
+    mV 一直是整数，只有最后显示那一步才除 1000 —— 中途换浮点，日志里
+    的数和界面上的数就会对不上（12.35 显示成 12.3 还是 12.4，两边四舍五入
+    的时机不同）。
+    """
+    ok = frame.make_frame_record(
+        frame.build_frame(frame.CMD_BATTERY, 0, b"\x30\xD4\x01")   # 12500mV
+    )
+    assert ok["batt_mv"] == 12500
+    assert ok["batt_valid"] is True
+    assert ok["batt_low"] is False
+    assert ok["status"] == "电池 12.5V"
+
+    low = frame.make_frame_record(
+        frame.build_frame(frame.CMD_BATTERY, 0, b"\x2C\xEC\x03")   # 11500mV 低压
+    )
+    assert low["batt_low"] is True
+    assert low["status"] == "电池 11.5V 低压"
+
+    dead = frame.make_frame_record(
+        frame.build_frame(frame.CMD_BATTERY, 0, b"\x00\x00\x00")
+    )
+    assert dead["batt_valid"] is False
+    assert dead["status"] == "电池 未接"
+
+
+def test_battery_divider_stays_within_adc_range():
+    """分压比算错，读数不是"偏一点"，是整段被削平。
+
+    ADC 满量程 3.3V。11:1 意味着 36.3V 才顶到天花板，12V / 24V 都有余量。
+    改电阻忘了重算的症状是"电压卡在某个数不再上升"，看着像电池充不进电，
+    实际是 ADC 早就饱和了。
+
+    另一头是源阻抗：R_TOP//R_BOT 太大，采样保持电容在 239.5 个周期里充
+    不满，读数会系统性偏低 —— 而且偏低得很有规律，容易被当成"电池真的虚"。
+    """
+    text = FIRMWARE_BATTERY_H.read_bytes().decode("gbk", errors="replace")
+    top = int(re.search(r"#define\s+BATT_DIV_TOP_OHM\s+(\d+)", text).group(1))
+    bot = int(re.search(r"#define\s+BATT_DIV_BOT_OHM\s+(\d+)", text).group(1))
+
+    full_scale_mv = 3300 * (top + bot) // bot
+    assert full_scale_mv >= 16000, f"满量程只有 {full_scale_mv}mV，12V 系统余量不够"
+    assert full_scale_mv <= 60000, f"满量程 {full_scale_mv}mV 太高，12V 只剩几个 LSB"
+
+    src = top * bot // (top + bot)
+    assert src <= 20000, f"源阻抗 {src} 欧超过 20k，读数会偏低"
+
+
+def test_battery_pin_does_not_collide():
+    """采样脚必须是 PC0，而且不能和 M4 的 PC6 撞。
+
+    这块板子上 GPIOC 只被 M4 的脉冲用过（PC6）。以后谁再往 GPIOC 加外设，
+    先看这一条 —— 撞了不会报错，只会让两边都读到乱七八糟的数。
+    """
+    text = FIRMWARE_BATTERY_H.read_bytes().decode("gbk", errors="replace")
+    assert re.search(r"#define\s+BATT_GPIO_PORT\s+GPIOC", text), "采样口不是 GPIOC"
+    assert re.search(r"#define\s+BATT_GPIO_PIN\s+GPIO_Pin_0", text), "采样脚不是 PC0"
+    assert re.search(r"#define\s+BATT_ADC_CHANNEL\s+ADC_Channel_10", text), \
+        "PC0 对应的是 ADC_Channel_10"
+
+    motor_h = (FIRMWARE_HW / "StepMotor_New.h").read_bytes().decode("gbk", errors="replace")
+    assert re.search(r"#define\s+M4_PUL_PIN\s+GPIO_Pin_6", motor_h), \
+        "M4 的脉冲脚变了，电池采样脚要重新挑（现在选 PC0 就是因为 PC6 被占了）"
 
 
 if __name__ == "__main__":

@@ -654,6 +654,16 @@
           <GroupName>Hardware</GroupName>
           <Files>
             <File>
+              <FileName>battery.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\Hardware\battery.c</FilePath>
+            </File>
+            <File>
+              <FileName>battery.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\Hardware\battery.h</FilePath>
+            </File>
+            <File>
               <FileName>cfg.c</FileName>
               <FileType>1</FileType>
               <FilePath>.\Hardware\cfg.c</FilePath>
@@ -1469,6 +1479,16 @@
         <Group>
           <GroupName>Hardware</GroupName>
           <Files>
+            <File>
+              <FileName>battery.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\Hardware\battery.c</FilePath>
+            </File>
+            <File>
+              <FileName>battery.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\Hardware\battery.h</FilePath>
+            </File>
             <File>
               <FileName>cfg.c</FileName>
               <FileType>1</FileType>
