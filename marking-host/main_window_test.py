@@ -612,12 +612,14 @@ def test_paint_progress_is_not_overwritten_by_a_command_echo():
     assert "OK" in w.status_label.text(), w.status_label.text()
 
 
-def battery_frame(mv, valid=True, low=False):
+def battery_frame(mv, valid=True, low=False, absent=False):
     flags = 0
     if valid:
         flags |= frame.BATT_FLAG_VALID
     if low:
         flags |= frame.BATT_FLAG_LOW
+    if absent:
+        flags |= frame.BATT_FLAG_ABSENT
     return frame.build_frame(
         frame.CMD_BATTERY, 0,
         bytes([(mv >> 8) & 0xFF, mv & 0xFF, flags, 0, 0]),
@@ -644,6 +646,12 @@ def test_battery_label_shows_voltage_and_turns_red():
     assert "---" in w.battery_label.text(), w.battery_label.text()
     assert "0.0V" not in w.battery_label.text(), "分压线断了却显示 0.0V"
 
+    # 分压电阻没焊是另一回事：固件读到了数，但那不是电池。界面要说"未接"，
+    # 不能和上面那条"这一轮没读到"混成一句话 —— 前者要去焊电阻，后者等一轮就好。
+    w.on_data_received(battery_frame(0, valid=False, absent=True))
+    assert "未接" in w.battery_label.text(), w.battery_label.text()
+    assert "0.0V" not in w.battery_label.text(), "没接分压却显示了一个电压"
+
 
 def test_battery_frame_stays_out_of_the_log():
     """1Hz 的电池帧进日志会把 ACK 和错误码冲掉，和速度帧一个道理。"""
@@ -654,6 +662,51 @@ def test_battery_frame_stays_out_of_the_log():
         w.on_data_received(battery_frame(12500))
 
     assert w.recv_log.document().blockCount() == before, "电池帧刷进接收日志了"
+
+
+def resume_info_frame(length, width, step):
+    """固件上行 0x86：flash 里那份断点的长宽和边号。"""
+    return frame.build_frame(
+        frame.CMD_RESUME_INFO, 0,
+        bytes([(length >> 8) & 0xFF, length & 0xFF,
+               (width >> 8) & 0xFF, width & 0xFF, step]),
+    )
+
+
+def test_resume_label_shows_what_the_firmware_remembers():
+    """断点行显示固件 flash 里那一圈的长宽，而且不许动输入框。
+
+    这一行是为“核对不了”准备的：上电之后固件已经把断点的尺寸还原了，
+    续画按它走，但以前面板上没有任何地方能看到那个数。
+
+    反过来说，尺寸也不能自动填进输入框 —— 那两个框是“我打算画多大”，
+    而续画只认断点。填进去等于告诉人“改了尺寸就按新的画”，实际改了也
+    白改、车还是照断点走。
+    """
+    w = make_window()
+    w.paint_len_spin.setValue(5000)
+    w.paint_wid_spin.setValue(2300)
+
+    w.on_data_received(resume_info_frame(5300, 2500, 5))
+    text = w.resume_label.text()
+    assert "5300x2500" in text, text
+    assert "第3条边" in text, text
+    assert w.paint_len_spin.value() == 5000, "断点把长边输入框改掉了"
+    assert w.paint_wid_spin.value() == 2300, "断点把宽边输入框改掉了"
+
+    w.on_data_received(resume_info_frame(0, 0, 0))
+    assert "无" in w.resume_label.text(), w.resume_label.text()
+
+
+def test_resume_info_frame_stays_out_of_the_log():
+    """1Hz 的断点帧进日志会把 ACK 和错误码冲掉，和速度帧一个道理。"""
+    w = make_window()
+    before = w.recv_log.document().blockCount()
+
+    for _ in range(5):
+        w.on_data_received(resume_info_frame(5300, 2500, 5))
+
+    assert w.recv_log.document().blockCount() == before, "断点帧刷进接收日志了"
 
 
 if __name__ == "__main__":

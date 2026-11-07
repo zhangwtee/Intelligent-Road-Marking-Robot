@@ -283,21 +283,23 @@ static void PaintCaptureResume(void)
     paint_resume_dirty    = 1;      /* 等车停稳，由 service 写 flash */
 }
 
-/* 断点作废：RAM 立刻清，flash 交给 service 等车停稳再擦。
+/* 断点作废：RAM 立刻清，flash 交给 service 等车停稳再写。
  *
- * 用在"停止复位"上：那一下车可能还在跑，擦一页期间取指是停的，不能插在
- * 这个位置。确认新开一条画车位时用下面的 PaintResumeClearNow —— 那种时刻
- * 车本来就停着（WAIT 才放行），当场擦更安全。 */
+ * 用在"停止复位"上：那一下车可能还在跑。写一条记录只是编程几个字，理论上
+ * 插在这里也不会丢步，但"车没停就不碰 flash"这条规矩不想为它开例外 ——
+ * 例外一开，下一次就会有人把真正的擦页也插进来。新开一条画车位、每条边走完
+ * 这两个地方车是停着的，用下面的 PaintResumeClearNow。 */
 static void PaintResumeForget(void)
 {
     paint_resume_valid = 0;
     paint_resume_dirty = 1;
 }
 
-/* 车已经停着的时候（新开一条画车位），当场把 flash 里的断点抹掉，
- * 不必等 service。
+/* 车已经停着的时候，当场把 flash 里的断点抹掉，不必等 service。
  *
- * 为什么这两处不能只置脏标记：接下来车就要开始走了，而 service 只在车停下
+ * 用在三个地方：新开一条画车位、每条边走完（进转弯之前）、一圈画完。
+ *
+ * 为什么这些地方不能只置脏标记：接下来车就要开始走了，而 service 只在车停下
  * 的时候才写 —— 也就是说整条画车位期间，flash 里都留着上一份断点。中途
  * 断电，上电之后那个旧断点会自己冒出来，按下去就是从"上一次停下的地方"
  * 再走一段，而车已经往前走了几条边。 */
@@ -308,6 +310,91 @@ static void PaintResumeClearNow(void)
         paint_resume_dirty = 0;     /* 已经擦掉了，别再让 service 跑一趟 */
     } else {
         paint_resume_dirty = 1;     /* 擦不掉就退回老办法，车停稳后重试 */
+    }
+}
+
+/* 把 RAM 里的断点写进 flash。调用方必须已经确认车停着。
+ *
+ * 失败就置脏标记交给 service 重试 —— 写 flash 会失败（页写保护、片子是
+ * 打磨过的），但失败不该让"记断点"这件事消失：RAM 里那份还在，车停下来
+ * 之前随时可以再试一次。 */
+static uint8_t PaintResumeFlush(void)
+{
+    CfgResume rec;
+
+    if (!paint_resume_valid) {
+        return Cfg_ClearResume();
+    }
+
+    rec.valid    = 1;
+    rec.step     = (uint8_t)paint_resume_step;
+    rec.heading  = (uint8_t)(paint_resume_heading ? 1 : 0);
+    rec.left_mm  = (uint16_t)(paint_resume_left_mm + 0.5f);
+    rec.right_mm = (uint16_t)(paint_resume_right_mm + 0.5f);
+    rec.len_mm   = (uint16_t)(paint_len_mm + 0.5f);
+    rec.wid_mm   = (uint16_t)(paint_wid_mm + 0.5f);
+
+    if (Cfg_SaveResume(&rec)) {
+        paint_resume_dirty = 0;
+        paint_resume_tried = 0;
+        return 1;
+    }
+
+    paint_resume_dirty = 1;
+    return 0;
+}
+
+/* 记"这一条边从头开始"，并当场写 flash。
+ *
+ * 这是为"画线中途断电 / 复位"准备的。急停只有人按了才有，而断电随时都
+ * 可能发生 —— 以前只有按 T 才留得下断点，一断电这一圈就白画了：前几条
+ * 边喷过漆，人只能从第一条边重来，而车早就离开起点了。
+ *
+ * 一圈写 4 次（每条边开头一次），加上每条边走完作废一次、画完一次，
+ * 一圈八九条记录。flash 那边是页内追加（见 cfg.c），写一条只编程五个字、
+ * 不擦页，一页能装一百多条，很久才轮到一次擦除。
+ *
+ * 写点挑得很小心：4 个调用点全在"车刚停稳、泵还关着"的那一拍 —— 上一条
+ * 边走完、转弯、电机停了，才轮到写这里。所以写 flash 那一下既不会
+ * 多走一步，也不会在漆线上留一个点。急停那条路不一样，按下那一刻电机
+ * 可能还在转，所以那边仍然只置脏标记，交给 PaintResumeService。
+ *
+ * 代价是断电最多重画这一条边，而不是整圈。 */
+static void PaintResumeMarkEdge(float edge_mm)
+{
+    paint_resume_step     = paint_step;
+    paint_resume_left_mm  = edge_mm;
+    paint_resume_right_mm = edge_mm;
+    paint_resume_heading  = paint_heading;
+    paint_resume_valid    = 1;
+
+    if (StepMotor_IsAnyRunning()) {
+        /* 车还在转（理论上这里不该发生）：交给 service 等它停稳。 */
+        paint_resume_dirty = 1;
+        return;
+    }
+    PaintResumeFlush();
+}
+
+/* OLED 第 4 行：有没有断点、停在第几条边。
+ *
+ * 不接上位机的时候，这是唯一能知道"车上还挂着一个断点"的地方。没有它，
+ * 上电只显示 Wait，人以为是一条干净的线，按了画车位才发现车从半路接上。
+ * 反过来，按了 W、或者一圈画完了，这一行必须清掉 —— 留着就一直骗人。
+ *
+ * 只在"断点变了"的时候写一次，不放进主循环：刷一屏是软件 I2C 一位一位挪
+ * 出去的，很慢，而这件事一天也就发生几次。 */
+static void PaintResumeShowOnOled(void)
+{
+    if (!paint_resume_valid) {
+        OLED_ShowString(4, 1, "                ");
+        return;
+    }
+    switch (paint_resume_step) {
+        case PAINT_EDGE2: OLED_ShowString(4, 1, "Resume:2/4      "); break;
+        case PAINT_EDGE3: OLED_ShowString(4, 1, "Resume:3/4      "); break;
+        case PAINT_EDGE4: OLED_ShowString(4, 1, "Resume:4/4      "); break;
+        default:          OLED_ShowString(4, 1, "Resume:1/4      "); break;
     }
 }
 
@@ -332,6 +419,10 @@ static void PaintResumeBootLoad(void)
     paint_wid_mm          = (float)rec.wid_mm;
     paint_resume_valid    = 1;
     paint_resume_dirty    = 0;      /* flash 里就是这一份，不用再写 */
+
+    /* 上电就告诉人"车上有断点"。这一行不写的话，界面只有 Wait，
+     * 人要按了画车位才发现车从半路接上。 */
+    PaintResumeShowOnOled();
 }
 
 /* ---- 速度档位的掉电保存 ----
@@ -429,11 +520,11 @@ static void SpeedSaveService(void)
 
 static void PaintResumeService(void)
 {
-    CfgResume rec;
-
     if (!paint_resume_dirty) {
         return;
     }
+    /* 车还在跑就不能擦页：擦一页期间取指是停的，正在发脉冲的那一路会
+     * 少走几步，而开环步进丢的步补不回来。 */
     if (StepMotor_IsAnyRunning()) {
         return;
     }
@@ -445,18 +536,7 @@ static void PaintResumeService(void)
     paint_resume_try_ms = timer_counter;
 
     if (paint_resume_valid) {
-        rec.valid    = 1;
-        rec.step     = (uint8_t)paint_resume_step;
-        rec.heading  = (uint8_t)(paint_resume_heading ? 1 : 0);
-        rec.left_mm  = (uint16_t)(paint_resume_left_mm + 0.5f);
-        rec.right_mm = (uint16_t)(paint_resume_right_mm + 0.5f);
-        rec.len_mm   = (uint16_t)(paint_len_mm + 0.5f);
-        rec.wid_mm   = (uint16_t)(paint_wid_mm + 0.5f);
-
-        if (Cfg_SaveResume(&rec)) {
-            paint_resume_dirty = 0;
-            paint_resume_tried = 0;
-        }
+        PaintResumeFlush();
     } else if (Cfg_ClearResume()) {
         paint_resume_dirty = 0;
         paint_resume_tried = 0;
@@ -1080,10 +1160,18 @@ void SendStatusFrame(void)
     /* 0x20 = 陀螺仪掉过线。跑着跑着冒出来，说明接线松了或者干扰变大，
      * 角度精度已经开始下降 —— 赶在车走歪之前就能看见。 */
     if (MPU6050_ErrorCount() > 0)          flags |= 0x20;
-    /* 0x40 = 画车位有断点可续（急停停在某条边中途）。
+    /* 0x40 = 画车位有断点、而且现在就能续。
      * 上位机据此决定"续画"按钮能不能按 —— 按钮常亮、按下去回 ERR_STATE
-     * 是最糟的交互：人以为在续画，其实一个字都没动。 */
-    if (paint_resume_valid)                flags |= 0x40;
+     * 是最糟的交互：人以为在续画，其实一个字都没动。
+     *
+     * 后半个条件是后加的：现在每条边开头都会写一份断点（断电保护），
+     * 所以整个画车位期间 paint_resume_valid 都是 1。只看这个标志的话，
+     * 按钮在车正跑着的时候也亮着，按下去被回绝 —— 比灰着更让人糊涂。
+     * 只有停在 WAIT / TING 上才是真的能续。 */
+    if (paint_resume_valid
+        && (sys_ctrl.state == STATE_WAIT || sys_ctrl.state == STATE_TING)) {
+        flags |= 0x40;
+    }
     /* 0x80 = 电池电压低于门限。Battery_IsLow 内部已经带"采样有效"
      * 判断：分压线断了不能报"没电"，那会让人去充电，而真正该修的
      * 是那根线。 */
@@ -1194,6 +1282,50 @@ static void SendSpeedInfoFrame(void)
     SendFrame(SOURCE_PI, PROTO_CMD_SPEED_INFO, 0, d);
 }
 
+/* 断点帧：把 flash 里那份断点的长宽和边号报给上位机。
+ *
+ * 为什么专门为它开一帧：上电之后固件已经把那一圈的长宽还原了（续画要用），
+ * 但面板那两个输入框还是它自己上次的值。人要核对"车上记的到底是 5.3x2.5
+ * 还是 5.0x2.3"没有任何地方能看 —— 这不是功能坏了，是"一切正常但有一个数
+ * 没人能证实"，最难被发现的那类问题。
+ *
+ * 1Hz，内容一变立刻补发。省下来的带宽留给 ACK 和错误码。 */
+static uint8_t  resume_info_step = 0xFFu;   /* 0xFF 保证第一帧一定发出去 */
+static uint16_t resume_info_len;
+static uint16_t resume_info_wid;
+static uint32_t resume_info_ms;
+
+static void SendResumeInfoFrame(void)
+{
+    uint8_t  d[PROTO_DATA_LEN];
+    uint8_t  step = 0;
+    uint16_t len  = 0;
+    uint16_t wid  = 0;
+
+    if (paint_resume_valid) {
+        len  = (uint16_t)(paint_len_mm + 0.5f);
+        wid  = (uint16_t)(paint_wid_mm + 0.5f);
+        step = (uint8_t)paint_resume_step;
+    }
+
+    if (step == resume_info_step && len == resume_info_len && wid == resume_info_wid
+        && (uint32_t)(timer_counter - resume_info_ms) < PROTO_BATTERY_PERIOD_MS) {
+        return;
+    }
+    resume_info_step = step;
+    resume_info_len  = len;
+    resume_info_wid  = wid;
+    resume_info_ms   = timer_counter;
+
+    d[0] = (uint8_t)((len >> 8) & 0xFF);
+    d[1] = (uint8_t)(len & 0xFF);
+    d[2] = (uint8_t)((wid >> 8) & 0xFF);
+    d[3] = (uint8_t)(wid & 0xFF);
+    d[4] = step;                /* 0 = 没有断点 */
+
+    SendFrame(SOURCE_PI, PROTO_CMD_RESUME_INFO, 0, d);
+}
+
 /* OLED 第 2 行（电池）上次画上去的内容。
  *
  * 提成文件级，是为了让 OLED_Clear 那两处能把"画过"这个标记清掉 ——
@@ -1227,6 +1359,9 @@ static void SendBatteryFrame(void)
     if (Battery_IsLow()) {
         d[2] |= PROTO_BATT_FLAG_LOW;
     }
+    if (Battery_IsAbsent()) {
+        d[2] |= PROTO_BATT_FLAG_ABSENT;
+    }
 
     SendFrame(SOURCE_PI, PROTO_CMD_BATTERY, 0, d);
 }
@@ -1251,8 +1386,13 @@ static void BatteryService(void)
 
     mv = Battery_GetMv();
 
-    /* ---- OLED 第 2 行 ---- */
-    if (!Battery_IsValid()) {
+    /* ---- OLED 第 2 行 ----
+     *
+     * 三种状态分开显示。以前只有"有效"和"--.-"两种，分压电阻没焊的时候
+     * 屏上永远是 --.-，看着像固件坏了 —— 而实际上是少焊两个电阻。 */
+    if (Battery_IsAbsent()) {
+        code = 0xFFFEu;
+    } else if (!Battery_IsValid()) {
         code = 0xFFFFu;                 /* 有效电压按 0.1V 取整也落不到这个值 */
     } else {
         code = (uint16_t)(mv / 100u);   /* 0.1V 一格，比这更细的位数人眼也看不出 */
@@ -1264,8 +1404,13 @@ static void BatteryService(void)
     if (!batt_oled_drawn || code != batt_oled_code) {
         batt_oled_drawn = 1;
         batt_oled_code  = code;
-        if (!Battery_IsValid()) {
-            /* 没接分压线时显示 --.-，不是 0.0 —— 后者会让人以为电池挂了 */
+        if (Battery_IsAbsent()) {
+            /* 引脚印出来就不是电池的电压：直接说没接，别显示一个数。
+             * 悬空脚会读出 8 点几伏这种"看着像快没电"的值，人会端着
+             * 万用表去量一块满电的电池。 */
+            OLED_ShowString(2, 1, "BAT no sense    ");
+        } else if (!Battery_IsValid()) {
+            /* 这一轮没读到（ADC 超时），下一轮可能就好了。 */
             OLED_ShowString(2, 1, "BAT --.-V       ");
         } else {
             OLED_ShowString(2, 1, "BAT ");
@@ -1338,6 +1483,7 @@ static void HandleCmd(uint8_t cmd, uint8_t from) {
         /* W = 这条活不干了，断点跟着作废。留着的话，"续画"按钮会在
          * 几天后仍然亮着，按下去接到一个早就不存在的位置。 */
         PaintResumeForget();
+        PaintResumeShowOnOled();   /* 第 4 行那行 "Resume:n/4" 一起清掉 */
         sys_ctrl.state = STATE_WAIT;
 				break;
 		case 'K'://开水泵
@@ -1378,6 +1524,10 @@ static void HandleCmd(uint8_t cmd, uint8_t from) {
         /* 先记断点再切状态：切状态那一下会把电机停掉（见状态机的退出块），
          * 之后 StepMotor_GetRemainOf 读到的就全是"空闲"。 */
         PaintCaptureResume();
+        /* 记没记得下要当场告诉人：记得下就是"能续"，记不下（停在转弯上、
+         * 剩不到 50mm）就是第 4 行空着。不写这一句的话，两种情况在屏幕上
+         * 完全一样，人只能靠按一下续画按钮去试。 */
+        PaintResumeShowOnOled();
         sys_ctrl.state = STATE_TING;
 				break;
 		case '+':   // 提速一档（单字节通道：蓝牙和上位机都能用）
@@ -1617,6 +1767,7 @@ void System_StateMachine(void) {
     SendStatusFrame();     /* 5Hz 上行状态，只发给树莓派 */
     SendHeadingFrame();    /* 5Hz 上行航向，未就绪时不发 */
     SendSpeedInfoFrame();  /* 变速立刻发，否则 1Hz 兜底 */
+    SendResumeInfoFrame(); /* 断点的长宽和边号：面板要能核对尺寸 */
 
     /* 速度的掉电保存：改完 2 秒、车停着、状态空闲时才真正写 flash。
      * 放在状态机之前 —— 状态机里那一轮可能刚把车开起来，先让这里
@@ -1763,9 +1914,8 @@ void System_StateMachine(void) {
                 Heading_MarkReference();
             }
 
-            Pump_On();
-
             if (resume) {
+                Pump_On();
                 /* 先把 flash 里这条断点抹掉，再起步。
                  *
                  * 顺序不能反：擦一页期间取指是停的，而脉冲是硬件定时器在
@@ -1786,8 +1936,19 @@ void System_StateMachine(void) {
                 Motion_ForwardFlatLR(paint_resume_left_mm, paint_resume_right_mm);
                 paint_resume_left_mm  = 0.0f;
                 paint_resume_right_mm = 0.0f;
+
+                /* 断点用掉了，第 4 行那行提示要跟着消失。 */
+                PaintResumeShowOnOled();
             } else {
                 paint_step = PAINT_EDGE1;
+
+                /* 第一条边的起点记进 flash。此刻车停着、泵关着，是整圈里
+                 * 少数几个能安全擦页的位置之一（见 PaintResumeMarkEdge）。
+                 * 从这里往后每条边的开头都会记一次，中途断电最多重画
+                 * 当前这一条边。 */
+                PaintResumeMarkEdge(paint_len_mm);
+
+                Pump_On();
                 Motion_ForwardFlat(paint_len_mm);
             }
 
@@ -2036,6 +2197,14 @@ void System_StateMachine(void) {
                     case PAINT_EDGE1:
                         if (!StepMotor_IsAnyRunning()) {
                             Pump_Off();
+
+                            /* 这条边已经走完，断点作废。不清的话，转弯那几步里
+                             * 断电，上电会从"这条边的起点"重走一整条 —— 而车已经
+                             * 转了一半，方向都不对，五米多的漆就喷到别处去了。
+                             * 转弯本身不能续（那是"少转了 90 度"），所以这里
+                             * 宁可让上电之后没有断点。 */
+                            PaintResumeClearNow();
+
                             Motion_TurnRight(PAINT_TURN_DEG);
                             paint_step = PAINT_TURN1;
                             OLED_ShowString(3, 1, "Turn1           ");
@@ -2043,7 +2212,6 @@ void System_StateMachine(void) {
                         break;
                     case PAINT_TURN1:
                         if (!StepMotor_IsAnyRunning()) {
-                            Pump_On();
                             /* 新的一条边从这一刻起算"直"。转弯本身带来的
                              * 角度偏差在这里归零 —— 边是直的，角的误差归
                              * CHASSIS_TURN_SCALE 管。 */
@@ -2051,14 +2219,27 @@ void System_StateMachine(void) {
                                 Heading_MarkReference();
                                 paint_trim_exhausted = 0;
                             }
-                            Motion_ForwardFlat(paint_wid_mm);
+                            /* 先把边号定下来，再记断点：记录里存的是
+                             * paint_step 的原值，存晚了一步就是上一条边。 */
                             paint_step = PAINT_EDGE2;
+                            PaintResumeMarkEdge(paint_wid_mm);
+
+                            Pump_On();
+                            Motion_ForwardFlat(paint_wid_mm);
                             OLED_ShowString(3, 1, "Paint:2/4       ");
                         }
                         break;
                     case PAINT_EDGE2:
                         if (!StepMotor_IsAnyRunning()) {
                             Pump_Off();
+
+                            /* 这条边已经走完，断点作废。不清的话，转弯那几步里
+                             * 断电，上电会从"这条边的起点"重走一整条 —— 而车已经
+                             * 转了一半，方向都不对，五米多的漆就喷到别处去了。
+                             * 转弯本身不能续（那是"少转了 90 度"），所以这里
+                             * 宁可让上电之后没有断点。 */
+                            PaintResumeClearNow();
+
                             Motion_TurnRight(PAINT_TURN_DEG);
                             paint_step = PAINT_TURN2;
                             OLED_ShowString(3, 1, "Turn2           ");
@@ -2066,7 +2247,6 @@ void System_StateMachine(void) {
                         break;
                     case PAINT_TURN2:
                         if (!StepMotor_IsAnyRunning()) {
-                            Pump_On();
                             /* 新的一条边从这一刻起算"直"。转弯本身带来的
                              * 角度偏差在这里归零 —— 边是直的，角的误差归
                              * CHASSIS_TURN_SCALE 管。 */
@@ -2074,14 +2254,27 @@ void System_StateMachine(void) {
                                 Heading_MarkReference();
                                 paint_trim_exhausted = 0;
                             }
-                            Motion_ForwardFlat(paint_len_mm);
+                            /* 先把边号定下来，再记断点：记录里存的是
+                             * paint_step 的原值，存晚了一步就是上一条边。 */
                             paint_step = PAINT_EDGE3;
+                            PaintResumeMarkEdge(paint_len_mm);
+
+                            Pump_On();
+                            Motion_ForwardFlat(paint_len_mm);
                             OLED_ShowString(3, 1, "Paint:3/4       ");
                         }
                         break;
                     case PAINT_EDGE3:
                         if (!StepMotor_IsAnyRunning()) {
                             Pump_Off();
+
+                            /* 这条边已经走完，断点作废。不清的话，转弯那几步里
+                             * 断电，上电会从"这条边的起点"重走一整条 —— 而车已经
+                             * 转了一半，方向都不对，五米多的漆就喷到别处去了。
+                             * 转弯本身不能续（那是"少转了 90 度"），所以这里
+                             * 宁可让上电之后没有断点。 */
+                            PaintResumeClearNow();
+
                             Motion_TurnRight(PAINT_TURN_DEG);
                             paint_step = PAINT_TURN3;
                             OLED_ShowString(3, 1, "Turn3           ");
@@ -2089,7 +2282,6 @@ void System_StateMachine(void) {
                         break;
                     case PAINT_TURN3:
                         if (!StepMotor_IsAnyRunning()) {
-                            Pump_On();
                             /* 新的一条边从这一刻起算"直"。转弯本身带来的
                              * 角度偏差在这里归零 —— 边是直的，角的误差归
                              * CHASSIS_TURN_SCALE 管。 */
@@ -2097,8 +2289,13 @@ void System_StateMachine(void) {
                                 Heading_MarkReference();
                                 paint_trim_exhausted = 0;
                             }
-                            Motion_ForwardFlat(paint_wid_mm);
+                            /* 先把边号定下来，再记断点：记录里存的是
+                             * paint_step 的原值，存晚了一步就是上一条边。 */
                             paint_step = PAINT_EDGE4;
+                            PaintResumeMarkEdge(paint_wid_mm);
+
+                            Pump_On();
+                            Motion_ForwardFlat(paint_wid_mm);
                             OLED_ShowString(3, 1, "Paint:4/4       ");
                         }
                         break;
@@ -2106,6 +2303,13 @@ void System_StateMachine(void) {
                         if (!StepMotor_IsAnyRunning()) {
                             Pump_Off();
                             paint_step = PAINT_DONE;
+
+                            /* 一圈画完了，断点必须当场作废。留着的话，下次上电
+                             * 会冒出"第 4 条边还剩 5.3 米"，按续画就是从画完的
+                             * 地方再走一遍。此刻车停着，当场擦是安全的。 */
+                            PaintResumeClearNow();
+                            PaintResumeShowOnOled();
+
                             sys_ctrl.state = STATE_WAIT;
                             OLED_ShowString(3, 1, "Paint Done      ");
                         }

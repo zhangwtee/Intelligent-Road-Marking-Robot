@@ -15,7 +15,14 @@ extern volatile uint32_t timer_counter;
 
 static uint16_t batt_mv;
 static uint8_t  batt_valid;
+static uint8_t  batt_absent;        /* 1 = 读到的不是电池（分压没接） */
 static uint32_t batt_ms;
+
+/* 最近几次的读数，用来算极差。悬空脚的读数是这样跳的：这一次 3.1V、
+ * 下一次 19.7V、再下一次 0.4V。一块真的电池在 4 秒里上下不会差 2V。 */
+static uint16_t batt_hist[BATT_HISTORY];
+static uint8_t  batt_hist_n;
+static uint8_t  batt_hist_i;
 
 /* ADC 单次转换，阻塞到 EOC。
  *
@@ -119,8 +126,12 @@ void Battery_Poll(void)
     raw = (uint16_t)(sum / BATT_OVERSAMPLE);
 
     if (raw < BATT_RAW_MIN) {
-        batt_mv    = 0;
-        batt_valid = 0;
+        /* 读到的是 0 附近：分压线断了，或者电阻根本没焊。这不是"电池没电"，
+         * 电量耗尽时引脚上仍然是 8~10V 那一路的真实电压。 */
+        batt_mv     = 0;
+        batt_valid  = 0;
+        batt_absent = 1;
+        batt_hist_n = 0;        /* 历史作废：接上之后要重新攒 */
         return;
     }
 
@@ -132,8 +143,42 @@ void Battery_Poll(void)
         mv = 65535u;
     }
 
-    batt_mv    = (uint16_t)mv;
-    batt_valid = 1;
+    batt_hist[batt_hist_i] = (uint16_t)mv;
+    batt_hist_i = (uint8_t)((batt_hist_i + 1u) % BATT_HISTORY);
+    if (batt_hist_n < BATT_HISTORY) {
+        batt_hist_n++;
+    }
+
+    /* 落在电池不可能出现的区间里：就是没接，或者分压比配错了。 */
+    if (mv < BATT_MIN_MV || mv > BATT_MAX_MV) {
+        batt_mv     = 0;
+        batt_valid  = 0;
+        batt_absent = 1;
+        return;
+    }
+
+    /* 攒够 8 个样本之后再看稳不稳。跳得厉害的是悬空脚，不是电池。
+     * 阈值见 battery.h：2V 足够放过电机启停那一下掉压。 */
+    if (batt_hist_n >= BATT_HISTORY) {
+        uint16_t lo = batt_hist[0];
+        uint16_t hi = batt_hist[0];
+        uint8_t  k;
+
+        for (k = 1; k < BATT_HISTORY; k++) {
+            if (batt_hist[k] < lo) { lo = batt_hist[k]; }
+            if (batt_hist[k] > hi) { hi = batt_hist[k]; }
+        }
+        if ((uint16_t)(hi - lo) > BATT_UNSTABLE_MV) {
+            batt_mv     = 0;
+            batt_valid  = 0;
+            batt_absent = 1;
+            return;
+        }
+    }
+
+    batt_mv     = (uint16_t)mv;
+    batt_valid  = 1;
+    batt_absent = 0;
 }
 
 uint16_t Battery_GetMv(void)
@@ -144,6 +189,11 @@ uint16_t Battery_GetMv(void)
 uint8_t Battery_IsValid(void)
 {
     return batt_valid;
+}
+
+uint8_t Battery_IsAbsent(void)
+{
+    return batt_absent;
 }
 
 uint8_t Battery_IsLow(void)

@@ -942,7 +942,18 @@ def test_battery_frame_roundtrip():
         frame.build_frame(frame.CMD_BATTERY, 0, b"\x00\x00\x00")
     )
     assert dead["batt_valid"] is False
-    assert dead["status"] == "电池 未接"
+    assert dead["batt_absent"] is False
+    assert dead["status"] == "电池 未读到"
+
+    # 分压电阻没焊：固件判出来"引脚上的不是电池"，单独一位。以前这两种
+    # 情况都显示 `---`，人分不清是固件坏了还是少焊两个电阻。
+    absent = frame.make_frame_record(
+        frame.build_frame(frame.CMD_BATTERY, 0, b"\x00\x00\x04")
+    )
+    assert absent["batt_absent"] is True
+    assert absent["batt_valid"] is False
+    assert absent["batt_low"] is False
+    assert absent["status"] == "电池 未接（无分压）"
 
 
 def test_battery_divider_stays_within_adc_range():
@@ -1209,10 +1220,14 @@ def test_clearing_the_breakpoint_updates_the_ram_copy():
     """
     cfg_c = (FIRMWARE_HW / "cfg.c").read_bytes().decode("gbk", errors="replace")
     body = _firmware_body(cfg_c, r"uint8_t Cfg_ClearResume\(void\)")
+    assert "CfgWriteResume(0)" in body, "Cfg_ClearResume 里没写 flash"
 
-    write = body.find("CfgWritePage")
-    clear = body.find("cfg_resume.valid = 0")
-    assert write != -1, "Cfg_ClearResume 里没写 flash"
+    # 落盘和更新副本都在 CfgWriteResume 里 —— 写断点和抹断点走同一条路,
+    # 少一处"只在一半的分支里更新副本"的机会。
+    inner = _firmware_body(cfg_c, r"static uint8_t CfgWriteResume\(const CfgResume \*rec\)")
+    write = inner.find("CfgAppend")
+    clear = inner.find("cfg_resume.valid = 0")
+    assert write != -1, "CfgWriteResume 里没写 flash"
     assert clear != -1, "擦完没有更新 RAM 里的副本"
     assert clear > write, "先清副本再写 flash，写失败了副本就已经是错的"
 
@@ -1232,10 +1247,16 @@ def test_breakpoint_is_written_only_when_the_car_is_standing_still():
 
     service = _firmware_body(text, r"static void PaintResumeService\(void\)")
     stop = service.find("StepMotor_IsAnyRunning")
-    write = service.find("Cfg_SaveResume")
+    write = service.find("PaintResumeFlush")
     assert stop != -1, "写断点之前没有查车停没停"
     assert write != -1, "PaintResumeService 里没有写 flash"
     assert stop < write, "先写 flash 再查车停没停，顺序反了"
+
+    # 真正落盘那一步在 PaintResumeFlush 里。多一层是因为画车位每条边
+    # 开头都要写一次（见 test_every_edge_start_writes_the_breakpoint），
+    # 那些地方和这里用的是同一段代码，不能各抄一遍。
+    flush = _firmware_body(text, r"static uint8_t PaintResumeFlush\(void\)")
+    assert "Cfg_SaveResume" in flush, "写断点的入口没有真去写 flash"
 
     # 失败要退避，不然每一圈都重擦一次页，主循环一直被它按住。
     assert "PAINT_RESUME_RETRY_MS" in service, "写失败没有退避"
@@ -1360,6 +1381,204 @@ def test_paint_watchdog_times_out_per_segment():
         "超时退出时没有记断点：已经喷完的几条边白费"
     assert tail.find("PaintCaptureResume();") < tail.find("STATE_WAIT"), \
         "先切状态再记断点 —— 切状态那一下电机就停了，剩余量读出来是空的"
+
+
+def test_resume_info_frame_carries_the_dimensions():
+    """断点的长宽要真的报给面板。
+
+    固件上电已经把断点的长宽还原了（续画要用），但以前没有任何一帧带这个
+    信息：面板上那两个输入框是它自己上次的值，人要核对“车上记的到底是
+    多大”只能靠猜或者按一下续画看车动没动 —— 而那时漆已经在喷了。
+
+    这一帧补的就是这个缺口。续画本身不受影响，所以它不是功能缺陷，
+    是“一切正常但有一个数没人能证实”，最难被发现的那类。
+    """
+    rec = frame.make_frame_record(
+        frame.build_frame(frame.CMD_RESUME_INFO, 0,
+                          b"\x14\xB4\x09\xC4\x05")   # 5300x2500，第 3 条边
+    )
+    assert rec["resume_len_mm"] == 5300, rec
+    assert rec["resume_wid_mm"] == 2500, rec
+    assert rec["resume_step"] == 5, rec
+    assert rec["resume_valid"] is True
+    assert rec["status"] == "断点 5300x2500mm 第3条边", rec["status"]
+
+    # 边号 0 才是“没有断点”。不能拿长宽是不是 0 去判 —— 一份 0x0 的记录
+    # 也可能是坏帧，而“没有断点”有明确的编码。
+    none = frame.make_frame_record(
+        frame.build_frame(frame.CMD_RESUME_INFO, 0, b"\x00\x00\x00\x00\x00")
+    )
+    assert none["resume_valid"] is False
+    assert none["status"] == "断点 无"
+
+
+def test_every_edge_start_writes_the_breakpoint():
+    """四条边的开头都要把断点写进 flash，不然断电就整圈白画。
+
+    急停只有人按了才有，断电是随时都可能发生的。以前只有按 T 才留得下
+    断点：画到第三条边的时候电池掉了，上电什么都没有，只能从第一条边
+    重来，而车早就不在起点了。
+
+    写点挑在“车刚停稳、泵还关着”的那一拍（上一条边走完、转弯、电机停了），
+    所以那一次擦页既不会多走一步，也不会在漆线上留一个点。
+    """
+    text = FIRMWARE_C.read_bytes().decode("gbk", errors="replace")
+
+    assert text.count("PaintResumeMarkEdge(paint_len_mm);") == 2, \
+        "第 1、3 条边（长边）的开头没有记断点"
+    assert text.count("PaintResumeMarkEdge(paint_wid_mm);") == 2, \
+        "第 2、4 条边（宽边）的开头没有记断点"
+
+    body = _firmware_body(text, r"static void PaintResumeMarkEdge\(float edge_mm\)")
+    assert "StepMotor_IsAnyRunning" in body, \
+        "车还在转也去擦页了：擦一页期间取指是停的，那一段会走少"
+    assert "PaintResumeFlush" in body, "只记了 RAM，没有落 flash"
+
+    # 画完一圈要把断点作废，否则下次上电会冒出“第 4 条边还剩 5.3 米”。
+    done = text.find("Paint Done")
+    assert done != -1
+    tail = text[max(0, done - 900):done]
+    assert "PaintResumeClearNow" in tail, \
+        "画完之后没有清断点：下次上电会从画完的地方再走一遍"
+
+
+def test_flash_keeps_two_copies_of_each_record():
+    """速度和断点各两份，写新的那份时旧的那份原封不动。
+
+    以前两个挤在同一页：写一次要先擦整页、再把两样都从头写回去。擦完还没
+    写完的那一刻掉电，两样一起没了 —— 校验字只能判出“这条无效”，保留不了
+    上一份。拆成四页之后最坏情况变成“这一次没存上”。
+    """
+    cfg = (FIRMWARE_HW / "cfg.c").read_bytes().decode("gbk", errors="replace")
+
+    pages = {}
+    for name in ("CFG_SPEED_PAGE0", "CFG_SPEED_PAGE1",
+                 "CFG_RESUME_PAGE0", "CFG_RESUME_PAGE1"):
+        m = re.search(
+            r"#define\s+" + name + r"\s+\(CFG_IMAGE_END - (\d+)u \* CFG_PAGE_SIZE\)",
+            cfg,
+        )
+        assert m, f"cfg.c 里没有 {name}"
+        pages[name] = int(m.group(1))
+    assert len(set(pages.values())) == 4, f"四页地址有重叠: {pages}"
+
+    # 两种记录都要走页内追加：写的时候记着"上一次写到哪页"，页满才换。
+    speed = _firmware_body(cfg, r"uint8_t Cfg_SaveSpeed\(uint16_t arr\)")
+    assert "CfgAppend(&cfg_speed_page" in speed, \
+        "速度没有走页内追加，改一次速就擦一页"
+    resume = _firmware_body(cfg, r"static uint8_t CfgWriteResume\(const CfgResume \*rec\)")
+    assert "CfgAppend(&cfg_resume_page" in resume, \
+        "断点没有走页内追加，记一次就擦一页"
+
+    # 读的时候要比序号，不是“有一份就用”。
+    assert "(int16_t)(seq - cfg_speed_seq) > 0" in cfg, "速度两份没比序号"
+    assert "(int16_t)(seq - cfg_resume_seq) > 0" in cfg, "断点两份没比序号"
+
+
+def test_clearing_a_breakpoint_writes_a_tombstone():
+    """抹断点是写一条“没有断点”的记录，不是把那一页擦空。
+
+    两页交替写：最新那份在 A，B 里躺着更旧的一份。抹的时候只把 A 擦空的
+    话，B 立刻又变成“最新” —— 断点自己复活了，而人刚刚按了 W。
+    """
+    cfg = (FIRMWARE_HW / "cfg.c").read_bytes().decode("gbk", errors="replace")
+
+    body = _firmware_body(cfg, r"static uint8_t CfgWriteResume\(const CfgResume \*rec\)")
+    assert "rec != 0" in body, "写函数没有区分“墓碑”和真记录"
+
+    read = _firmware_body(cfg, r"static uint8_t CfgScanResume\(uint32_t page, uint16_t \*seq, CfgResume \*out\)")
+    assert "rec.step != 0u" in read, "扫页时没有区分“墓碑”和真记录"
+    assert "best_seq" in read and "(int16_t)(s - best_seq) > 0" in read, \
+        "墓碑没参与“哪条最新”的比较，另一页那份断点会复活"
+
+
+def test_battery_can_tell_a_missing_divider_from_a_flat_battery():
+    """分压电阻没焊时不能显示一个像样的电压。
+
+    PC0 悬空读回来的是一串乱跳的数。按“读到的就是电压”去显示，界面上会
+    出现 8.3V 或者 21.6V —— 看着像一块快没电的电池，人端着万用表去量，
+    电池是满的，最后开始怀疑板子。
+    """
+    h = FIRMWARE_BATTERY_H.read_bytes().decode("gbk", errors="replace")
+    c = (FIRMWARE_HW / "battery.c").read_bytes().decode("gbk", errors="replace")
+
+    for name in ("BATT_MIN_MV", "BATT_MAX_MV", "BATT_UNSTABLE_MV", "BATT_HISTORY"):
+        assert re.search(r"#define\s+" + name, h), f"battery.h 里没有 {name}"
+
+    body = _firmware_body(c, r"void Battery_Poll\(void\)")
+    assert "mv < BATT_MIN_MV" in body and "mv > BATT_MAX_MV" in body, \
+        "只按“读不到”判：读到一个离谱的值照样会显示成人话"
+    assert "BATT_UNSTABLE_MV" in body, "没有按极差判悬空脚"
+    assert body.count("batt_absent = 1") >= 3, \
+        "三个判据里有的只清了 valid、没标 absent"
+
+    assert "Battery_IsAbsent" in c, "没有对外报“没接”的接口"
+
+
+def test_resume_flag_only_lights_up_when_it_can_really_resume():
+    """0x40 的含义是“现在按续画能走”，不是“flash 里有个断点”。
+
+    现在每条边开头都写一份断点（断电保护），整个画车位期间都有。只看
+    “有没有断点”的话，按钮在车正跑着的时候也亮着，按下去被回绝 ——
+    比灰着更让人糊涂。
+    """
+    text = FIRMWARE_C.read_bytes().decode("gbk", errors="replace")
+    i = text.find("flags |= 0x40;")
+    assert i != -1, "状态帧里没有 0x40"
+
+    cond = text[max(0, i - 900):i]
+    assert "STATE_WAIT" in cond and "STATE_TING" in cond, \
+        "0x40 没跟着“现在能不能真的续”走"
+
+
+def test_breakpoint_write_does_not_erase_a_page():
+    """记一条断点不能擦页 —— 一圈要写八九条。
+
+    F103 擦一页期间取指是停的，而画车位在每条边开头、每条边走完都要记一次。
+    如果每次写都擦一页，一万次的擦写寿命几圈之内就磨掉了。页内追加只编程
+    五个字，一页能装一百多条，十几卷才轮到一次擦除。
+
+    这条不是"优化"，是"每条边都记"能不能成立的前提：不改成追加，那个功能
+    的代价就是 flash 寿命，而寿命耗尽的表现是"速度和断点都存不住了"，看着
+    像颗坏片子。
+    """
+    cfg = (FIRMWARE_HW / "cfg.c").read_bytes().decode("gbk", errors="replace")
+    body = _firmware_body(
+        cfg,
+        r"static uint8_t CfgAppend\(uint32_t \*page, uint8_t slot, uint8_t words_n,[^)]*\)",
+    )
+
+    assert "CFG_WORD_BLANK" in body, "追加时没有找空白格"
+    assert "CfgProgramWords" in body, "没有走「只编程不擦除」的路径"
+
+    # 擦除只允许出现在「这页满了」那条分支里。
+    m = re.search(r"if \(addr \+ span > page_end\) \{(.*?)\n    \}", body, re.S)
+    assert m, "CfgAppend 里找不到「这页满了」的判断"
+    assert "CfgErasePage" in m.group(1), "擦页不在「这页满了」的分支里"
+
+    outside = body[:m.start()] + body[m.end():]
+    assert "CfgErasePage" not in outside, "除了页满，还有别的地方会擦页"
+
+
+def test_walking_off_an_edge_voids_the_breakpoint():
+    """一条边走完、进转弯之前要把断点作废。
+
+    不作废的后果：转弯那几步里断电，上电之后断点还写着"这条边从起点开始"，
+    按续画车就从当前位置、朝一个转了半截的方向走完 5.3 米 —— 漆喷到别处去，
+    而现象很像转角系数标错了，人会去调错地方。
+
+    转弯本身续不了（那是"少转了 90 度"），所以这里宁可让上电之后没有断点。
+    """
+    text = FIRMWARE_C.read_bytes().decode("gbk", errors="replace")
+
+    for edge in ("PAINT_EDGE1", "PAINT_EDGE2", "PAINT_EDGE3"):
+        i = text.find("case " + edge + ":")
+        assert i != -1, f"找不到 {edge}"
+        turn = text.find("Motion_TurnRight", i)
+        assert turn != -1, f"{edge} 后面没有转弯"
+        seg = text[i:turn]
+        assert "PaintResumeClearNow" in seg, \
+            f"{edge} 走完没有作废断点：转弯中断电会从边的起点错续一整条"
 
 
 if __name__ == "__main__":

@@ -191,6 +191,15 @@ class MainWindow(QWidget):
         self.battery_label.setStyleSheet("font-size:14px; color:#777;")
         left_layout.addWidget(self.battery_label)
 
+        # 断点：固件 flash 里存着的那一圈长宽和第几条边。
+        # 以前它只活在下位机里 —— 面板上的长宽输入框还是自己上次的值，
+        # 人要核对"车上记的到底是多大"没有任何地方能看。续画本身不受
+        # 影响（固件只认断点），所以这是可观测性缺口，不是功能缺陷。
+        self.resume_label = QLabel("断点  --")
+        self.resume_label.setAlignment(Qt.AlignCenter)
+        self.resume_label.setStyleSheet("font-size:14px; color:#777;")
+        left_layout.addWidget(self.resume_label)
+
         # 状态帧（5Hz）和航向帧（5Hz）都会想改上面这行字。两个源各写各的，
         # 界面就会每秒跳五次。约定：就绪之后这行只归航向帧管，状态帧只
         # 负责把这三个标记更新下来 —— 见 _apply_gyro_flags。
@@ -518,6 +527,9 @@ class MainWindow(QWidget):
         elif cmd == frame.CMD_BATTERY:
             self._apply_battery(item)
 
+        elif cmd == frame.CMD_RESUME_INFO:
+            self._apply_resume_info(item)
+
         elif cmd == frame.CMD_HEADING:
             self._update_heading(item)
 
@@ -549,6 +561,10 @@ class MainWindow(QWidget):
 
         # 电池帧 1Hz，同上：只更新上面那行字。
         if item.get("kind") == "frame" and item.get("cmd") == frame.CMD_BATTERY:
+            return
+
+        # 断点帧 1Hz，同上。
+        if item.get("kind") == "frame" and item.get("cmd") == frame.CMD_RESUME_INFO:
             return
 
         if not self.recv_pause_checkbox.isChecked():
@@ -756,6 +772,34 @@ class MainWindow(QWidget):
             else "固件还没写 flash（改完 2 秒、车停着才写），现在断电会回到上次存的档位"
         )
 
+    def _apply_resume_info(self, item):
+        """把固件 flash 里那份断点画到状态区。"
+
+        这一行解决的是"核对不了"：固件上电已经把断点的长宽还原了，续画也
+        按它走，但面板一直没地方看。人不放心的时候只能按一下续画看车动没动，
+        而那会儿漆已经在喷了。
+
+        长宽不往上面那两个输入框里填：输入框是"我打算画多大"，这个断点是
+        "车上记着多大"。自动填进去会让人以为尺寸改过了，而续画只认断点 ——
+        改了也白改，人还以为生效了。
+        """
+        if not item.get("resume_valid"):
+            self.resume_label.setText("断点  无")
+            self.resume_label.setStyleSheet("font-size:14px; color:#777;")
+            self.resume_label.setToolTip("固件 flash 里没有断点")
+            return
+
+        length = item.get("resume_len_mm", 0)
+        width = item.get("resume_wid_mm", 0)
+        step = frame.PAINT_STEP_LABELS.get(item.get("resume_step", 0), "?")
+
+        self.resume_label.setText(f"断点  {length}x{width}mm  停{step}")
+        self.resume_label.setStyleSheet("font-size:14px; color:#1a7f37;")
+        self.resume_label.setToolTip(
+            "固件 flash 里存着的断点，续画就按这个尺寸和位置接下去。\n"
+            "它和上面输入框里的值不是一回事 —— 续画只认断点。"
+        )
+
     def _apply_battery(self, item):
         """把电池帧画到状态区。
 
@@ -765,12 +809,24 @@ class MainWindow(QWidget):
         门限不由这一侧判断，只认固件给的 BATT_FLAG_LOW：两边各写一遍，
         改一处忘另一处就会出现"车上在响、界面还是绿的"。
         """
+        if item.get("batt_absent"):
+            # 分压电阻没焊的时候 PC0 悬空，读回来是乱跳的值。以前这种情况
+            # 显示 `---`，看着像固件坏了 —— 实际是少两个电阻。
+            self.battery_label.setText("电池  未接")
+            self.battery_label.setStyleSheet("font-size:14px; color:#777;")
+            self.battery_label.setToolTip(
+                "引脚上读到的不是电池的电压：分压电阻没焊，或者那根线断了。\n"
+                "接法：电池正极 -> 100k -> PC0 -> 10k -> 地，中间并 100nF 到地。\n"
+                "接上之后这一行会自己变成电压，不用重启。"
+            )
+            return
+
         if not item.get("batt_valid"):
             self.battery_label.setText("电池  ---")
             self.battery_label.setStyleSheet("font-size:14px; color:#777;")
             self.battery_label.setToolTip(
-                "固件报采样无效：分压线没接好，或 ADC 读到的接近 0。"
-                "接法是电池正极 -> 100k -> PC0 -> 10k -> 地。"
+                "这一轮没读到（ADC 超时），下一轮会重试。"
+                "一直是这样就查分压线。"
             )
             return
 

@@ -96,6 +96,13 @@ CMD_BATTERY = 0x85      # DATA[0:1]=电池电压 mV 大端，DATA[2]=标志
                         # 1Hz 一帧。以前车上还剩多少电只有那块 OLED 知道，
                         # 人在树莓派前跑到一半断电，事后再回想是"电池没电"
                         # 还是"车停了"根本分不清。
+CMD_RESUME_INFO = 0x86  # DATA[0:1]=断点的长 mm，DATA[2:3]=宽 mm
+                        # DATA[4]=边号（PaintStep 原值），0=没有断点
+                        # 固件上电已经把断点的长宽还原了，但以前没有任何一帧
+                        # 告诉面板 —— 输入框还是它自己上次的值，人要核对
+                        # "车上记的到底是 5.3x2.5 还是 5.0x2.3"没地方看。
+                        # 续画本身不受影响（固件只认断点），所以这是可观测性
+                        # 缺口，不是功能缺陷。
 
 # STATUS 帧 DATA[2] 的标志位，和固件 SendStatusFrame 里那几行 |= 一一对应。
 # 以前是散落在 UI 里的魔法数字，加一位就要在两边各改一处，改漏了不报错。
@@ -117,6 +124,9 @@ SPEED_FLAG_SAVED = 0x01     # 已写进固件 flash，断电不丢
 # 而且这种不一致只在真没电那天才暴露。
 BATT_FLAG_VALID = 0x01      # 采样有效，电压可信
 BATT_FLAG_LOW = 0x02        # 低于固件 battery.h 的门限
+BATT_FLAG_ABSENT = 0x04     # 引脚上根本没有电池（分压没接 / 线掉了）。
+                            # 和"采样无效"分开：那个是这一轮没读到，下一轮
+                            # 可能就好了；这个是得有人去接那两颗电阻。
 
 # 陀螺仪状态码，和固件 heading.h 的 HeadingState 一一对应
 GYRO_STATE_NAMES = {
@@ -172,7 +182,7 @@ CMD_NAMES = {
     CMD_STATUS: "状态",
     CMD_HEADING: "航向",
     CMD_SPEED_INFO: "当前速度",
-    CMD_BATTERY: "电池",
+    CMD_RESUME_INFO: "断点",
 }
 
 # 参数范围（和固件 proto.h 里的 PROTO_* 一一对应）
@@ -401,12 +411,21 @@ def describe(cmd: int, data: bytes) -> str:
         arr = (data[0] << 8) | data[1]
         tail = " 已存" if data[2] & SPEED_FLAG_SAVED else " 待存"
         return f"速度 {arr}{tail}"
+    if cmd == CMD_RESUME_INFO:
+        if data[4] == 0:
+            return "断点 无"
+        length = (data[0] << 8) | data[1]
+        width = (data[2] << 8) | data[3]
+        step = PAINT_STEP_LABELS.get(data[4], str(data[4]))
+        return f"断点 {length}x{width}mm {step}"
     if cmd == CMD_BATTERY:
         mv = (data[0] << 8) | data[1]
+        if data[2] & BATT_FLAG_ABSENT:
+            # 分压电阻没接的时候 PC0 是悬空的，读回来是个乱跳的值。
+            return "电池 未接（无分压）"
         if not data[2] & BATT_FLAG_VALID:
-            # 没接分压线时固件读到的是 0。显示 0.0V 会让人去充电，
-            # 而真正坏的是那根线。
-            return "电池 未接"
+            # 这一轮没读到（ADC 超时），下一轮可能就好了。
+            return "电池 未读到"
         tail = " 低压" if data[2] & BATT_FLAG_LOW else ""
         return f"电池 {mv / 1000.0:.1f}V{tail}"
     if cmd == CMD_HEADING:
@@ -439,10 +458,16 @@ def make_frame_record(frame: bytes) -> dict:
         record["speed_arr"] = (data[0] << 8) | data[1]
         record["speed_saved"] = bool(data[2] & SPEED_FLAG_SAVED)
 
+    if cmd == CMD_RESUME_INFO:
+        record["resume_len_mm"] = (data[0] << 8) | data[1]
+        record["resume_wid_mm"] = (data[2] << 8) | data[3]
+        record["resume_step"] = data[4]
+        record["resume_valid"] = bool(data[4])
     if cmd == CMD_BATTERY:
         record["batt_mv"] = (data[0] << 8) | data[1]
         record["batt_valid"] = bool(data[2] & BATT_FLAG_VALID)
         record["batt_low"] = bool(data[2] & BATT_FLAG_LOW)
+        record["batt_absent"] = bool(data[2] & BATT_FLAG_ABSENT)
 
     if cmd == CMD_HEADING:
         record["heading_deg"] = _s16(data[0], data[1]) / 100.0
