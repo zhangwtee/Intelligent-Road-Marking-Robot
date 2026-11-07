@@ -374,7 +374,11 @@ def test_start_track_sends_move_frame():
 
 
 def test_stop_track_turns_pump_off_before_stopping():
-    """先关泵再停车。顺序反了车停了泵还在出漆。"""
+    """先关泵再停车。顺序反了车停了泵还在出漆。
+
+    停车的单字节是 'W' 不是 'T'：'T' 把固件停在 TING，而画车位、二次喷涂
+    都只认 WAIT，撤完相机还得再补一条才能发命令。'W' 一条就回到 WAIT。
+    """
     s = FakeSerial()
     w = camera_widget.CameraWidget(serial_mgr=s, mode="track")
     w.start_track()
@@ -383,7 +387,51 @@ def test_stop_track_turns_pump_off_before_stopping():
     w.stop_track()
 
     assert frames_of(s, frame.CMD_PUMP), "没发关泵"
-    assert s.sent[-1] == b"T", "最后一条应该是急停"
+    assert s.sent[-1] == b"W", "最后一条应该是回 WAIT 的停止命令"
+
+
+def test_stop_track_clears_the_pump_flag():
+    """只发关泵帧、不改 pump_on 的话，下次巡线头几帧该喷的地方不喷。
+
+    _apply_pump(True) 会因为"值没变"直接 return，而固件那边泵已经关了。
+    """
+    s = FakeSerial()
+    w = camera_widget.CameraWidget(serial_mgr=s, mode="track")
+    w.start_track()
+    w.pump_on = True
+
+    w.stop_track()
+
+    assert w.pump_on is False, "pump_on 还留着，下次巡线发不出开泵帧"
+
+    # 再巡线，第一次"该喷"必须真的发出一帧开泵
+    before = len(frames_of(s, frame.CMD_PUMP))
+    w._apply_pump(True)
+    after = frames_of(s, frame.CMD_PUMP)
+    assert len(after) > before, "重新巡线时开泵被「值没变」挡掉了"
+    assert after[-1][3] == 1, "最后一帧应该是开泵"
+
+
+def test_voted_level_comes_from_the_frames_that_voted():
+    """补喷档位取"与投票结论一致的那几帧"，不是当前帧。
+
+    当前帧判"看不清"时档位是 0，直接拿它去补会被夹成 200mm。
+    """
+    w = camera_widget.CameraWidget()
+
+    w.votes.append((QUALITY_WORN, 5))
+    w.votes.append((QUALITY_WORN, 5))
+    w.votes.append((QUALITY_WORN, 4))
+    w.votes.append((QUALITY_UNSURE, 0))
+
+    assert w._voted_quality() == QUALITY_WORN
+    assert w._voted_level(QUALITY_WORN) == 4, "应该取最近一帧磨损给出的档位"
+
+    w.votes.clear()
+    for _ in range(3):
+        w.votes.append((QUALITY_UNSURE, 0))
+
+    assert w._voted_level(QUALITY_WORN) == 1, "没有证据时退回最保守的档位"
 
 
 def test_trim_is_rate_limited():

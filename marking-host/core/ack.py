@@ -164,10 +164,19 @@ class AckTracker:
                 continue
 
             if resend is not None and item.retries < self.max_retries:
+                # 先看写没写出去再记账。写失败（串口断了、写异常）时把
+                # retries 加一、把计时推到 now，等于告诉调用方"这条重发过"——
+                # 真正断线要再等一个超时才暴露，retried 也是虚的。
+                # 而且这条命令根本没上总线，等下去也不会有人来 ACK 它。
+                if not resend(item.payload):
+                    del self.pending[seq]
+                    self.timed_out += 1
+                    dead.append(item)
+                    continue
+
                 item.retries += 1
                 item.sent_at = now          # 重新计时，不是"宽限"
                 self.retried += 1
-                resend(item.payload)
                 resent.append(item)
                 continue
 

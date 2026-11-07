@@ -709,6 +709,134 @@ def test_resume_info_frame_stays_out_of_the_log():
     assert w.recv_log.document().blockCount() == before, "断点帧刷进接收日志了"
 
 
+def test_every_downstream_frame_gets_its_own_seq():
+    """下行帧序号必须自己递增。
+
+    固件按 (seq, cmd) 做 1 秒去重，只看这两个字段、不看内容。序号恒为 0
+    时，同一类命令 1 秒内发第二次会被当成重传：固件回上一次的结果，命令
+    根本没执行 —— 拖两下滑条、连按两下重新标零，都属于这种。
+    """
+    w = make_window()
+
+    for _ in range(3):
+        w.send_frame(frame.build_ping(w._next_seq()))
+
+    seqs = [f[2] for f in w.serial_mgr.sent]
+    assert seqs == [1, 2, 3], f"序号没有递增: {seqs}"
+
+
+def test_two_speed_changes_are_not_swallowed_as_one():
+    """连着改两次速度，两条帧的序号不能相同。
+
+    相同的话固件把第二条当重传，回上一次的结果，车还停在第一个值上 ——
+    而界面上滑条已经在第二个值了。
+    """
+    w = make_window()
+
+    w._send_speed(600)
+    w._send_speed(500)
+
+    speeds = [f for f in w.serial_mgr.sent if f[1] == frame.CMD_SPEED]
+    assert len(speeds) == 2, f"应该发两条速度帧，实际 {len(speeds)}"
+    assert speeds[0][2] != speeds[1][2], "两条速度帧同序号，第二条会被丢掉"
+
+
+def test_estop_does_not_claim_success_when_the_port_is_closed():
+    """串口没开时，状态栏不能写"紧急停止"。
+
+    急停这种键上，界面显示"已发送"而实际一个字节都没出去，比日志难看
+    要紧得多。
+    """
+    w = make_window()
+
+    w.serial_mgr.send = lambda data: False
+    w.btn_estop.click()
+
+    assert "未发出" in w.status_label.text(), w.status_label.text()
+
+
+def test_respray_stops_the_tracking_loop_first():
+    """巡线中点二次喷涂：车必须停下、泵必须关掉。
+
+    二次喷涂要车停着（固件只在 WAIT 收 RESPRAY）。这条路径以前跳过了撤
+    相机 —— 相机窗口关了，车继续走完这一段，泵还开着。
+    """
+    w = make_window()
+
+    class Stub:
+        mode = "track"
+
+        def __init__(self):
+            self.stopped = False
+
+        def stop_track(self):
+            self.stopped = True
+
+    stub = Stub()
+    w.camera_widget = stub
+    w.btn_track.setChecked(True)
+
+    # 别真去开摄像头
+    opened = []
+    w.open_camera_window = lambda label, mode=None: opened.append(label)
+    w.close_camera_window = lambda: None
+
+    btn = [b for b in w.control_buttons if b.text() == "二次喷涂"][0]
+    btn.click()
+
+    assert stub.stopped, "巡线没停就进了二次喷涂"
+    assert w.btn_track.isChecked() is False
+    assert opened == ["二次喷涂"]
+
+    w.camera_widget = None
+
+
+def test_closing_the_camera_window_releases_the_reference():
+    """点右上角 X 之后引用必须放掉。
+
+    留着的话，下次撤相机拿到的是一个已经关掉的控件，窗口对象也一直挂着
+    不释放 —— 每开一次多一个。
+    """
+    w = make_window()
+
+    class StubWidget:
+        mode = "view"
+
+        def __init__(self):
+            self.stopped = False
+
+        def stop_camera(self):
+            self.stopped = True
+
+        def stop_track(self):
+            pass
+
+    class StubWin:
+        def __init__(self):
+            self.deleted = False
+
+        def close(self):
+            pass
+
+        def deleteLater(self):
+            self.deleted = True
+
+    class Ev:
+        def accept(self):
+            pass
+
+    widget, win = StubWidget(), StubWin()
+    w.camera_window = win
+    w.camera_widget = widget
+
+    w.camera_close_event(Ev())
+
+    assert widget.stopped, "关窗口时摄像头没停"
+    assert win.deleted, "窗口没排进删除队列"
+    assert w.camera_window is None, "窗口引用还留着"
+    assert w.camera_widget is None, "控件引用还留着"
+
+
 if __name__ == "__main__":
     for name in sorted(n for n in globals() if n.startswith("test_")):
         globals()[name]()

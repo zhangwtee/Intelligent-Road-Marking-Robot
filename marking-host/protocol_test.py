@@ -1581,6 +1581,75 @@ def test_walking_off_an_edge_voids_the_breakpoint():
             f"{edge} 走完没有作废断点：转弯中断电会从边的起点错续一整条"
 
 
+def test_status_frame_pulse_is_big_endian_on_the_firmware_side():
+    """固件发脉冲必须高字节在前。
+
+    全协议的多字节字段都是大端（速度、航向、电池、断点），只有这一处以前
+    写成低字节在前。上位机按大端解，5000 脉冲会显示成 34835 —— 看着像
+    编码器丢步，其实只是字节序反了。
+    """
+    src = FIRMWARE_C.read_text(encoding="gbk")
+
+    assert "d[3] = (uint8_t)((pulse >> 8) & 0xFF);" in src, "脉冲高字节没放前面"
+    assert "d[4] = (uint8_t)(pulse & 0xFF);" in src
+    assert "d[3] = (uint8_t)(pulse & 0xFF);" not in src, "还是低字节在前"
+
+
+def test_trim_is_a_total_not_an_increment():
+    """Motion_Trim 收的是"这一段累计该纠到多少"，不是"再纠这么多"。
+
+    两个调用方算出来的都是几何上的绝对量。当增量加的话，同一个期望值每发
+    一次就累加一次：误差 2 度一次十几毫米，几百毫秒就撞上累计上限，这条边
+    剩下的路一个脉冲都不纠 —— 而日志里每一拍都是 OK。
+    """
+    src = (FIRMWARE_HW / "motion.c").read_text(encoding="gbk")
+
+    start = src.find("uint8_t Motion_Trim")
+    assert start != -1
+    body = src[start:src.find("\n}", start)]
+
+    assert "step = want - s_trim_accum;" in body, "没有按差值落地"
+    assert "StepMotor_AdjustTarget(MOTOR1, +step)" in body
+    assert "s_trim_accum + " not in body, "还在把这一次的量加到上一次上"
+
+
+def test_stopping_the_tracking_loop_returns_the_firmware_to_wait():
+    """撤相机发的必须是 'W'。
+
+    'T' 停在 TING，而新画一条车位只认 WAIT：撤完相机紧接着发画车位会被回
+    ERR_STATE，用户得按第二次才知道发生了什么事。
+    """
+    src = (Path(__file__).resolve().parent / "ui" / "camera_widget.py").read_text(
+        encoding="utf-8"
+    )
+
+    start = src.find("def stop_track")
+    assert start != -1
+    body = src[start:src.find("\n    def ", start + 10)]
+
+    assert 'send(b"W")' in body, "停车发的不是 'W'，撤完相机回不到 WAIT"
+    assert 'send(b"T")' not in body, "还在发 'T'，状态会停在 TING"
+    assert "self.pump_on = False" in body, "pump_on 没清，下次巡线头几帧不喷"
+
+
+def test_every_downstream_frame_carries_a_seq():
+    """主窗口发帧必须带上自己递增的序号。
+
+    固件按 (seq, cmd) 去重，不看内容。序号恒为 0 的话，同一类命令 1 秒内
+    发第二次会被当成重传 —— 命令根本没执行，回执还是上一次的 OK。
+    """
+    src = (Path(__file__).resolve().parent / "ui" / "main_window.py").read_text(
+        encoding="utf-8"
+    )
+
+    for call in ("build_gyro(sub,", "build_gyro(frame.GYRO_RECAL,",
+                 "build_gyro(frame.GYRO_MEASURE,", "build_speed(arr,"):
+        assert call in src, f"{call} 没带 seq"
+
+    assert "self._next_seq()" in src
+    assert "build_paint(length, width, heading=heading," in src
+
+
 if __name__ == "__main__":
     for name in sorted(n for n in globals() if n.startswith("test_")):
         globals()[name]()

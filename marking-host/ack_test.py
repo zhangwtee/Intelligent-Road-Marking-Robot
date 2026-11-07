@@ -15,6 +15,18 @@ def _sent_frame(cmd, seq, data=b""):
     return frame.build_frame(cmd, seq, data)
 
 
+def _recorder(calls):
+    """假的写串口函数：记下每一次重发，并如实返回"写出去了"。
+
+    返回 None 的话新逻辑会当成"串口断了"，重发不记账、直接判超时 ——
+    这正是 test_resend_is_not_counted_when_the_port_is_closed 要验的那条。
+    """
+    def _fn(raw):
+        calls.append(raw)
+        return True
+    return _fn
+
+
 def test_ok_round_trip():
     t = AckTracker()
     raw = _sent_frame(frame.CMD_RESPRAY, 7)
@@ -71,13 +83,13 @@ def test_resend_once_then_give_up():
     t.register(_sent_frame(frame.CMD_MOVE, 9), now=0.0)
 
     calls = []
-    dead, resent = t.expire(now=0.31, resend=calls.append)
+    dead, resent = t.expire(now=0.31, resend=_recorder(calls))
     assert len(resent) == 1 and dead == []
     assert len(calls) == 1
     assert t.retried == 1
 
     # 重发后又过了一个超时窗口，这次不再重发
-    dead, resent = t.expire(now=0.62, resend=calls.append)
+    dead, resent = t.expire(now=0.62, resend=_recorder(calls))
     assert len(dead) == 1 and resent == []
     assert len(calls) == 1
     assert t.timed_out == 1
@@ -91,7 +103,7 @@ def test_resend_keeps_same_seq():
     t.register(raw, now=0.0)
 
     calls = []
-    t.expire(now=0.31, resend=calls.append)
+    t.expire(now=0.31, resend=_recorder(calls))
 
     assert calls[0] == raw
     assert calls[0][2] == 42
@@ -173,6 +185,32 @@ def test_health_loss_percent():
     assert h["timed_out"] == 1 and h["acked"] == 1
     assert abs(h["loss_pct"] - 50.0) < 1e-9
     assert h["healthy"] is False
+
+
+def test_resend_is_not_counted_when_the_port_is_closed():
+    """写不出去就不算重发。
+
+    串口断着的时候把 retries 加一、把计时推到 now，等于骗调用方"这条救过
+    一次"：真正断线要再等一个超时才暴露，retried 也虚高。而且这条命令根本
+    没上总线，等下去不会有人来 ACK。
+    """
+    t = AckTracker(timeout_s=0.3, max_retries=1)
+    t.register(_sent_frame(frame.CMD_MOVE, 9), now=0.0)
+
+    tried = []
+
+    def dead_port(raw):
+        tried.append(raw)
+        return False
+
+    dead, resent = t.expire(now=0.31, resend=dead_port)
+
+    assert len(tried) == 1, "连试都没试就判死了"
+    assert resent == [], "写失败不能算重发成功"
+    assert len(dead) == 1, "这条命令根本没发出去，应该当场判超时"
+    assert t.retried == 0
+    assert t.timed_out == 1
+    assert t.pending == {}, "写不出去的条目不能留在表里"
 
 
 def test_pending_does_not_leak_on_seq_wrap():

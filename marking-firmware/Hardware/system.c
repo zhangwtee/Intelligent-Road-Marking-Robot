@@ -923,11 +923,14 @@ static void HandleFrame(const uint8_t *f, uint8_t from)
         break;
 
     case PROTO_CMD_TRIM:
-        /* 段内增量纠偏：不改"这段走多远"，只改"左右两边各自还差多少"。
+        /* 设定段内差速：不改"这段走多远"，只改"左右两边各自还差多少"。
+         *
+         * 值是"这一段累计该纠到多少"，不是"再纠这么多"。同一个值连发多次
+         * 不会越纠越多 —— Motion_Trim 内部记住已经落地的量，只落地差值。
          *
          * 和 CMD_MOVE 左右轮独立的关系：MOVE 是每段重新对齐（推荐，误差不
          * 累积），TRIM 是段内微调（连续、响应快，适合陀螺仪闭环这种高频源）。
-         * 两条都能用，但别在同一段里同时用 —— 一个在重设目标，一个在加减
+         * 两条都能用，但别在同一段里同时用 —— 一个在重设目标，一个在改
          * 目标，谁后到谁覆盖，行为取决于时序，没法调试。 */
         trim_mm = (int16_t)(((uint16_t)d[0] << 8) | (uint16_t)d[1]);
 
@@ -1178,10 +1181,20 @@ void SendStatusFrame(void)
     if (Battery_IsLow())                   flags |= 0x80;
 
     d[0] = (uint8_t)sys_ctrl.state;
-    d[1] = (uint8_t)((sys_ctrl.state == STATE_PAINT) ? paint_step : selfcheck_step);
+    /* 段号只在画车位和自检时有意义。别的状态下沿用上一次的值，日志里会
+     * 冒出"状态 W 段3"这种看不懂的字段。 */
+    if (sys_ctrl.state == STATE_PAINT) {
+        d[1] = (uint8_t)paint_step;
+    } else if (sys_ctrl.state == STATE_SELFCHECK) {
+        d[1] = selfcheck_step;
+    } else {
+        d[1] = 0;
+    }
     d[2] = flags;
-    d[3] = (uint8_t)(pulse & 0xFF);
-    d[4] = (uint8_t)((pulse >> 8) & 0xFF);
+    /* 高字节在前。全协议的多字节字段都是大端（速度、航向、电池、断点），
+     * 这里以前发成低字节在前，上位机按大端解，5000 脉冲会显示成 34835。 */
+    d[3] = (uint8_t)((pulse >> 8) & 0xFF);
+    d[4] = (uint8_t)(pulse & 0xFF);
 
     SendFrame(SOURCE_PI, PROTO_CMD_STATUS, 0, d);
 }

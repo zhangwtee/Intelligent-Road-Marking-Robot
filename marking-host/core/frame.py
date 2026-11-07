@@ -295,11 +295,14 @@ def build_move(direction: int, left_mm: int, right_mm: int = None,
 
 
 def build_trim(delta_mm: int, seq: int = 0) -> bytes:
-    """运动中增量纠偏。>0 = 整车向右偏一点，<0 = 向左。
+    """设定段内差速。>0 = 整车向右偏一点，<0 = 向左。
 
-    和 build_move 的区别：它不改"这段还差多远"，只在当前这一段上给左右
-    两侧的目标脉冲各加/减一点。适合响应快、段很细的场合（陀螺仪闭环）。
-    视觉伺服请用 build_move 的左右轮参数，那是重新对齐，误差不累积。
+    delta_mm 是"这一段累计该纠到多少"，不是"再纠这么多"。固件记住已经
+    落地的量，只把差值加到左右剩余目标上 —— 同一个期望值连发多次不会
+    越纠越多。这一点必须和调用方的算法一致，否则几百毫秒就撞上累计上限。
+
+    和 build_move 的区别：它不改"这段还差多远"，只改左右两侧的剩余目标。
+    适合响应快、段很细的场合（陀螺仪闭环、视觉逐帧纠偏）。
     """
     value = max(-32768, min(32767, int(delta_mm))) & 0xFFFF
     return build_frame(CMD_TRIM, seq, bytes([value >> 8, value & 0xFF]))

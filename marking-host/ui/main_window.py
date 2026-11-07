@@ -37,6 +37,12 @@ class MainWindow(QWidget):
         # 但分不清"链路断了"和"命令被回绝"。现在按 SEQ 配起来。
         self.ack = AckTracker()
 
+        # 下行帧序号。固件按 (seq, cmd) 做 1 秒去重，而且只比这两个字段、
+        # 不比内容 —— 序号恒为 0 的时候，同一类命令 1 秒内发第二次会被当成
+        # 重传，固件直接回上一次的结果，命令根本没执行。ACK 表也以 seq 为键，
+        # 恒为 0 等于永远只有一条在飞。
+        self._seq = 0
+
         self.append_send_signal.connect(self._append_send)
         self.append_recv_signal.connect(self._append_recv)
 
@@ -97,6 +103,11 @@ class MainWindow(QWidget):
         self.link_label.setStyleSheet(f"color:{color}; font-size:14px;")
 
     # ---------------- 帧发送 ----------------
+    def _next_seq(self):
+        """下一个下行序号，0~255 循环。"""
+        self._seq = (self._seq + 1) & 0xFF
+        return self._seq
+
     def send_frame(self, raw, label=""):
         """发一帧并登记 ACK。所有走帧协议的动作都要经过这里 ——
         绕过它发送，链路健康度就少了这一条，而且永远不会被发现。
@@ -655,11 +666,12 @@ class MainWindow(QWidget):
 
     def on_gyro_toggle(self, checked):
         sub = frame.GYRO_ON if checked else frame.GYRO_OFF
-        self.send_frame(frame.build_gyro(sub),
+        self.send_frame(frame.build_gyro(sub, self._next_seq()),
                         "陀螺仪 开闭环" if checked else "陀螺仪 关闭环")
 
     def on_gyro_recal(self):
-        self.send_frame(frame.build_gyro(frame.GYRO_RECAL), "陀螺仪 重新标零")
+        self.send_frame(frame.build_gyro(frame.GYRO_RECAL, self._next_seq()),
+                        "陀螺仪 重新标零")
         self.append_send_signal.emit(
             "标零期间车必须完全静止，约 1 秒。失败会自动重试。"
         )
@@ -667,7 +679,8 @@ class MainWindow(QWidget):
     def on_gyro_measure(self):
         # 这条会让车自己动起来，先确认一次再发 —— 和别的按钮不一样，
         # 它不是"发一个字节"，而是"车要绕一个弧走 300mm"。
-        self.send_frame(frame.build_gyro(frame.GYRO_MEASURE), "陀螺仪 标定轮距")
+        self.send_frame(frame.build_gyro(frame.GYRO_MEASURE, self._next_seq()),
+                        "陀螺仪 标定轮距")
         self.append_send_signal.emit(
             f"轮距标定：车将单侧走 {frame.GYRO_MEASURE_DIFF_MM}mm，"
             "请让开并留出约 1.5 米空间。结果看 OLED 第 4 行或接收日志。"
@@ -681,6 +694,8 @@ class MainWindow(QWidget):
         或者"关水泵"，摄像头还在按帧下发指令 —— 人按的停停不停得住
         全看手速，这不能接受。下位机那边也堵了一道：RESPRAY / MOVE
         只在 STATE_WAIT 被接受。
+
+        撤完之后状态就是 WAIT，所以调用方可以紧接着发画车位 / 二次喷涂。
         """
         widget = getattr(self, 'camera_widget', None)
         if widget is None:
@@ -712,7 +727,8 @@ class MainWindow(QWidget):
 
         self._detach_camera_auto()
         self.send_frame(
-            frame.build_paint(length, width, heading=heading),
+            frame.build_paint(length, width, heading=heading,
+                              seq=self._next_seq()),
             f"画车位 {length}x{width}mm" + (" +纠偏" if heading else ""),
         )
 
@@ -727,7 +743,8 @@ class MainWindow(QWidget):
         抢在前面到达时固件回 ERR_STATE，续不上还只在日志里留一个结果码。
         """
         self._detach_camera_auto()
-        self.send_frame(frame.build_paint(resume=True), "画车位 续画")
+        self.send_frame(frame.build_paint(resume=True, seq=self._next_seq()),
+                        "画车位 续画")
 
     # ---------------- 速度 ----------------
     def _apply_speed_info(self, item):
@@ -868,7 +885,7 @@ class MainWindow(QWidget):
         # 写出去了才记账。串口断着的时候拖滑条，记成"已发"的话，之后
         # 拖回同一个值会被上面那句"值没变"挡掉，界面上写着 600 而车
         # 还按旧档跑。
-        if self.send_frame(frame.build_speed(arr), f"速度 {arr}"):
+        if self.send_frame(frame.build_speed(arr, self._next_seq()), f"速度 {arr}"):
             self._speed_sent = arr
             self._speed_sent_at = time.monotonic()
 
@@ -878,12 +895,23 @@ class MainWindow(QWidget):
         if data is None:
             return
 
-        self.serial_mgr.send(data)
+        # 先撤相机，再发这个字节。反过来的话，撤相机那一下的停止命令会落到
+        # 按钮之后：按「停止复位」实际停在 TING，用户还得再按一次。
+        #
+        # 二次喷涂也要撤：它要车停着（固件只在 WAIT 收 RESPRAY），而原来
+        # 这条路径跳过了撤相机 —— 相机窗口关了、车还在走完这一段、泵还开着。
+        if label not in CAMERA_BUTTONS or label == "二次喷涂":
+            self._detach_camera_auto()
+
+        # 串口没开时不能再写"状态: 紧急停止"—— 那会让人以为按下去生效了。
+        if not self.serial_mgr.send(data):
+            self.append_send_log(data, f"{label}（未发出）")
+            self.status_label.setText(f"状态:\n{label} 未发出")
+            self._update_link_label()
+            return
+
         self.append_send_log(data, label)
         self.status_label.setText(f"状态:\n{label}")
-
-        if label not in CAMERA_BUTTONS:
-            self._detach_camera_auto()
 
         # ---------------- 摄像头弹窗 ----------------
         if label in CAMERA_BUTTONS:
@@ -903,9 +931,18 @@ class MainWindow(QWidget):
             self.close_camera_window()
             self.open_camera_window("自动巡线喷涂", CameraWidget.MODE_TRACK)
 
-            if self.camera_widget is not None:
-                self.camera_widget.start_track()
-                self.append_send_log(b"(track start)", "自动巡线")
+            widget = getattr(self, "camera_widget", None)
+            if widget is None or not widget.camera_ok:
+                # 画面都没起来就别发 MOVE。没有视觉还按帧往前跑，是在漆线上
+                # 开一台瞎车 —— 而界面上写着"正在巡线"，日志里全是已确认。
+                self.append_send_log(b"(track refused)", "自动巡线：摄像头未就绪")
+                self.status_label.setText("状态:\n摄像头未就绪，未开始巡线")
+                self.btn_track.setChecked(False)
+                self.close_camera_window()
+                return
+
+            widget.start_track()
+            self.append_send_log(b"(track start)", "自动巡线")
 
         else:
             widget = getattr(self, "camera_widget", None)
@@ -919,7 +956,9 @@ class MainWindow(QWidget):
         win = getattr(self, 'camera_window', None)
         if win is None:
             return
-        self.camera_widget.stop_camera()
+        widget = getattr(self, 'camera_widget', None)
+        if widget is not None:
+            widget.stop_camera()
         win.close()
         win.deleteLater()      # 不然每按一次就漏一个 QWidget
         self.camera_window = None
@@ -964,4 +1003,13 @@ class MainWindow(QWidget):
                 widget.stop_track()
                 self.btn_track.setChecked(False)
             widget.stop_camera()
+
+        # 点 X 之后不会再走 close_camera_window，引用得自己放掉：
+        # 留着的话，下次 _detach_camera_auto 拿到的是一个已经关掉的控件，
+        # 窗口对象也一直挂着不释放。
+        win = getattr(self, 'camera_window', None)
+        if win is not None:
+            win.deleteLater()
+        self.camera_window = None
+        self.camera_widget = None
         event.accept()

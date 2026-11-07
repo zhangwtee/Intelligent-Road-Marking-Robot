@@ -112,6 +112,8 @@ class CameraWidget(QLabel):
 
         # ---------------- 检测状态 ----------------
         self.center_queue = deque(maxlen=5)
+        # 每个元素是 (质量结论, 这一帧给出的补喷档位)。档位跟着一起存，
+        # 是为了让"补多长"和"该不该补"出自同一批帧 —— 见 _voted_level。
         self.votes = deque(maxlen=self.VOTE_WINDOW)
         self.quality = QUALITY_UNSURE
         self.quality_note = ""
@@ -135,6 +137,10 @@ class CameraWidget(QLabel):
         # 只会互相抵消，而且双方都认为自己没错。
         self.gyro_closed = False
 
+        # 摄像头到底开没开起来。巡线要用它决定"能不能发 MOVE"——
+        # 画面都没起来还按帧往前跑，等于一台瞎车在漆线上开。
+        self.camera_ok = False
+
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_frame)
 
@@ -155,7 +161,7 @@ class CameraWidget(QLabel):
     def start_camera(self):
 
         if self.cap is not None:
-            return
+            return True
 
         self.cap = cv2.VideoCapture(0)
 
@@ -168,14 +174,18 @@ class CameraWidget(QLabel):
             # 都直接返回 —— 摄像头再也起不来，还漏个句柄。
             self.cap.release()
             self.cap = None
+            self.camera_ok = False
             self.setText("摄像头打开失败")
-            return
+            return False
 
+        self.camera_ok = True
         self.timer.start(30)
+        return True
 
     def stop_camera(self):
 
         self.timer.stop()
+        self.camera_ok = False
 
         if self.cap:
             self.cap.release()
@@ -222,7 +232,7 @@ class CameraWidget(QLabel):
             return QUALITY_UNSURE
 
         counts = {}
-        for value in self.votes:
+        for value, _level in self.votes:
             counts[value] = counts.get(value, 0) + 1
 
         state, hits = max(counts.items(), key=lambda kv: kv[1])
@@ -231,6 +241,21 @@ class CameraWidget(QLabel):
             return QUALITY_UNSURE
 
         return state
+
+    def _voted_level(self, quality):
+        """投票结论对应哪一档补喷。
+
+        取与结论一致的那些帧里最近一帧的档位。补多长和该不该补必须出自
+        同一批帧：用当前帧的档位的话，一旦投票和当前帧判断不同，补出来的
+        长度就和投票结论对不上，而日志里只看得到"发了一帧补喷"。
+
+        一帧都没有（不该发生，结论就是从这些帧里投出来的）就退回 1 档：
+        补短了还能再补一次，补长了没有回头路。
+        """
+        for value, level in reversed(self.votes):
+            if value == quality and level > 0:
+                return level
+        return 1
 
     # ==========================================================
     # 补喷模式
@@ -292,15 +317,26 @@ class CameraWidget(QLabel):
         return True
 
     def stop_track(self):
-        """停车。先关泵再发命令 —— 顺序反了的话，车停了泵还在出漆。"""
+        """停车。先关泵再发命令 —— 顺序反了的话，车停了泵还在出漆。
+
+        用 'W' 而不是 'T'：'T' 把状态停在 TING，而画车位、二次喷涂都只认
+        WAIT，撤完相机还得再补一条 'W' 才能发命令，两条命令还要求到达顺序。
+        'W' 一条就做完"停电机 + 回 WAIT"。代价是它会作废画车位断点 ——
+        巡线途中本来就没有正在进行的画车位，留下的旧断点在车已经挪走之后
+        也没法续，清掉不影响什么。
+
+        pump_on 必须跟着清。只发一帧关泵而不改这个标志的话，下次巡线
+        _apply_pump(True) 会因为"值没变"直接 return，头几帧该喷的地方不喷，
+        HUD 也一直显示泵开着。
+        """
         self.tracking = False
+        self.pump_on = False
 
         self._send(frame.build_pump(False, self._next_seq()))
 
-        # 'T' 是固件的急停，任何状态都接受。这里用它而不是 CMD_MOVE(0)：
-        # MOVE 0 会被判参数越界回绝（proto.h 里 mm == 0 是非法值）。
+        # 裸字节不登记 ACK：固件对它们只回显，登记了必然超时。
         if self.serial_mgr is not None:
-            self.serial_mgr.send(b"T")
+            self.serial_mgr.send(b"W")
 
     def _send_segment(self, segment_mm=None):
         if segment_mm is None:
@@ -315,9 +351,12 @@ class CameraWidget(QLabel):
     def _track_tick(self, heading_deg, lateral_ratio):
         """每帧调一次。按 TRIM_INTERVAL_S 节流下发纠偏。
 
-        为什么用 CMD_TRIM（增量）而不是每段重发 MOVE（重设）：
+        为什么用 CMD_TRIM（段内改目标）而不是每段重发 MOVE（重设）：
         重设要等一段走完，5000mm 一段就是 31 秒一次，等于没有反馈。
         TRIM 在段内直接改左右轮的目标脉冲数，31 秒里能纠 300 次。
+
+        trim_mm 算出来的是"这一段累计该给多少差速"（带速率限制的绝对量），
+        和固件 Motion_Trim 的语义一致：它记住已经落地的量，只落地差值。
 
         代价是差速会在段内累积（内侧轮一路提前停）。所以固件那边给
         Motion_Trim 加了累计上限，上位机这边有限幅 + 速率限制，
@@ -587,7 +626,7 @@ class CameraWidget(QLabel):
 
                 quality, spray_level, reason = classify_line_quality(line_pixels)
 
-                self.votes.append(quality)
+                self.votes.append((quality, spray_level))
                 voted = self._voted_quality()
 
                 self.quality = voted
@@ -609,7 +648,7 @@ class CameraWidget(QLabel):
                     # 卡在破损边缘"那种来回摆的情况 —— 补喷一发就是几百
                     # 毫米的漆，比巡线的开泵贵得多。
                     if self._want_spray(voted):
-                        self.maybe_send_respray(spray_level)
+                        self.maybe_send_respray(self._voted_level(voted))
 
                 elif self.mode == self.MODE_TRACK and self.tracking:
                     self._update_pump(voted)
@@ -643,7 +682,7 @@ class CameraWidget(QLabel):
 
             # 认不到线也要进投票：连续几帧看不到，结论就该变成"看不清"，
             # 而不是一直沿用最后一帧的"完好"。泵那边靠这个关掉。
-            self.votes.append(QUALITY_UNSURE)
+            self.votes.append((QUALITY_UNSURE, 0))
             self.quality = self._voted_quality()
             self.quality_note = "No line"
 

@@ -42,7 +42,9 @@ static float   s_pulse_per_deg = 0.0f;
 static float   s_k[4]          = {1.0f, 1.0f, 1.0f, 1.0f};
 static uint8_t s_ready         = 0;
 
-/* 本段累计纠偏（脉冲，带符号）。每次开新段清零。
+/* 本段已经落地的累计纠偏（脉冲，带符号）。每次开新段清零。
+ * Motion_Trim 拿它和"上层期望的累计量"作差，只把差值加到剩余目标上 ——
+ * 上层反复发同一个期望值时不会重复累加。
  * 只在 Motion_Trim 和开段函数里读写，都是主循环上下文，不需要临界区。 */
 static int32_t s_trim_accum    = 0;
 
@@ -395,13 +397,21 @@ void Motion_TurnRight(float deg)
 
 uint8_t Motion_Trim(float delta_mm)
 {
-    int32_t half;
+    int32_t want;       /* 这一段累计该纠到多少（半差，脉冲） */
+    int32_t step;       /* 这一次真正要落地的差 */
     uint8_t moved = 0;
 
     if (!s_ready) {
         return 0;
     }
 
+    /* delta_mm 是"这一段累计该纠到这么多"，不是"再纠这么多"。
+     *
+     * 两个调用方算出来的都是几何上的绝对量：陀螺仪那边是"转过 err 度需要
+     * 的左右行程差"，视觉那边是带速率限制的比例输出。以前这里按增量处理，
+     * 等于每 100ms 就把整个修正量再加一遍 —— 误差 2 度时一次十几毫米，
+     * 不到一秒就撞上累计上限，这条边剩下的路一个脉冲都不纠，而队列里已经
+     * 压了一大截转向。 */
     if (delta_mm > MOTION_TRIM_MAX_MM) {
         delta_mm = MOTION_TRIM_MAX_MM;
     }
@@ -413,19 +423,23 @@ uint8_t Motion_Trim(float delta_mm)
      * 的舍入互相打架（-3.7 -> -3 还是 -4，两种都有道理，但差一个脉冲
      * 在左右两侧就是两次不同的方向修正）。 */
     if (delta_mm >= 0.0f) {
-        half = (int32_t)(delta_mm * 0.5f * s_pulse_per_mm + 0.5f);
+        want = (int32_t)(delta_mm * 0.5f * s_pulse_per_mm + 0.5f);
     } else {
-        half = -(int32_t)((-delta_mm) * 0.5f * s_pulse_per_mm + 0.5f);
+        want = -(int32_t)((-delta_mm) * 0.5f * s_pulse_per_mm + 0.5f);
     }
 
-    if (half == 0) {
-        /* 落在死区里：不用调，但要把"车到底在不在跑"如实报上去。
-         * 这里若一律返回 0，上层就无法区分"死区不需要动"和"四路都停了"，
-         * 只能把每一次小修正都当成失败。 */
+    want *= MOTION_TRIM_SIGN;
+
+    /* 目标没变就别动。这一步既是死区，也是"绝对量"的实现：
+     * 上层连续发同一个期望值时，只有第一次会真的改目标。
+     *
+     * 返回 StepMotor_IsAnyRunning 而不是 0：0 是"四路都停了"的意思，
+     * 上层拿它回 ERR_STATE。目标没变不等于车没在走。 */
+    step = want - s_trim_accum;
+
+    if (step == 0) {
         return StepMotor_IsAnyRunning();
     }
-
-    half *= MOTION_TRIM_SIGN;
 
     /* 累计上限。见头文件里的 MOTION_TRIM_ACCUM_MAX_MM ——
      * 一段里一直往同一个方向纠，内侧轮会越停越早，累计到一米的时候
@@ -433,22 +447,25 @@ uint8_t Motion_Trim(float delta_mm)
      * 撞上限时返回 2，让上层知道"这段该结束了"，而不是继续硬纠。 */
     {
         int32_t limit = (int32_t)(MOTION_TRIM_ACCUM_MAX_MM * s_pulse_per_mm);
-        int32_t next  = s_trim_accum + half;
 
-        if (next > limit || next < -limit) {
+        if (want > limit || want < -limit) {
             return 2;
         }
-
-        s_trim_accum = next;
     }
 
     /* 向右修正 = 左边多走、右边少走。
      * 注意这不是旋转：四个轮子都还在往前走，只是目标脉冲数一边加一边减，
      * 车走出来的是一段很缓的弧。每 100mm 纠一次，宏观上看就是直线。 */
-    if (StepMotor_AdjustTarget(MOTOR1, +half) == 0) { moved = 1; }   /* 左前多走 */
-    if (StepMotor_AdjustTarget(MOTOR3, +half) == 0) { moved = 1; }   /* 左后多走 */
-    if (StepMotor_AdjustTarget(MOTOR2, -half) == 0) { moved = 1; }   /* 右前少走 */
-    if (StepMotor_AdjustTarget(MOTOR4, -half) == 0) { moved = 1; }   /* 右后少走 */
+    if (StepMotor_AdjustTarget(MOTOR1, +step) == 0) { moved = 1; }   /* 左前多走 */
+    if (StepMotor_AdjustTarget(MOTOR3, +step) == 0) { moved = 1; }   /* 左后多走 */
+    if (StepMotor_AdjustTarget(MOTOR2, -step) == 0) { moved = 1; }   /* 右前少走 */
+    if (StepMotor_AdjustTarget(MOTOR4, -step) == 0) { moved = 1; }   /* 右后少走 */
+
+    /* 四路都没落地（车已经停了）就别记这个目标，下一拍还要再来一次。
+     * 记上的话，车重新起步时这段纠偏会被悄悄吃掉。 */
+    if (moved) {
+        s_trim_accum = want;
+    }
 
     /* 目标改过之后，"两侧同时到达"就失效了 —— 按剩余脉冲重算一次 ARR。
      *
