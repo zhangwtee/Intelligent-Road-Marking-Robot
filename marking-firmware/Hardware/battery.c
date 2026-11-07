@@ -10,6 +10,9 @@ extern volatile uint32_t timer_counter;
  * 报 0.0V 会让人去充电，而真正的问题是分压线掉了。 */
 #define BATT_RAW_MIN        16u
 
+/* 等 EOC 的循环上限。给的余量很大，只用来兜底 ADC 真的不响应的情况。 */
+#define BATT_EOC_TIMEOUT    4000u
+
 static uint16_t batt_mv;
 static uint8_t  batt_valid;
 static uint32_t batt_ms;
@@ -22,24 +25,27 @@ static uint32_t batt_ms;
  *
  * 采样时间取最长的 239.5 周期，是因为分压源阻抗有 9k 左右。手册给的
  * 表格里，源阻抗超过 10k 就要加长采样时间，短了读数会系统性偏低。 */
-static uint16_t Batt_ReadOnce(void)
+static int16_t Batt_ReadOnce(void)
 {
     uint32_t wait;
+
+    /* 先清掉上一次的 EOC。上一次如果是超时退出的，它那次转换迟到的结果
+     * 会留在这个标志上 —— 不清的话，下面一启动就看到它，读到的是上一次
+     * 那个没等到结果的样本。 */
+    ADC_ClearFlag(ADC1, ADC_FLAG_EOC);
 
     ADC_RegularChannelConfig(ADC1, BATT_ADC_CHANNEL, 1, ADC_SampleTime_239Cycles5);
     ADC_SoftwareStartConvCmd(ADC1, ENABLE);
 
-    /* 等 EOC，带超时。正常 21 微秒（239.5 + 12.5 个 ADCCLK，12MHz），
-     * 这里给到上千倍余量：ADC 真的挂了的时候，宁可这一次读数作废，
-     * 也不能把主循环卡死在这儿 —— 那等于整台车死机，而电池电压只是
-     * 一个顺手看看的量。 */
-    wait = 4000u;
+    /* 等 EOC，带超时。ADC 不响应的时候，宁可这一次读数作废，也不能把
+     * 主循环卡死在这儿 —— 那等于整台车死机，而电池电压只是顺手看看的量。 */
+    wait = BATT_EOC_TIMEOUT;
     while (ADC_GetFlagStatus(ADC1, ADC_FLAG_EOC) == RESET) {
         if (--wait == 0u) {
-            return 0u;      /* 这次没测到，上层按无效处理 */
+            return -1;
         }
     }
-    return ADC_GetConversionValue(ADC1);   /* 读 DR 顺带清 EOC */
+    return (int16_t)ADC_GetConversionValue(ADC1);   /* 读 DR 顺带清 EOC */
 }
 
 void Battery_Init(void)
@@ -52,8 +58,9 @@ void Battery_Init(void)
     /* ADCCLK 上限 14MHz，PCLK2 是 72MHz，只能 6 分频到 12MHz。 */
     RCC_ADCCLKConfig(RCC_PCLK2_Div6);
 
-    gpio.GPIO_Pin  = BATT_GPIO_PIN;
-    gpio.GPIO_Mode = GPIO_Mode_AIN;     /* 模拟输入，数字输入缓冲断开 */
+    gpio.GPIO_Pin   = BATT_GPIO_PIN;
+    gpio.GPIO_Mode  = GPIO_Mode_AIN;     /* 模拟输入，数字输入缓冲断开 */
+    gpio.GPIO_Speed = GPIO_Speed_50MHz;  /* 模拟输入用不到，填上只为结构体不留野值 */
     GPIO_Init(BATT_GPIO_PORT, &gpio);
 
     ADC_DeInit(ADC1);
@@ -65,6 +72,14 @@ void Battery_Init(void)
     adc.ADC_NbrOfChannel       = 1;
     ADC_Init(ADC1, &adc);
     ADC_Cmd(ADC1, ENABLE);
+
+    /* 数据手册要求 ADC 上电后等 tSTAB 再开始校准。这里空转，不靠
+     * 前面那几条指令的耗时去凑。 */
+    {
+        volatile uint32_t i;
+        for (i = 0; i < 200u; i++) {
+        }
+    }
 
     /* 校准不能省。不做的话零点和增益都停在出厂默认，读数能偏几十毫伏，
      * 而且每次上电偏的方向一样 —— 看着像分压电阻不准，实际白换一次电阻。 */
@@ -89,11 +104,22 @@ void Battery_Poll(void)
     batt_ms = timer_counter;
 
     for (i = 0; i < BATT_OVERSAMPLE; i++) {
-        sum += Batt_ReadOnce();
+        int16_t one = Batt_ReadOnce();
+
+        /* 有一次没读到就整轮作废。要是拿 0 顶上，8 次里错 1 次就能把
+         * 平均值拉下一大截，直接跨过低电压门限 —— 车上开始叫，而电池
+         * 是好的。这种误报比没有读数更坏。 */
+        if (one < 0) {
+            batt_mv    = 0;
+            batt_valid = 0;
+            return;
+        }
+        sum += (uint32_t)one;
     }
     raw = (uint16_t)(sum / BATT_OVERSAMPLE);
 
     if (raw < BATT_RAW_MIN) {
+        batt_mv    = 0;
         batt_valid = 0;
         return;
     }

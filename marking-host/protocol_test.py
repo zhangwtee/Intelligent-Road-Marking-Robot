@@ -984,6 +984,57 @@ def test_battery_pin_does_not_collide():
         "M4 的脉冲脚变了，电池采样脚要重新挑（现在选 PC0 就是因为 PC6 被占了）"
 
 
+def test_battery_round_is_dropped_when_a_sample_times_out():
+    """一次没读到就整轮作废，不能拿 0 去凑平均。
+
+    8 次平均里掺一个 0，读数会掉一大截 —— 12V 直接落到 10V 出头，正好
+    跨过低电压门限，车上开始叫、界面变红，而电池是满的。误报比不报更坏：
+    人会去换电池，换完还是叫，最后开始怀疑板子。
+    """
+    text = (FIRMWARE_HW / "battery.c").read_bytes().decode("gbk", errors="replace")
+
+    assert "static int16_t Batt_ReadOnce" in text, "采样函数要给调用方一个超时信号"
+    assert "return -1;" in text, "超时要能和真实的 0（线断了）分开"
+    assert "sum += Batt_ReadOnce()" not in text, \
+        "直接把采样值累加进去了，超时那次的 0 会被算进平均"
+
+    # 超时分支里既要作废整轮，也要把这次转换停掉 —— 否则下一次启动会
+    # 立刻看到残留的 EOC，读到的是上一次那个没等到结果的值。
+    body = text[text.index("static int16_t Batt_ReadOnce"):]
+    body = body[:body.index("\n}")]
+    clear_at = body.find("ADC_ClearFlag(ADC1, ADC_FLAG_EOC)")
+    start_at = body.find("ADC_RegularChannelConfig")
+    assert 0 <= clear_at < start_at, "启动转换之前要先清 EOC，不然可能读到上一次的残留"
+
+
+def test_low_battery_chirp_leaves_the_buzzer_to_the_state_machine():
+    """低压提示音只在 WAIT 里响。
+
+    蜂鸣器只有一个脚，状态机也在用（画完那声、自检）。要是这边按自己的
+    计时去关，关掉的可能是状态机刚打开的那一声 —— 表现是"画完不响了"，
+    而原因在一个跟画车位毫无关系的地方。
+    """
+    text = FIRMWARE_C.read_bytes().decode("gbk", errors="replace")
+    i = text.index("/* ---- 低压提示音")
+    body = text[i:i + 2000]
+
+    assert "sys_ctrl.state != STATE_WAIT" in body, \
+        "离开 WAIT 要把这一轮丢掉，不去关别人响着的那一声"
+    assert "sys_ctrl.state == STATE_WAIT && Battery_IsLow()" in body, \
+        "只在 WAIT 里起新的提示"
+
+
+def test_battery_oled_code_survives_a_24v_system():
+    """0.1V 一格的编号要能装下两位数的电压。
+
+    用 uint8 存 mv/100，24V 系统充到 25.6V 就绕回来了，绕过的值可能和
+    另一个电压撞上，结果是"电压变了但那一行不重画"。12V 撞不到，换车才暴露。
+    """
+    text = FIRMWARE_C.read_bytes().decode("gbk", errors="replace")
+    assert re.search(r"static uint16_t batt_oled_code;", text), \
+        "batt_oled_code 要用 16 位"
+
+
 if __name__ == "__main__":
     for name in sorted(n for n in globals() if n.startswith("test_")):
         globals()[name]()

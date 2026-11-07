@@ -1052,8 +1052,8 @@ static void SendSpeedInfoFrame(void)
  * 提成文件级，是为了让 OLED_Clear 那两处能把"画过"这个标记清掉 ——
  * 否则清屏之后电池行要等电压真的变了 0.1V 才回来，而放电到那个程度
  * 可能是几分钟以后，中间这段时间第 2 行一直是空的。 */
-static uint8_t batt_oled_code;
-static uint8_t batt_oled_drawn;
+static uint16_t batt_oled_code;
+static uint8_t  batt_oled_drawn;
 
 /* 电池电压帧：1Hz。
  *
@@ -1097,7 +1097,7 @@ static void BatteryService(void)
     static uint32_t chirp_ms;
     uint32_t now = timer_counter;
     uint16_t mv;
-    uint8_t  code;
+    uint16_t code;
 
     Battery_Poll();
     SendBatteryFrame();
@@ -1106,11 +1106,11 @@ static void BatteryService(void)
 
     /* ---- OLED 第 2 行 ---- */
     if (!Battery_IsValid()) {
-        code = 0xFE;
+        code = 0xFFFFu;                 /* 有效电压按 0.1V 取整也落不到这个值 */
     } else {
-        code = (uint8_t)(mv / 100u);    /* 0.1V 一格，比这更细的位数人眼也看不出 */
+        code = (uint16_t)(mv / 100u);   /* 0.1V 一格，比这更细的位数人眼也看不出 */
         if (Battery_IsLow()) {
-            code = (uint8_t)(code | 0x80);
+            code = (uint16_t)(code | 0x80);
         }
     }
 
@@ -1130,29 +1130,32 @@ static void BatteryService(void)
     }
 
     /* ---- 低压提示音：每 30 秒"嘀嘀"两声 ----
+     *
      * 不用长鸣：状态一切换就会 Buzzer_Off（见 System_StateMachine 的
      * "打断就关"那几句），长鸣反而响不满一秒；两声短的听得见，也不至于
-     * 吵到人把它当成故障。 */
-    if (chirp_on) {
-        if ((uint32_t)(now - chirp_ms) >= BATT_CHIRP_ON_MS) {
-            Buzzer_Off();
-            chirp_on = 0;
-            chirp_ms = now;
-        }
-        return;
-    }
-
-    if (chirp_left > 0) {
-        if ((uint32_t)(now - chirp_ms) >= BATT_CHIRP_GAP_MS) {
+     * 吵到人把它当成故障。
+     *
+     * 只在 WAIT 里响。蜂鸣器只有一个，状态机的提示音（画完那声长鸣、
+     * 自检）和这里抢同一个脚：这一声是我们打开的，就要我们关；可一旦
+     * 中间状态机又打开了它，我们按自己的计时去关，关掉的是别人的。
+     * 所以离开 WAIT 就把这一轮丢掉，不碰已经响着的那一声 —— 它归状态机管。 */
+    if (chirp_on || chirp_left > 0) {
+        if (sys_ctrl.state != STATE_WAIT) {
+            chirp_on   = 0;
+            chirp_left = 0;
+        } else if (chirp_on) {
+            if ((uint32_t)(now - chirp_ms) >= BATT_CHIRP_ON_MS) {
+                Buzzer_Off();
+                chirp_on = 0;
+                chirp_ms = now;
+            }
+        } else if ((uint32_t)(now - chirp_ms) >= BATT_CHIRP_GAP_MS) {
             Buzzer_On();
             chirp_on = 1;
             chirp_ms = now;
             chirp_left--;
         }
-        return;
-    }
-
-    if (Battery_IsLow()) {
+    } else if (sys_ctrl.state == STATE_WAIT && Battery_IsLow()) {
         /* 已经掉到临界值以下就别再等 30 秒 —— 那时候每一步都可能在丢步。 */
         uint32_t period = Battery_IsCritical() ? BATT_CRIT_ALARM_PERIOD_MS
                                                : BATT_ALARM_PERIOD_MS;
