@@ -1299,6 +1299,69 @@ def test_resume_does_not_apply_the_wheel_factor_twice():
         "Motion_ForwardFlatLR 走了 DriveLR：轮径系数会被乘两次"
 
 
+def test_breakpoint_needs_both_sides_to_have_something_left():
+    """断点要求两侧都还剩得下东西。
+
+    存进 flash 时两侧各自四舍五入成整数毫米。放过"一侧 0.3mm、另一侧
+    3 米"这种组合，存下去那一侧就是 0，cfg 的合理性检查会整条拒掉：
+    RAM 里断点还在、面板上按钮亮着，掉电之后什么都没留下，service 又
+    每 10 秒白跑一次。所以这里是"任一侧不够就不记"，不是"两侧都不够
+    才不记"。
+
+    这种组合只在差速纠偏把某一侧目标往前挪了一大截、又恰好在收尾前
+    按下急停时出现，窗口很窄 —— 但结果是"看着能续、实际续不了"。
+    """
+    text = FIRMWARE_C.read_bytes().decode("gbk", errors="replace")
+    body = _firmware_body(text, r"static void PaintCaptureResume\(void\)")
+
+    i = body.find("PAINT_RESUME_MIN_MM")
+    assert i != -1, "找不到最小剩余量那段判断"
+    cond = body[i:body.find("return;", i)]
+    assert "return;" in body[i:], "最小剩余量那段判断里没有 return"
+
+    assert "&&" not in cond, (
+        "写的是「两侧都小于 50mm 才放弃」：一侧只剩几个脉冲时会把 0 毫米存进 flash，"
+        "整条断点被 cfg 拒掉，而面板上按钮是亮的"
+    )
+    assert "||" in cond, "最小剩余量的判断既不是 || 也不是 &&"
+
+
+def test_paint_watchdog_times_out_per_segment():
+    """画车位的超时按"段"计，不按"整圈"计。
+
+    最慢档下走完一整圈就可能超过 PAINT_TIMEOUT_MS —— 按整圈计时会把
+    "慢但正常"判成卡住：泵关、车停，四条边只画了一半。
+
+    按段计才叫"卡住"：同一个段号停留超过这个时间。超时退出之前还要按
+    断点记一份，否则已经喷完的那几条边跟着白费。
+    """
+    # 不抠函数体：System_StateMachine 里有好几处行首的 }，那个辅助函数会在
+    # 第一处就停下，抠不到看门狗这一段。这两处判断在全文里都是唯一的。
+    text = FIRMWARE_C.read_bytes().decode("gbk", errors="replace")
+
+    guard = re.search(
+        r"if \(\(uint8_t\)paint_step != paint_step_seen\)\s*\{(.*?)\n\s*\}",
+        text, re.S,
+    )
+    assert guard, "看门狗没有跟着段号走"
+    assert "paint_progress_ms = current_time" in guard.group(1), \
+        "段号变了没有重起计时，等于还在按整圈算"
+
+    i = text.find("PAINT_TIMEOUT_MS)")
+    assert i != -1, "找不到画车位超时判断"
+
+    cond = text[max(0, i - 200):i]
+    assert "paint_progress_ms" in cond, \
+        "超时还在按进 STATE_PAINT 的时刻算：慢速画一整圈会被误判成卡住"
+    assert "state_timestamp" not in cond, "超时还在用 state_timestamp"
+
+    tail = text[i:i + 400]
+    assert "PaintCaptureResume();" in tail, \
+        "超时退出时没有记断点：已经喷完的几条边白费"
+    assert tail.find("PaintCaptureResume();") < tail.find("STATE_WAIT"), \
+        "先切状态再记断点 —— 切状态那一下电机就停了，剩余量读出来是空的"
+
+
 if __name__ == "__main__":
     for name in sorted(n for n in globals() if n.startswith("test_")):
         globals()[name]()

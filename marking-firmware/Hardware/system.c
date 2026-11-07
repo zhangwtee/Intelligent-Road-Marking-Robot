@@ -167,6 +167,14 @@ static uint8_t   paint_resume_dirty;     /* 断点变了，等车停着再写 flash */
 static uint32_t  paint_resume_try_ms;    /* 上一次真去写 flash 的时刻 */
 static uint8_t   paint_resume_tried;     /* 写过没有；0 时 try_ms 不作数 */
 
+/* 画车位看门狗：记"段号上一次变的时刻"，不是"进 STATE_PAINT 的时刻"。
+ *
+ * 按整圈计时会把"慢但正常"误判成卡住：最慢档下走完一整圈就可能超过
+ * PAINT_TIMEOUT_MS。按段计时含义也更清楚 —— 同一个段号停留超过这个
+ * 时间，才是真卡住了。 */
+static uint32_t  paint_progress_ms;
+static uint8_t   paint_step_seen;
+
 /* 轮距自标定时单侧走的距离。
  * 300mm 的取法：若轮距 500mm，车会转 300/500 = 0.6 rad ≈ 34 度。
  * 角度够大，读数的相对误差就小；又不会大到让车转出测试场地。
@@ -253,8 +261,17 @@ static void PaintCaptureResume(void)
         return;
     }
 
+    /* 任一侧剩不到 50mm 就不给续 —— 用 || 不是 &&。
+     *
+     * 断点存进 flash 时两侧各自四舍五入成整数毫米。放过"一侧 0.3mm、
+     * 另一侧 3 米"这种组合，存下去那一侧就是 0，cfg 里的合理性检查会
+     * 整条拒掉：RAM 里还有断点、面板上按钮亮着，掉电之后却什么都没留下，
+     * 而且 service 每 10 秒白跑一次。
+     *
+     * 这种组合只在差速纠偏把某一侧目标往前挪了一大截、又恰好在收尾前
+     * 按下急停时出现，窗口很窄，但结果是"看着能续、实际续不了"。 */
     if (Motion_PulseToMm((uint32_t)remain_l) < PAINT_RESUME_MIN_MM
-        && Motion_PulseToMm((uint32_t)remain_r) < PAINT_RESUME_MIN_MM) {
+        || Motion_PulseToMm((uint32_t)remain_r) < PAINT_RESUME_MIN_MM) {
         return;
     }
 
@@ -1774,6 +1791,11 @@ void System_StateMachine(void) {
                 Motion_ForwardFlat(paint_len_mm);
             }
 
+            /* 这一圈从这一刻起算。续画时 paint_step 已经是断点那条边，
+             * 记进 paint_step_seen，下一拍就不会被当成"刚走完一段"。 */
+            paint_progress_ms = current_time;
+            paint_step_seen   = (uint8_t)paint_step;
+
             /* OLED 上必须显示真实边号：续画从 3/4 开始，屏幕上就该是 3/4，
              * 显示 1/4 会让人以为车又从第一条边重新走了。 */
             switch (paint_step) {
@@ -1980,9 +2002,18 @@ void System_StateMachine(void) {
                 break;
             case STATE_PAINT:
             {
-                /* 总时限看护：画一个车位正常 20~40s，超过 120s 说明卡住了。
-                 * 没有这条，一次机械卡死就是泵一直开、车不动、地上一滩漆。 */
-                if (current_time - sys_ctrl.state_timestamp > PAINT_TIMEOUT_MS) {
+                /* 同一段停留太久 = 卡住了。按段计不按整圈计，理由见
+                 * paint_progress_ms 的说明。没有这条，一次机械卡死就是
+                 * 泵一直开、车不动、地上一滩漆。 */
+                if ((uint8_t)paint_step != paint_step_seen) {
+                    paint_step_seen   = (uint8_t)paint_step;
+                    paint_progress_ms = current_time;
+                }
+                if ((uint32_t)(current_time - paint_progress_ms) > PAINT_TIMEOUT_MS) {
+                    /* 退出之前按断点记一份：超时多半是"这一条边走不动"，
+                     * 前面已经喷完的几条边不该跟着白费。电机还转着的时候
+                     * 才记得下（PaintCaptureResume 自己会判断）。 */
+                    PaintCaptureResume();
                     sys_ctrl.state = STATE_WAIT;
                     break;
                 }
