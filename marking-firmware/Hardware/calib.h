@@ -53,22 +53,14 @@
  * 失效条件：换底盘、改轮距、四个轮子换成不同直径的。 */
 #define CALIB_TRACK_WIDTH_MM    500.0f
 
-/* ---------- 工艺行程（逻辑值，不是标定值） ---------- */
-#define CALIB_PAINT_LONG_MM     5300.0f  /* 车位长边 */
-#define CALIB_PAINT_SHORT_MM    2500.0f  /* 车位短边 */
-#define CALIB_TURN_DEG          90.0f    /* 转角 */
-
-/* ---------- 补喷长度档位（'1'~'5' 选择） ---------- */
-#define CALIB_RESPRAY_L1_MM      200.0f
-#define CALIB_RESPRAY_L2_MM      400.0f
-#define CALIB_RESPRAY_L3_MM      600.0f
-#define CALIB_RESPRAY_L4_MM      800.0f
-#define CALIB_RESPRAY_L5_MM     1000.0f
-#define CALIB_RESPRAY_DEFAULT    5       /* 上电默认档位 */
-
-/* ---------- 时序参数（毫秒） ---------- */
-#define CALIB_BOOT_SILENCE_MS   10000    /* 上电后忽略命令的时长，避开串口毛刺 */
-#define CALIB_CMD_TIMEOUT_MS     3000    /* 运动态超过此时长无合法字节则停机 */
-#define CALIB_JOG_TIMEOUT_MS     2000    /* 遥控点动超时 */
-
+/* ---------- 工艺行程与超时：不在这个文件里 ----------
+ * 车位长宽、转角、补喷档位、上电静默、各种超时都写在 system.c 顶部
+ * （PAINT_LEN_DEFAULT_MM / BOOT_SILENCE_MS / PAINT_TIMEOUT_MS ...），
+ * 因为那边才是真正用它们的地方，protocol_test 也直接从 system.c 里读。
+ *
+ * 这里以前也留过一份（CALIB_PAINT_LONG_MM / CALIB_RESPRAY_L1_MM /
+ * CALIB_BOOT_SILENCE_MS ...），但全仓库没有一处引用：改了一点效果都没有，
+ * 而且 CALIB_BOOT_SILENCE_MS 写的是 10000，实际生效的是 3000。删掉，
+ * 免得下一个人照着它改。
+ */
 #endif

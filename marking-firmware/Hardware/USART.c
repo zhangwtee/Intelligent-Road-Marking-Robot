@@ -4,50 +4,51 @@
 #include "uart_ring.h"
 
 /* --------------------------------------------------------------------------
- * ä¸¤è·¯ä¸²å£çš„æŽ¥æ”¶ç¼“å†²
+ * Á½Â·´®¿Ú£º½ÓÊÕºÍ·¢ËÍ¸÷Ò»¸ö»·
  *
- * åŽŸæ¥æ˜¯ã€ä¸€ä¸ªå­—èŠ‚å˜é‡ + ä¸€ä¸ªæ ‡å¿—ä½ã€‘ï¼Œä¸­æ–­å†™ã€ä¸»å¾ªçŽ¯è¯»ï¼ŒåŒæ—¶åªèƒ½è®°ä½ä¸€ä¸ª
- * å­—èŠ‚ã€‚ä¸»å¾ªçŽ¯ä¸€åœˆæœ¬æ¥è¿œå¿«äºŽä¸²å£åˆ°è¾¾ä¸€ä¸ªå­—èŠ‚çš„é€Ÿåº¦ï¼Œä½† OLED åˆ·ä¸€å±ï¼ˆè½¯ä»¶
- * I2Cï¼Œ80~100msï¼‰ã€èˆµæœºæ’å€¼æ—¶éƒ½ä¼šåœä½ï¼›è¿™æœŸé—´åˆ°çš„å­—èŠ‚ï¼ŒåŽä¸€ä¸ªç›´æŽ¥æŠŠå‰ä¸€ä¸ª
- * è¦†ç›–æŽ‰ã€‚
+ * ½ÓÊÕ£ºÖÐ¶ÏÈû×Ö½Ú¡¢Ö÷Ñ­»·È¡¡£Ô­À´ÊÇ¡¾Ò»¸ö×Ö½Ú±äÁ¿ + Ò»¸ö±êÖ¾Î»¡¿£¬ÖÐ¶ÏÐ´¡¢
+ * Ö÷Ñ­»·¶Á£¬Í¬Ê±Ö»ÄÜ¼Ç×¡Ò»¸ö×Ö½Ú£»OLED Ë¢Ò»ÆÁ£¨Èí¼þ I2C£¬80~100ms£©¡¢¶æ»ú
+ * ²åÖµÊ±Ö÷Ñ­»·»áÍ£×¡£¬ÕâÆÚ¼äµ½µÄ×Ö½Ú£¬ºóÒ»¸öÖ±½Ó°ÑÇ°Ò»¸ö¸²¸Çµô¡£
  *
- * æ¢æˆçŽ¯å½¢ç¼“å†²ä¹‹åŽï¼š
- *   - ä¸­æ–­åªåšä¸€ä»¶äº‹ï¼šæŠŠå­—èŠ‚å¡žè¿›ç¼“å†²ï¼Œç«‹åˆ»é€€å‡ºï¼ˆä¸ç¢°ä»»ä½•å…±äº«çŠ¶æ€ï¼‰
- *   - ä¸»å¾ªçŽ¯æ‰¹é‡å–ï¼Œä¸€æ¬¡èƒ½å–èµ°ç§¯åŽ‹çš„å…¨éƒ¨å­—èŠ‚
- *   - ä¸¤è·¯è½®è½¬å–ï¼Œä¸å†"è“ç‰™ä¼˜å…ˆ"æŠŠä¸Šä½æœºé¥¿æ­»ï¼ˆè§ system.c çš„ ProcessCommandï¼‰
+ * ·¢ËÍ£ºÖ÷Ñ­»·Èû×Ö½Ú¡¢TXE ÖÐ¶ÏÈ¡¡£ÒÔÇ°ÊÇ×èÈû·¢ ¡ª¡ª Ò»Ö¡ 10 ×Ö½ÚÔÚ 9600 ÏÂÒª
+ * 10.4ms£¬×´Ì¬Ö¡ 5Hz + º½ÏòÖ¡ 5Hz£¬Ò»ÃëÓÐÒ»°Ù¶àºÁÃëÔÚµÈ TXE£¬ÊÕ×Ö½ÚºÍ×´Ì¬»ú
+ * ÍÆ½øÈ«±»ÍÆºó¡£ÏÖÔÚÕâÒ»È¦Ö»»¨¼¸Ê®Î¢Ãë£¬ÏßÉÏ»¹ÊÇ 10.4ms£¬µ«²»µÈËü¡£
  *
- * å…·ä½“ä¸ºä»€ä¹ˆè¿™æ ·æ˜¯çº¿ç¨‹å®‰å…¨çš„ï¼Œè§ uart_ring.h é¡¶éƒ¨ã€‚
+ * Á½ÌõÂ·¶¼ÊÇµ¥Éú²úÕß / µ¥Ïû·ÑÕß£¬ËùÒÔ²»ÐèÒªÁÙ½çÇø£»¾ßÌå¼û uart_ring.h ¶¥²¿¡£
  * -------------------------------------------------------------------------- */
-static UartRing rx1;    /* USART1 = è“ç‰™ï¼ˆPA9/PA10ï¼‰ */
-static UartRing rx2;    /* USART2 = æ ‘èŽ“æ´¾ï¼ˆPA2/PA3ï¼‰ */
+static UartRing rx1;    /* USART1 ½ÓÊÕ£¨À¶ÑÀ£© */
+static UartRing tx1;    /* USART1 ·¢ËÍ£ºÖ÷Ñ­»··Å£¬TXE ÖÐ¶ÏÈ¡ */
+static UartRing rx2;    /* USART2 ½ÓÊÕ£¨Ê÷Ý®ÅÉ£© */
+static UartRing tx2;    /* USART2 ·¢ËÍ£¬Í¬ÉÏ */
 
 void Serial1_Init(void)
 {
-    /* å…ˆæ¸…ç¼“å†²ï¼Œå†å¼€ä¸­æ–­ â€”â€” åè¿‡æ¥çš„è¯ï¼Œå¼€ä¸­æ–­åˆ°æ¸…ç¼“å†²ä¹‹é—´æ”¶åˆ°çš„å­—èŠ‚ä¼šè¢«æŠ¹æŽ‰ */
+    /* ÏÈÇå»º³å£¬ÔÙ¿ªÖÐ¶Ï ¡ª¡ª ·´¹ýÀ´µÄ»°£¬¿ªÖÐ¶Ïµ½Çå»º³åÖ®¼äÊÕµ½µÄ×Ö½Ú»á±»Ä¨µô */
     UartRing_Init(&rx1);
+    UartRing_Init(&tx1);
 
-    /*å¼€å¯æ—¶é’Ÿ*/
-    RCC_APB2PeriphClockCmd(RCC_APB2Periph_USART1, ENABLE);    // USART1æ—¶é’Ÿåœ¨APB2ä¸Š
-    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);     // GPIOAæ—¶é’Ÿ
+    /*¿ªÆôÊ±ÖÓ*/
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_USART1, ENABLE);    // USART1Ê±ÖÓÔÚAPB2ÉÏ
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);     // GPIOAÊ±ÖÓ
 
-    /*GPIOåˆå§‹åŒ–*/
+    /*GPIO³õÊ¼»¯*/
     GPIO_InitTypeDef GPIO_InitStructure;
 
-    // PA9ä½œä¸ºUSART1_TXï¼ˆå¤ç”¨æŽ¨æŒ½è¾“å‡ºï¼‰
+    // PA9×÷ÎªUSART1_TX£¨¸´ÓÃÍÆÍìÊä³ö£©
     GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AF_PP;
     GPIO_InitStructure.GPIO_Pin = GPIO_Pin_9;                 // PA9
     GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
     GPIO_Init(GPIOA, &GPIO_InitStructure);
 
-    // PA10ä½œä¸ºUSART1_RXï¼ˆæµ®ç©ºè¾“å…¥ï¼‰
-    // ä¸Šæ‹‰è¾“å…¥ï¼Œä¸æ˜¯æµ®ç©ºã€‚å¯¹ç«¯ï¼ˆè“ç‰™æ¨¡å— / æ ‘èŽ“æ´¾ï¼‰æ²¡ä¸Šç”µæˆ–è€…æ²¡æ’çš„æ—¶å€™ï¼Œ
-    // æ‚¬ç©ºçš„ RX è„šè¢«ç”µæœºå’Œé©±åŠ¨å™¨çš„å¹²æ‰°ä¸€è€¦åˆå°±èƒ½åˆæˆä¸€ä¸ªèµ·å§‹ä½ï¼ŒHandleCmd
-    // æ‹¿åˆ°ä¸€ä¸ªä»»æ„å­—èŠ‚ç…§æ‰§è¡Œ â€”â€” 'U' æ˜¯å‰è¿›ï¼Œ'P' æ˜¯å¼€å§‹ç”»è½¦ä½ã€‚
-    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IPU;             // ä¸Šæ‹‰è¾“å…¥
+    // PA10×÷ÎªUSART1_RX£¨¸¡¿ÕÊäÈë£©
+    // ÉÏÀ­ÊäÈë£¬²»ÊÇ¸¡¿Õ¡£¶Ô¶Ë£¨À¶ÑÀÄ£¿é / Ê÷Ý®ÅÉ£©Ã»ÉÏµç»òÕßÃ»²åµÄÊ±ºò£¬
+    // Ðü¿ÕµÄ RX ½Å±»µç»úºÍÇý¶¯Æ÷µÄ¸ÉÈÅÒ»ñîºÏ¾ÍÄÜºÏ³ÉÒ»¸öÆðÊ¼Î»£¬HandleCmd
+    // ÄÃµ½Ò»¸öÈÎÒâ×Ö½ÚÕÕÖ´ÐÐ ¡ª¡ª 'U' ÊÇÇ°½ø£¬'P' ÊÇ¿ªÊ¼»­³µÎ»¡£
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IPU;             // ÉÏÀ­ÊäÈë
     GPIO_InitStructure.GPIO_Pin = GPIO_Pin_10;                // PA10
     GPIO_Init(GPIOA, &GPIO_InitStructure);
 
-    /*USARTåˆå§‹åŒ–*/
+    /*USART³õÊ¼»¯*/
     USART_InitTypeDef USART_InitStructure;
     USART_InitStructure.USART_BaudRate = 9600;
     USART_InitStructure.USART_HardwareFlowControl = USART_HardwareFlowControl_None;
@@ -57,27 +58,49 @@ void Serial1_Init(void)
     USART_InitStructure.USART_WordLength = USART_WordLength_8b;
     USART_Init(USART1, &USART_InitStructure);                 // USART1
 
-    /*ä¸­æ–­é…ç½®*/
-    USART_ITConfig(USART1, USART_IT_RXNE, ENABLE);            // USART1æŽ¥æ”¶ä¸­æ–­
+    /*ÖÐ¶ÏÅäÖÃ*/
+    USART_ITConfig(USART1, USART_IT_RXNE, ENABLE);            // USART1½ÓÊÕÖÐ¶Ï
 
-    /*NVICé…ç½®*/
+    /*NVICÅäÖÃ*/
     NVIC_PriorityGroupConfig(NVIC_PriorityGroup_2);
 
     NVIC_InitTypeDef NVIC_InitStructure;
-    NVIC_InitStructure.NVIC_IRQChannel = USART1_IRQn;         // USART1ä¸­æ–­é€šé“
+    NVIC_InitStructure.NVIC_IRQChannel = USART1_IRQn;         // USART1ÖÐ¶ÏÍ¨µÀ
     NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;
     NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 1;
     NVIC_InitStructure.NVIC_IRQChannelSubPriority = 1;
     NVIC_Init(&NVIC_InitStructure);
 
-    /*USARTä½¿èƒ½*/
+    /*USARTÊ¹ÄÜ*/
     USART_Cmd(USART1, ENABLE);                                // USART1
+}
+
+/* °ÑÒ»¸ö×Ö½Ú·Å½ø·¢ËÍ»·£¬²¢±£Ö¤ TXE ÖÐ¶Ï¿ª×Å¡£
+ *
+ * »·ÂúÊ±µÈÖÐ¶ÏÌÚÎ»ÖÃ£¨9600 ÏÂÒ»×Ö½ÚÔ¼ 1ms£©£¬²»Ö±½ÓÐ´ DR ¡ª¡ª Ö÷Ñ­»·ºÍ
+ * ÖÐ¶ÏÍ¬Ê±Íù DR Ð´»á¶ª×Ö½Ú£¬¶ø¶ªÒ»¸ö×Ö½Ú¾ÍÒª¿¿¶Ô¶Ë 300ms ¾²Ä¬ÆÚÖØÐÂÍ¬²½¡£
+ * Put ºÍ"¿ª TXE ÖÐ¶Ï"·ÅÔÚÍ¬Ò»¸öÁÙ½çÇøÀï£º·Ö¿ª×öµÄ»°£¬ÖÐ¶Ï¿ÉÄÜ¸ÕºÃÔÚ
+ * ÖÐ¼ä°Ñ»·³é¿Õ¡¢Ë³ÊÖ°Ñ TXE ¹Øµô£¬ÄÇ¸ö×Ö½Ú¾ÍÓÀÔ¶ÁôÔÚ»·ÀïÁË¡£
+ *
+ * ÕâÌõÁ´µÚÒ»´ÎÉÏµç¾Í¸ÃÈ·ÈÏ£º½ÓÉÏÉÏÎ»»ú»ò´®¿ÚÖúÊÖ£¬×´Ì¬Ö¡ 5Hz ÔÚ¹ö¾ÍÊÇÍ¨µÄ£»
+ * Ò»Ö¡¶¼Ã»ÓÐ£¬ÏÈ²é PA9 / PA2 µÄ TX ÏßºÍ²¨ÌØÂÊ£¬±ðÈ¥·­Ð­Òé²ã¡£ */
+static void Uart_TxPut(USART_TypeDef *u, UartRing *r, uint8_t b)
+{
+    for (;;) {
+        __disable_irq();
+        if (UartRing_Put(r, b)) {
+            USART_ITConfig(u, USART_IT_TXE, ENABLE);
+            __enable_irq();
+            return;
+        }
+        __enable_irq();
+        USART_ITConfig(u, USART_IT_TXE, ENABLE);   /* »·Âú£ºÈ·±£ÖÐ¶ÏÔÚ³é */
+    }
 }
 
 void Serial1_SendByte(uint8_t Byte)
 {
-    USART_SendData(USART1, Byte);        // æ”¹ä¸ºUSART1
-    while (USART_GetFlagStatus(USART1, USART_FLAG_TXE) == RESET);  // æ”¹ä¸ºUSART1
+    Uart_TxPut(USART1, &tx1, Byte);
 }
 
 uint32_t Serial1_Pow(uint32_t X, uint32_t Y)
@@ -100,84 +123,97 @@ void Serial1_SendNumber(uint32_t Number, uint8_t Length)
 }
 
 /**
-  * å‡½    æ•°ï¼šå–ä¸€ä¸ªå·²æ”¶åˆ°çš„å­—èŠ‚
-  * å‚    æ•°ï¼šout ç”¨æ¥å¸¦å›žæ•°æ®
-  * è¿” å›ž å€¼ï¼š1 = å–åˆ°äº†ï¼Œ0 = æ²¡æœ‰æ–°å­—èŠ‚
-  * è¯´    æ˜Žï¼šæ•°æ®æºä»Ž"ä¸€ä¸ªå˜é‡ + ä¸€ä¸ªæ ‡å¿—ä½"æ¢æˆäº†çŽ¯å½¢ç¼“å†²ã€‚
-  *           åŽŸæ¥å¿…é¡»åœ¨ä¸´ç•ŒåŒºé‡Œ"è¯»æ•°æ® + æ¸…æ ‡å¿—"æ‰“åŒ…ï¼Œå¦åˆ™åŒä¸€ä¸ªå­—èŠ‚ä¼šè¢«
-  *           æ‰§è¡Œä¸¤æ¬¡ï¼ˆ'P' ç”»ä¸¤æ¬¡è½¦ä½ï¼‰ï¼›çŽ°åœ¨ Get åªæŒªä¸€ä¸ªè¯»æŒ‡é’ˆï¼Œ
-  *           ä¸­æ–­åªæŒªä¸€ä¸ªå†™æŒ‡é’ˆï¼Œä¸¤è€…äº’ä¸è¦†ç›–ï¼Œä¸´ç•ŒåŒºè‡ªç„¶å°±ä¸éœ€è¦äº†ã€‚
-  *           æŽ¥å£åä¸å˜ï¼Œsystem.c ä¸€è¡Œéƒ½ä¸ç”¨æ”¹å°±èƒ½è·‘ã€‚
+  * º¯    Êý£ºÈ¡Ò»¸öÒÑÊÕµ½µÄ×Ö½Ú
+  * ²Î    Êý£ºout ÓÃÀ´´ø»ØÊý¾Ý
+  * ·µ »Ø Öµ£º1 = È¡µ½ÁË£¬0 = Ã»ÓÐÐÂ×Ö½Ú
+  * Ëµ    Ã÷£ºÊý¾ÝÔ´´Ó"Ò»¸ö±äÁ¿ + Ò»¸ö±êÖ¾Î»"»»³ÉÁË»·ÐÎ»º³å¡£
+  *           Ô­À´±ØÐëÔÚÁÙ½çÇøÀï"¶ÁÊý¾Ý + Çå±êÖ¾"´ò°ü£¬·ñÔòÍ¬Ò»¸ö×Ö½Ú»á±»
+  *           Ö´ÐÐÁ½´Î£¨'P' »­Á½´Î³µÎ»£©£»ÏÖÔÚ Get Ö»Å²Ò»¸ö¶ÁÖ¸Õë£¬
+  *           ÖÐ¶ÏÖ»Å²Ò»¸öÐ´Ö¸Õë£¬Á½Õß»¥²»¸²¸Ç£¬ÁÙ½çÇø×ÔÈ»¾Í²»ÐèÒªÁË¡£
+  *           ½Ó¿ÚÃû²»±ä£¬system.c Ò»ÐÐ¶¼²»ÓÃ¸Ä¾ÍÄÜÅÜ¡£
   */
 uint8_t Serial1_TakeRxData(uint8_t *out)
 {
     return UartRing_Get(&rx1, out);
 }
 
-/* ç§¯åŽ‹å­—èŠ‚æ•°ï¼Œè°ƒè¯•æ—¶çœ‹ä¸»å¾ªçŽ¯æœ‰æ²¡æœ‰è¢«å¡ä½ */
+/* »ýÑ¹×Ö½ÚÊý£¬µ÷ÊÔÊ±¿´Ö÷Ñ­»·ÓÐÃ»ÓÐ±»¿¨×¡ */
 uint16_t Serial1_RxCount(void)
 {
     return UartRing_Count(&rx1);
 }
 
-/* å› ç¼“å†²æ»¡è€Œä¸¢å¼ƒçš„å­—èŠ‚æ•°ã€‚æ­£å¸¸è¿è¡Œæ—¶åº”è¯¥æ’ä¸º 0 */
+/* Òò»º³åÂú¶ø¶ªÆúµÄ×Ö½ÚÊý¡£Õý³£ÔËÐÐÊ±Ó¦¸ÃºãÎª 0 */
 uint16_t Serial1_RxOverflow(void)
 {
     return UartRing_Overflow(&rx1);
 }
 
-/* çœ‹ç¬¬ offset ä¸ªå¾…å¤„ç†å­—èŠ‚ï¼Œä¸æ¶ˆè´¹ â€”â€” å¸§åè®®è§£æžç”¨ï¼Œè§ proto.c */
+/* ¿´µÚ offset ¸ö´ý´¦Àí×Ö½Ú£¬²»Ïû·Ñ ¡ª¡ª Ö¡Ð­Òé½âÎöÓÃ£¬¼û proto.c */
 uint8_t Serial1_Peek(uint16_t offset, uint8_t *out)
 {
     return UartRing_Peek(&rx1, offset, out);
 }
 
-/* ä¸¢å¼ƒ n ä¸ªå­—èŠ‚ã€‚åªæœ‰ä¸»å¾ªçŽ¯æ”¹ tailï¼Œæ‰€ä»¥å’Œ Get ä¸€æ ·ä¸éœ€è¦ä¸´ç•ŒåŒº */
+/* ¶ªÆú n ¸ö×Ö½Ú¡£Ö»ÓÐÖ÷Ñ­»·¸Ä tail£¬ËùÒÔºÍ Get Ò»Ñù²»ÐèÒªÁÙ½çÇø */
 void Serial1_Drop(uint16_t n)
 {
     UartRing_Drop(&rx1, n);
 }
 
-void USART1_IRQHandler(void)  // æ”¹ä¸ºUSART1ä¸­æ–­å¤„ç†å‡½æ•°
+void USART1_IRQHandler(void)  // ¸ÄÎªUSART1ÖÐ¶Ï´¦Àíº¯Êý
 {
     if (USART_GetITStatus(USART1, USART_IT_RXNE) == SET)  // USART1
     {
-        // æ— æ¡ä»¶è¯»ä¸€æ¬¡ DRï¼šåŒæ—¶æ¸… RXNE å’Œ OREï¼ˆæº¢å‡ºï¼‰ã€‚
-        // ä¸æ¸… ORE çš„è¯ï¼Œä¸€æ—¦å‘ç”Ÿè¿‡ä¸€æ¬¡æº¢å‡ºï¼ŒRXNE ä¼šè¢« ORE é¡¶ä½åå¤è¿›ä¸­æ–­ï¼Œ
-        // ä¸»å¾ªçŽ¯è¢«é¥¿æ­»ã€‚æ‰€ä»¥è¿™é‡Œå¿…é¡»"å…ˆè¯»ã€å†åˆ¤æ–­ç”¨ä¸ç”¨"ã€‚
+        // ÎÞÌõ¼þ¶ÁÒ»´Î DR£ºÍ¬Ê±Çå RXNE ºÍ ORE£¨Òç³ö£©¡£
+        // ²»Çå ORE µÄ»°£¬Ò»µ©·¢Éú¹ýÒ»´ÎÒç³ö£¬RXNE »á±» ORE ¶¥×¡·´¸´½øÖÐ¶Ï£¬
+        // Ö÷Ñ­»·±»¶öËÀ¡£ËùÒÔÕâÀï±ØÐë"ÏÈ¶Á¡¢ÔÙÅÐ¶ÏÓÃ²»ÓÃ"¡£
         uint8_t b = (uint8_t)USART_ReceiveData(USART1);
         UartRing_Put(&rx1, b);
+    }
+
+    /* ·¢ËÍ£º»·ÀïÓÐ¾Í¼ÌÐøÐ´ DR£¬È¡¿ÕÁË¾Í°Ñ TXE ÖÐ¶Ï¹Øµô£¨·ñÔò DR Ò»¿Õ
+     * ¾ÍÒ»Ö±½øÖÐ¶Ï£©¡£Ð´ DR »á×Ô¶¯Çå TXE£¬²»ÐèÒªÊÖ¶¯Çå±êÖ¾¡£ */
+    if (USART_GetITStatus(USART1, USART_IT_TXE) == SET)
+    {
+        uint8_t out;
+        if (UartRing_Get(&tx1, &out)) {
+            USART_SendData(USART1, out);
+        } else {
+            USART_ITConfig(USART1, USART_IT_TXE, DISABLE);
+        }
     }
 }
 
 
 void Serial2_Init(void)
 {
-    /* å…ˆæ¸…ç¼“å†²ï¼Œå†å¼€ä¸­æ–­ */
+    /* ÏÈÇå»º³å£¬ÔÙ¿ªÖÐ¶Ï */
     UartRing_Init(&rx2);
+    UartRing_Init(&tx2);
 
-    /*å¼€å¯æ—¶é’Ÿ*/
+    /*¿ªÆôÊ±ÖÓ*/
     RCC_APB1PeriphClockCmd(RCC_APB1Periph_USART2, ENABLE);
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
 
-    /*GPIOåˆå§‹åŒ–*/
+    /*GPIO³õÊ¼»¯*/
     GPIO_InitTypeDef GPIO_InitStructure;
 
-    // PA2ä½œä¸ºUSART2_TXï¼ˆå¤ç”¨æŽ¨æŒ½è¾“å‡ºï¼‰
+    // PA2×÷ÎªUSART2_TX£¨¸´ÓÃÍÆÍìÊä³ö£©
     GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AF_PP;
     GPIO_InitStructure.GPIO_Pin = GPIO_Pin_2;                 // PA2
     GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
     GPIO_Init(GPIOA, &GPIO_InitStructure);
 
-    // PA3ä½œä¸ºUSART2_RXï¼ˆæµ®ç©ºè¾“å…¥ï¼‰
-    // ä¸Šæ‹‰è¾“å…¥ï¼Œä¸æ˜¯æµ®ç©ºã€‚å¯¹ç«¯ï¼ˆè“ç‰™æ¨¡å— / æ ‘èŽ“æ´¾ï¼‰æ²¡ä¸Šç”µæˆ–è€…æ²¡æ’çš„æ—¶å€™ï¼Œ
-    // æ‚¬ç©ºçš„ RX è„šè¢«ç”µæœºå’Œé©±åŠ¨å™¨çš„å¹²æ‰°ä¸€è€¦åˆå°±èƒ½åˆæˆä¸€ä¸ªèµ·å§‹ä½ï¼ŒHandleCmd
-    // æ‹¿åˆ°ä¸€ä¸ªä»»æ„å­—èŠ‚ç…§æ‰§è¡Œ â€”â€” 'U' æ˜¯å‰è¿›ï¼Œ'P' æ˜¯å¼€å§‹ç”»è½¦ä½ã€‚
-    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IPU;             // ä¸Šæ‹‰è¾“å…¥
+    // PA3×÷ÎªUSART2_RX£¨¸¡¿ÕÊäÈë£©
+    // ÉÏÀ­ÊäÈë£¬²»ÊÇ¸¡¿Õ¡£¶Ô¶Ë£¨À¶ÑÀÄ£¿é / Ê÷Ý®ÅÉ£©Ã»ÉÏµç»òÕßÃ»²åµÄÊ±ºò£¬
+    // Ðü¿ÕµÄ RX ½Å±»µç»úºÍÇý¶¯Æ÷µÄ¸ÉÈÅÒ»ñîºÏ¾ÍÄÜºÏ³ÉÒ»¸öÆðÊ¼Î»£¬HandleCmd
+    // ÄÃµ½Ò»¸öÈÎÒâ×Ö½ÚÕÕÖ´ÐÐ ¡ª¡ª 'U' ÊÇÇ°½ø£¬'P' ÊÇ¿ªÊ¼»­³µÎ»¡£
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IPU;             // ÉÏÀ­ÊäÈë
     GPIO_InitStructure.GPIO_Pin = GPIO_Pin_3;                 // PA3
     GPIO_Init(GPIOA, &GPIO_InitStructure);
 
-    /*USARTåˆå§‹åŒ–*/
+    /*USART³õÊ¼»¯*/
     USART_InitTypeDef USART_InitStructure;
     USART_InitStructure.USART_BaudRate = 9600;
     USART_InitStructure.USART_HardwareFlowControl = USART_HardwareFlowControl_None;
@@ -187,69 +223,67 @@ void Serial2_Init(void)
     USART_InitStructure.USART_WordLength = USART_WordLength_8b;
     USART_Init(USART2, &USART_InitStructure);                 // USART2
 
-    /*ä¸­æ–­é…ç½®*/
+    /*ÖÐ¶ÏÅäÖÃ*/
     USART_ITConfig(USART2, USART_IT_RXNE, ENABLE);            //USART2
 
-    /*NVICé…ç½®*/
+    /*NVICÅäÖÃ*/
     NVIC_PriorityGroupConfig(NVIC_PriorityGroup_2);
 
     NVIC_InitTypeDef NVIC_InitStructure;
-    NVIC_InitStructure.NVIC_IRQChannel = USART2_IRQn;         // USART2ä¸­æ–­é€šé“
+    NVIC_InitStructure.NVIC_IRQChannel = USART2_IRQn;         // USART2ÖÐ¶ÏÍ¨µÀ
     NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;
     NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 1;
     NVIC_InitStructure.NVIC_IRQChannelSubPriority = 1;
     NVIC_Init(&NVIC_InitStructure);
 
-    /*USARTä½¿èƒ½*/
+    /*USARTÊ¹ÄÜ*/
     USART_Cmd(USART2, ENABLE);                                // USART2
 }
 
 /**
-  * å‡½    æ•°ï¼šä¸²å£å‘é€ä¸€ä¸ªå­—èŠ‚
-  * å‚    æ•°ï¼šByte è¦å‘é€çš„ä¸€ä¸ªå­—èŠ‚
-  * è¿” å›ž å€¼ï¼šæ— 
+  * º¯    Êý£º´®¿Ú·¢ËÍÒ»¸ö×Ö½Ú
+  * ²Î    Êý£ºByte Òª·¢ËÍµÄÒ»¸ö×Ö½Ú
+  * ·µ »Ø Öµ£ºÎÞ
   */
 void Serial2_SendByte(uint8_t Byte)
 {
-	USART_SendData(USART2, Byte);		//å°†å­—èŠ‚æ•°æ®å†™å…¥æ•°æ®å¯„å­˜å™¨ï¼Œå†™å…¥åŽUSARTè‡ªåŠ¨ç”Ÿæˆæ—¶åºæ³¢å½¢
-	while (USART_GetFlagStatus(USART2, USART_FLAG_TXE) == RESET);	//ç­‰å¾…å‘é€å®Œæˆ
-	/*ä¸‹æ¬¡å†™å…¥æ•°æ®å¯„å­˜å™¨ä¼šè‡ªåŠ¨æ¸…é™¤å‘é€å®Œæˆæ ‡å¿—ä½ï¼Œæ•…æ­¤å¾ªçŽ¯åŽï¼Œæ— éœ€æ¸…é™¤æ ‡å¿—ä½*/
+    Uart_TxPut(USART2, &tx2, Byte);
 }
 
 /**
-  * å‡½    æ•°ï¼šæ¬¡æ–¹å‡½æ•°ï¼ˆå†…éƒ¨ä½¿ç”¨ï¼‰
-  * è¿” å›ž å€¼ï¼šè¿”å›žå€¼ç­‰äºŽXçš„Yæ¬¡æ–¹
+  * º¯    Êý£º´Î·½º¯Êý£¨ÄÚ²¿Ê¹ÓÃ£©
+  * ·µ »Ø Öµ£º·µ»ØÖµµÈÓÚXµÄY´Î·½
   */
 uint32_t Serial2_Pow(uint32_t X, uint32_t Y)
 {
-	uint32_t Result = 1;	//è®¾ç½®ç»“æžœåˆå€¼ä¸º1
-	while (Y --)			//æ‰§è¡ŒYæ¬¡
+	uint32_t Result = 1;	//ÉèÖÃ½á¹û³õÖµÎª1
+	while (Y --)			//Ö´ÐÐY´Î
 	{
-		Result *= X;		//å°†Xç´¯ä¹˜åˆ°ç»“æžœ
+		Result *= X;		//½«XÀÛ³Ëµ½½á¹û
 	}
 	return Result;
 }
 
 /**
-  * å‡½    æ•°ï¼šä¸²å£å‘é€æ•°å­—
-  * å‚    æ•°ï¼šNumber è¦å‘é€çš„æ•°å­—ï¼ŒèŒƒå›´ï¼š0~4294967295
-  * å‚    æ•°ï¼šLength è¦å‘é€æ•°å­—çš„é•¿åº¦ï¼ŒèŒƒå›´ï¼š0~10
-  * è¿” å›ž å€¼ï¼šæ— 
+  * º¯    Êý£º´®¿Ú·¢ËÍÊý×Ö
+  * ²Î    Êý£ºNumber Òª·¢ËÍµÄÊý×Ö£¬·¶Î§£º0~4294967295
+  * ²Î    Êý£ºLength Òª·¢ËÍÊý×ÖµÄ³¤¶È£¬·¶Î§£º0~10
+  * ·µ »Ø Öµ£ºÎÞ
   */
 void Serial2_SendNumber(uint32_t Number, uint8_t Length)
 {
 	uint8_t i;
-	for (i = 0; i < Length; i ++)		//æ ¹æ®æ•°å­—é•¿åº¦éåŽ†æ•°å­—çš„æ¯ä¸€ä½
+	for (i = 0; i < Length; i ++)		//¸ù¾ÝÊý×Ö³¤¶È±éÀúÊý×ÖµÄÃ¿Ò»Î»
 	{
-		Serial2_SendByte(Number / Serial2_Pow(10, Length - i - 1) % 10 + '0');	//ä¾æ¬¡è°ƒç”¨Serial_SendByteå‘é€æ¯ä½æ•°å­—
+		Serial2_SendByte(Number / Serial2_Pow(10, Length - i - 1) % 10 + '0');	//ÒÀ´Îµ÷ÓÃSerial_SendByte·¢ËÍÃ¿Î»Êý×Ö
 	}
 }
 
 /**
-  * å‡½    æ•°ï¼šå–ä¸€ä¸ªå·²æ”¶åˆ°çš„å­—èŠ‚
-  * å‚    æ•°ï¼šout ç”¨æ¥å¸¦å›žæ•°æ®
-  * è¿” å›ž å€¼ï¼š1 = å–åˆ°äº†ï¼Œ0 = æ²¡æœ‰æ–°å­—èŠ‚
-  * è¯´    æ˜Žï¼šä¸Ž Serial1_TakeRxData åŒæž„ï¼Œè§ä¸Šé¢çš„è¯´æ˜Žã€‚
+  * º¯    Êý£ºÈ¡Ò»¸öÒÑÊÕµ½µÄ×Ö½Ú
+  * ²Î    Êý£ºout ÓÃÀ´´ø»ØÊý¾Ý
+  * ·µ »Ø Öµ£º1 = È¡µ½ÁË£¬0 = Ã»ÓÐÐÂ×Ö½Ú
+  * Ëµ    Ã÷£ºÓë Serial1_TakeRxData Í¬¹¹£¬¼ûÉÏÃæµÄËµÃ÷¡£
   */
 uint8_t Serial2_TakeRxData(uint8_t *out)
 {
@@ -277,19 +311,30 @@ void Serial2_Drop(uint16_t n)
 }
 
 /**
-  * å‡½    æ•°ï¼šUSART2ä¸­æ–­å‡½æ•°
-  * å‚    æ•°ï¼šæ— 
-  * è¿” å›ž å€¼ï¼šæ— 
-  * æ³¨æ„äº‹é¡¹ï¼šæ­¤å‡½æ•°ä¸ºä¸­æ–­å‡½æ•°ï¼Œæ— éœ€è°ƒç”¨ï¼Œä¸­æ–­è§¦å‘åŽè‡ªåŠ¨æ‰§è¡Œ
-  *           å‡½æ•°åä¸ºé¢„ç•™çš„æŒ‡å®šåç§°ï¼Œå¯ä»¥ä»Žå¯åŠ¨æ–‡ä»¶å¤åˆ¶
-  *           è¯·ç¡®ä¿å‡½æ•°åæ­£ç¡®ï¼Œä¸èƒ½æœ‰ä»»ä½•å·®å¼‚ï¼Œå¦åˆ™ä¸­æ–­å‡½æ•°å°†ä¸èƒ½è¿›å…¥
+  * º¯    Êý£ºUSART2ÖÐ¶Ïº¯Êý
+  * ²Î    Êý£ºÎÞ
+  * ·µ »Ø Öµ£ºÎÞ
+  * ×¢ÒâÊÂÏî£º´Ëº¯ÊýÎªÖÐ¶Ïº¯Êý£¬ÎÞÐèµ÷ÓÃ£¬ÖÐ¶Ï´¥·¢ºó×Ô¶¯Ö´ÐÐ
+  *           º¯ÊýÃûÎªÔ¤ÁôµÄÖ¸¶¨Ãû³Æ£¬¿ÉÒÔ´ÓÆô¶¯ÎÄ¼þ¸´ÖÆ
+  *           ÇëÈ·±£º¯ÊýÃûÕýÈ·£¬²»ÄÜÓÐÈÎºÎ²îÒì£¬·ñÔòÖÐ¶Ïº¯Êý½«²»ÄÜ½øÈë
   */
 void USART2_IRQHandler(void)
 {
-	if (USART_GetITStatus(USART2, USART_IT_RXNE) == SET)		//åˆ¤æ–­æ˜¯å¦æ˜¯USART2çš„æŽ¥æ”¶äº‹ä»¶è§¦å‘çš„ä¸­æ–­
+	if (USART_GetITStatus(USART2, USART_IT_RXNE) == SET)		//ÅÐ¶ÏÊÇ·ñÊÇUSART2µÄ½ÓÊÕÊÂ¼þ´¥·¢µÄÖÐ¶Ï
 	{
-		// æ— æ¡ä»¶è¯»ä¸€æ¬¡ DRï¼šåŒæ—¶æ¸… RXNE å’Œ OREï¼Œç†ç”±åŒ USART1ã€‚
+		// ÎÞÌõ¼þ¶ÁÒ»´Î DR£ºÍ¬Ê±Çå RXNE ºÍ ORE£¬ÀíÓÉÍ¬ USART1¡£
 		uint8_t b = (uint8_t)USART_ReceiveData(USART2);
 		UartRing_Put(&rx2, b);
 	}
+
+    /* ·¢ËÍ£ºÍ¬ USART1£¬È¡¿ÕÁË¾Í¹Ø TXE ÖÐ¶Ï */
+    if (USART_GetITStatus(USART2, USART_IT_TXE) == SET)
+    {
+        uint8_t out;
+        if (UartRing_Get(&tx2, &out)) {
+            USART_SendData(USART2, out);
+        } else {
+            USART_ITConfig(USART2, USART_IT_TXE, DISABLE);
+        }
+    }
 }

@@ -11,11 +11,11 @@ void UartRing_Init(UartRing *r)
 }
 
 /**
-  * 函    数：中断里存一个字节
+  * 函    数：生产者存一个字节
   * 参    数：r 环形缓冲；byte 收到的字节
-  * 返 回 值：1 = 已存入；0 = 缓冲满，已丢弃
-  * 说    明：只有中断会改 head，所以这里不需要任何保护。
-  *           缓冲满时丢【新】字节而不是覆盖最旧的 —— 旧命令先到先服务，
+  * 返 回 值：1 = 已存入；0 = 缓冲满（接收侧丢弃并计数，发送侧由调用方重试）
+  * 说    明：只有生产者会改 head，所以这里不需要任何保护。
+  *           接收侧满了丢【新】字节而不是覆盖最旧的 —— 旧命令先到先服务，
   *           而且"丢最旧"会让刚到的急停 T 被后面的噪声挤掉，方向反了。
   */
 uint8_t UartRing_Put(UartRing *r, uint8_t byte)
@@ -23,20 +23,20 @@ uint8_t UartRing_Put(UartRing *r, uint8_t byte)
     uint16_t next = (uint16_t)((r->head + 1) & RING_MASK);
 
     if (next == r->tail) {          /* 满：留一格空位用来区分空和满 */
-        r->overflow++;              /* 计数留着，调试时能看出主循环被卡过 */
+        r->overflow++;              /* 接收侧=丢了几次；发送侧=重试了几次，都不丢数据本身 */
         return 0;
     }
 
     r->buf[r->head] = byte;
-    r->head = next;                 /* 先写数据再挪指针，主循环不会读到半成品 */
+    r->head = next;                 /* 先写数据再挪指针，消费者不会读到半成品 */
     return 1;
 }
 
 /**
-  * 函    数：主循环里取一个字节
+  * 函    数：消费者取一个字节
   * 参    数：r 环形缓冲；out 带回数据
   * 返 回 值：1 = 取到；0 = 空
-  * 说    明：只有主循环会改 tail。
+  * 说    明：只有消费者会改 tail。
   */
 uint8_t UartRing_Get(UartRing *r, uint8_t *out)
 {

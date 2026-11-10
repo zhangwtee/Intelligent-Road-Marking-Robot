@@ -141,6 +141,10 @@ class CameraWidget(QLabel):
         # 画面都没起来还按帧往前跑，等于一台瞎车在漆线上开。
         self.camera_ok = False
 
+        # 连续读失败多少帧才当成"相机掉了"。30fps 下 10 帧约 0.3 秒，
+        # USB 抖一下不会误停车；真的拔了线，0.3 秒内就该停。
+        self._camera_fail_streak = 0
+
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_frame)
 
@@ -152,6 +156,7 @@ class CameraWidget(QLabel):
         self.RECT_WIDTH = 100
         self.MIN_AREA = 200
         self.LINEAR_ASPECT_RATIO_THRESH = 4.0
+        self.CAMERA_LOST_FRAMES = 10
         # 破损判据的阈值统一在 core/line_quality.py 的 THRESHOLDS 里，
         # 现场标定只改那一处，别在这儿再放一份。
 
@@ -179,6 +184,7 @@ class CameraWidget(QLabel):
             return False
 
         self.camera_ok = True
+        self._camera_fail_streak = 0
         self.timer.start(30)
         return True
 
@@ -194,6 +200,30 @@ class CameraWidget(QLabel):
 
         self.clear()
         self.setText("摄像头已关闭")
+
+    def _camera_hiccup(self):
+        """读相机失败。单帧抖动不算，连续到门限才当"相机掉了"。
+
+        以前这里直接 return：读失败既不关泵、也不停车，而跟踪循环还在按
+        状态帧一段段发 MOVE —— 相机死了车照样往前走，泵还开着，面板上只剩
+        一帧冻住的画面，什么提示都没有。0.3 秒的滞回是为了 USB 抖一下不至于
+        停掉整条线。
+        """
+        self._camera_fail_streak += 1
+        if self._camera_fail_streak < self.CAMERA_LOST_FRAMES:
+            return
+        if not self.camera_ok and not self.tracking:
+            return                      # 已经处理过了
+
+        self.camera_ok = False
+        self.quality = QUALITY_UNSURE
+        self.quality_note = "相机中断"
+        self.setText("摄像头中断")
+
+        if self.tracking:
+            # 看不见就不喷、也不接着发下一段。stop_track 会关泵再发 'W'，
+            # 顺序和用户手动停一样。
+            self.stop_track()
 
     # ==========================================================
     # 串口发送
@@ -345,6 +375,11 @@ class CameraWidget(QLabel):
         self._segments_sent += 1
         self._last_segment_time = time.monotonic()
 
+        # 固件在新的一段把累计差速清零（Motion_DriveLR 里的 s_trim_accum），
+        # 这边的速率限制也得从 0 起算。不归零的话，上一段末尾的 20mm 会让
+        # 新段第一次纠偏被限成"只能变 8mm"，而车上早就回到 0 了。
+        self.param_trim = 0.0
+
         self._send(frame.build_move(frame.MOVE_FWD, int(segment_mm), int(segment_mm),
                                     self._next_seq()))
 
@@ -381,11 +416,18 @@ class CameraWidget(QLabel):
 
         trim = lane_control.trim_mm(heading_deg, lateral_ratio,
                                     previous=self.param_trim)
+
+        # param_trim 既是速率限制的"上一次输出"，也是"上一次真正发出去的值"
+        # （两者只有死区那一种情况会分开）。先存下来再覆盖。
+        last_sent = self.param_trim
         self.param_trim = trim
 
-        # 死区之内不发。发了也是 0，白白占 10.4ms 的串口带宽，
-        # 还会让 ACK 表里全是"OK"，真正出问题的那条混在里面看不出来。
-        if abs(trim) >= lane_control.GAINS["DEADBAND_MM"]:
+        # 死区之内不发 —— 但"从非零回到 0"必须发。固件 Motion_Trim 记的是
+        # 这一段已经落地的累计差速，不发这一帧 0，它就带着上一次那点差速
+        # 把这一段走完（5 米的段能有三十秒），车会一直朝一边慢慢偏，而界面
+        # 上看不出任何异常。发了也是 0 这句话只在"本来就是 0"时成立。
+        if (abs(trim) >= lane_control.GAINS["DEADBAND_MM"]
+                or (trim == 0.0 and last_sent != 0.0)):
             self._send(frame.build_trim(int(round(trim)), self._next_seq()))
 
     def _want_spray(self, quality):
@@ -546,7 +588,11 @@ class CameraWidget(QLabel):
         ret, frame_in = self.cap.read()
 
         if not ret:
+            self._camera_hiccup()
             return
+
+        self._camera_fail_streak = 0
+        self.camera_ok = True
 
         result = frame_in.copy()
 

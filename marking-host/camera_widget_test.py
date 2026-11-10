@@ -607,6 +607,62 @@ def test_on_status_does_not_resend_when_move_was_rejected():
     assert len(frames_of(s, frame.CMD_MOVE)) == before, "被回绝的命令在无限重发"
 
 
+def test_camera_loss_stops_tracking_and_pump():
+    """读相机连续失败要关泵、停车，而不是接着发下一段。
+
+    以前 update_frame 里只有一句 `if not ret: return` —— 跟踪循环还在按
+    状态帧一段段发 MOVE，泵也保持在开着的状态。相机被踢掉之后，车照样往前
+    开、照样喷，面板上只剩一帧冻住的画面，日志里一条错误都没有。
+    单帧抖动不该停车（USB 本来就会抖），所以门限是连续若干帧。
+    """
+    s = FakeSerial()
+    w = camera_widget.CameraWidget(serial_mgr=s, mode="track")
+    w.tracking = True
+    w.pump_on = True
+    w.camera_ok = True
+    w.cap = type("Cap", (), {"read": lambda self: (False, None)})()
+
+    for _ in range(w.CAMERA_LOST_FRAMES - 1):
+        w.update_frame()
+    assert w.tracking, "单帧读失败就停车了，USB 抖一下会停整条线"
+    assert not frames_of(s, frame.CMD_PUMP), "还没到门限就关泵了"
+
+    w.update_frame()
+    assert not w.tracking
+    assert not w.camera_ok
+    assert frames_of(s, frame.CMD_PUMP), "相机掉了没有关泵"
+    assert b"W" in s.sent, "相机掉了没有停车"
+
+
+def test_trim_returns_to_zero_on_the_wire():
+    """纠偏收敛回 0 时必须真发一帧 0。
+
+    固件 Motion_Trim 记的是"这一段累计该纠到多少"，不发这一帧 0，它就带着
+    上一次那点差速把整段走完 —— 车在已经对正的线上继续慢慢偏，而界面上
+    一切正常。以前死区判断只看"本次算出来的值"，0 落在死区里就整帧不发。
+    """
+    original = camera_widget.classify_line_quality
+    s = FakeSerial()
+    w = camera_widget.CameraWidget(serial_mgr=s, mode="track")
+    w.start_track()
+    w.TRIM_INTERVAL_S = 0.0
+
+    patch_quality(lambda px: (QUALITY_OK, 0, "ok"))
+    try:
+        for _ in range(3):
+            feed(w, tilted_line_frame(deg=10))
+        assert frames_of(s, frame.CMD_TRIM), "起步就没发纠偏"
+
+        for _ in range(6):
+            feed(w, line_frame())
+    finally:
+        camera_widget.classify_line_quality = original
+
+    zero = [t for t in frames_of(s, frame.CMD_TRIM)
+            if ((t[3] << 8) | t[4]) == 0]
+    assert zero, "纠偏回到 0 之后没发 0，固件会一直保留上一次的差速"
+
+
 if __name__ == "__main__":
     for name in sorted(n for n in globals() if n.startswith("test_")):
         globals()[name]()

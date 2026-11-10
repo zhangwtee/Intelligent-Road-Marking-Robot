@@ -76,6 +76,14 @@ class MainWindow(QWidget):
 
         self._update_link_label()
 
+        # 相机掉了会自己停车（CameraWidget._camera_hiccup），但它够不着这个
+        # 勾选框。勾着而车不动，人会以为"巡线还在跑"，然后去查别的地方。
+        # 这里连的是 clicked 不是 toggled，所以 setChecked 不会再触发一遍
+        # toggle_track，摄像头窗口留着显示"摄像头中断"。
+        widget = getattr(self, "camera_widget", None)
+        if self.btn_track.isChecked() and (widget is None or not widget.tracking):
+            self.btn_track.setChecked(False)
+
     def _update_link_label(self):
         h = self.ack.health()
 
@@ -251,8 +259,8 @@ class MainWindow(QWidget):
         # 质量（漆量、拐角冲击），这是现场最需要当场调的一个量。
         #
         # 滑条的值就是固件的 ARR（越小越快）。不换算成 mm/s 是因为那要经过
-        # CALIB_STEPS_PER_REV，而这个数本身还没和驱动器 OLED 上的 MStep
-        # 对过 —— 显示一个可能差一倍的速度比不显示更糟。
+        # CALIB_STEPS_PER_REV，而驱动器的细分（面板上的 MStep）是可以现场改的
+        # —— 两边一旦对不上，显示出来的速度能差一倍。
         speed_row = QHBoxLayout()
         speed_row.setSpacing(6)
         speed_row.addWidget(self._make_size_label("速度"))

@@ -406,6 +406,7 @@ uint8_t Motion_Trim(float delta_mm)
     int32_t want;       /* 这一段累计该纠到多少（半差，脉冲） */
     int32_t step;       /* 这一次真正要落地的差 */
     uint8_t moved = 0;
+    uint8_t capped = 0;   /* 期望值撞上段内累计上限，已经被削平 */
 
     if (!s_ready) {
         return 0;
@@ -439,9 +440,35 @@ uint8_t Motion_Trim(float delta_mm)
 
     want *= MOTION_TRIM_SIGN;
 
-    /* 目标没变就别动。这一步既是死区，也是"绝对量"的实现：
-     * 上层连续发同一个期望值时，只有第一次会真的改目标。
+    /* 段内累计上限。见头文件里的 MOTION_TRIM_ACCUM_MAX_MM ——
+     * 一段里一直往同一个方向纠，内侧轮会越停越早，累计到一米的时候
+     * 车已经在原地转了 90 度，而每一步单独看都只是"小小的修正"。
      *
+     * want 是"半差"，所以上限也得取一半（全差 = 2 x want）。以前这里漏了
+     * 0.5f，判据变成"全差上限"，而入参在上一步已经被钳到 ACCUM_MAX ——
+     * 于是这个分支永远不触发，累计到顶只是被静默夹住，上层收不到信号。
+     *
+     * 撞上限时把期望值削平、照常落地，然后回 2 通知上层"这段该结束了"。
+     * 只回报不落地是不行的：差速车的 80mm 正好折合九度，那一下等于一个
+     * 脉冲都不纠，剩下的五米就这么歪着走完。
+     * 边界用 > 而不是 >=：正好等于上限不算超。 */
+    {
+        int32_t limit = (int32_t)(MOTION_TRIM_ACCUM_MAX_MM * 0.5f * s_pulse_per_mm);
+
+        if (want > limit) {
+            want = limit;
+            capped = 1;
+        } else if (want < -limit) {
+            want = -limit;
+            capped = 1;
+        }
+    }
+
+    /* 削平之后才按差值落地 —— step 必须用"钳过的 want"来算，
+     * 否则到顶的那一拍会把超出的部分照样发出去。
+     *
+     * 目标没变就别动。这一步既是死区，也是"绝对量"的实现：
+     * 上层连续发同一个期望值时，只有第一次会真的改目标。
      * 返回 StepMotor_IsAnyRunning 而不是 0：0 是"四路都停了"的意思，
      * 上层拿它回 ERR_STATE。目标没变不等于车没在走。 */
     step = want - s_trim_accum;
@@ -450,19 +477,31 @@ uint8_t Motion_Trim(float delta_mm)
         return StepMotor_IsAnyRunning();
     }
 
-    /* 累计上限。见头文件里的 MOTION_TRIM_ACCUM_MAX_MM ——
-     * 一段里一直往同一个方向纠，内侧轮会越停越早，累计到一米的时候
-     * 车已经在原地转了 90 度，而每一步单独看都只是"小小的修正"。
-     * 撞上限时返回 2，让上层知道"这段该结束了"，而不是继续硬纠。
+    /* 先按"这一侧还剩多少脉冲"把这次能落地的量削到真实值。
      *
-     * 用 >= 而不是 >：上面已经把期望值钳到这个上限，落在边界上的那个值
-     * 正是最该报"到顶"的。 */
+     * 夹位规则在 StepMotor_TrimRoom 里，和 AdjustTarget 共用同一条 ——
+     * motion 层只负责取两侧的较小值，不再自己写一遍"SET 必须大于 CNT"。
+     * 被夹住的时候实际落地的比 step 少，这里仍按 want 记账的话，固件会
+     * 以为纠了、其实没纠，后面每一拍都在补一个不存在的缺口。 */
     {
-        int32_t limit = (int32_t)(MOTION_TRIM_ACCUM_MAX_MM * s_pulse_per_mm);
+        int32_t room  = (step > 0) ? StepMotor_TrimRoom(MOTOR2)
+                                   : StepMotor_TrimRoom(MOTOR1);
+        int32_t other = (step > 0) ? StepMotor_TrimRoom(MOTOR4)
+                                   : StepMotor_TrimRoom(MOTOR3);
 
-        if (want >= limit || want <= -limit) {
-            return 2;
+        if (other < room) {
+            room = other;
         }
+        if (room <= 0) {
+            /* 这一侧已经到头，没有地方再减了。这不是错误：5 米的段、累计
+             * 上限 80mm，被减的那一侧最多早到 40mm，也就是段末最后几毫米。
+             * 返回"这一拍不用动"，而不是 2（2 的意思是"该重新对齐了"，那是
+             * 累计上限那条路的事）。 */
+            return StepMotor_IsAnyRunning();
+        }
+
+        if (step > room)  { step = room; }
+        if (step < -room) { step = -room; }
     }
 
     /* 向右修正 = 左边多走、右边少走。
@@ -476,7 +515,7 @@ uint8_t Motion_Trim(float delta_mm)
     /* 四路都没落地（车已经停了）就别记这个目标，下一拍还要再来一次。
      * 记上的话，车重新起步时这段纠偏会被悄悄吃掉。 */
     if (moved) {
-        s_trim_accum = want;
+        s_trim_accum += step;   /* 只记真正落地的量 */
     }
 
     /* 目标改过之后，"两侧同时到达"就失效了 —— 按剩余脉冲重算一次 ARR。
@@ -497,7 +536,7 @@ uint8_t Motion_Trim(float delta_mm)
         }
     }
 
-    return moved;
+    return moved ? (uint8_t)(capped ? 2 : 1) : 0;
 }
 
 void Motion_DriveLR(float left_mm, float right_mm, uint8_t forward)

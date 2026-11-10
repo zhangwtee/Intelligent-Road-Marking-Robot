@@ -115,9 +115,22 @@ class AckTracker:
         seq = raw[2]
         item = Pending(seq, cmd, raw, now)
 
-        # 256 条绕回来之前，同 seq 的旧记录早就该超时清掉了。真撞上就覆盖，
-        # 不能让表无限长 —— 那是一个只在"发得很多又都丢"的情况下才发作的泄漏。
-        self.pending[seq] = item
+        # 键是 (SEQ, CMD)，不是 SEQ：面板和摄像头各有一个独立的 8 位序号，
+        # 两个都从 0 开始，都往这张表里登记。只按 SEQ 存的话，撞号时后来的
+        # 那条会把前一条挤掉，被挤掉的那条既收不到 ACK，也走不到重发和超时
+        # —— 日志里干干净净，命令其实没执行。
+        #
+        # 同一个 SEQ 上还挂着老到该超时的记录，那是 SEQ 绕圈复用（8 位，
+        # 256 条一绕），不是"两个发送方各发一条"：后者的间隔是几十毫秒。
+        # 前者必须丢掉，不然一条 100 秒前的命令会被迟到的 ACK 认领，RTT
+        # 报成 100 秒，人还以为串口坏了。
+        for old_key in [k for k in self.pending if k[0] == seq]:
+            if now - self.pending[old_key].sent_at > self.timeout_s:
+                del self.pending[old_key]
+
+        # 真撞上就覆盖，不能让表无限长 —— 那是一个只在"发得很多又都丢"
+        # 的情况下才发作的泄漏。
+        self.pending[(seq, cmd)] = item
         self.sent += 1
         return item
 
@@ -127,19 +140,16 @@ class AckTracker:
         或者 None（说明这条 ACK 属于一条早就被清掉的命令）。"""
         now = time.monotonic() if now is None else now
 
-        # 先看再删。用 pop 的话，一条 cmd 对不上的迟到 ACK 会把表里
-        # 正主一起删掉 —— 而且它自己还被判成"未匹配"，两败俱伤。
-        item = self.pending.get(seq)
+        # 先看再删。用 pop 的话，一条对不上的迟到 ACK 会把表里正主一起删掉。
+        # 键里带 CMD，所以"SEQ 撞号"在表里不存在：迟到的那条 ACK 找不到自己
+        # 那一项，返回 None，也不会碰别人。
+        key = (seq, cmd)
+        item = self.pending.get(key)
 
         if item is None:
             return None
 
-        if item.cmd != cmd:
-            # cmd 对不上：seq 被复用过了，这条 ACK 是更早那一条的。
-            # 不报错，也不消耗统计 —— 这是正常现象，不是故障。
-            return None
-
-        del self.pending[seq]
+        del self.pending[key]
 
         item.rtt = now - item.sent_at
         item.result = result
@@ -168,8 +178,8 @@ class AckTracker:
         dead = []
         resent = []
 
-        for seq in list(self.pending.keys()):
-            item = self.pending[seq]
+        for key in list(self.pending.keys()):
+            item = self.pending[key]
 
             if item.age(now) < self.timeout_s:
                 continue
@@ -179,7 +189,7 @@ class AckTracker:
                 # 命令"，而是一条全新的命令。中途卡顿（刷日志、弹窗、GC）
                 # 很容易把这一次推到窗口之外。判据用 born_at 而不是 sent_at。
                 if now - item.born_at > DEDUP_WINDOW_S:
-                    del self.pending[seq]
+                    del self.pending[key]
                     self.timed_out += 1
                     dead.append(item)
                     continue
@@ -189,7 +199,7 @@ class AckTracker:
                 # 真正断线要再等一个超时才暴露，retried 也是虚的。
                 # 而且这条命令根本没上总线，等下去也不会有人来 ACK 它。
                 if not resend(item.payload):
-                    del self.pending[seq]
+                    del self.pending[key]
                     self.timed_out += 1
                     dead.append(item)
                     continue
@@ -200,7 +210,7 @@ class AckTracker:
                 resent.append(item)
                 continue
 
-            del self.pending[seq]
+            del self.pending[key]
             self.timed_out += 1
             dead.append(item)
 

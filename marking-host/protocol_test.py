@@ -549,7 +549,8 @@ def test_trim_limits_line_up_with_the_axis_they_belong_to():
     以前四处（加上 motion.c 和 heading.h）都写 20，看起来整齐，但那是
     “每次纠一点”时代的每步限幅。入参改成累计量以后，20mm 差速在 500mm
     轮距上只折合两度多 —— 5 度的偏差永远纠不回来，而且永远撞不到累计
-    上限，Motion_Trim 的 return 2 成了死代码，_exhausted 再也不会置位。
+    上限，Motion_Trim 的 return 2 一度成了死代码，_exhausted 也就不会置位。
+    现在判据按“半差 x 2 = 全差”换算，累计到顶会真的回 ERR_RANGE。
 
     现在的关系只有两条，都是“不能比中间那个小”：
         协议层   <= 一帧能发的量   小了 -> 帧回 ERR_RANGE，车完全不纠
@@ -1635,6 +1636,21 @@ def test_trim_is_a_total_not_an_increment():
     assert "StepMotor_AdjustTarget(MOTOR1, +step)" in body
     assert "s_trim_accum + " not in body, "还在把这一次的量加到上一次上"
 
+    # 记的必须是"真正落地的量"。StepMotor_AdjustTarget 会把目标夹在
+    # CNT+1 以上（再减就是急停），夹住时实际落地的比 step 少；这里若直接
+    # 记 want，固件会以为纠了、其实没纠，后面每一拍都在补一个不存在的缺口。
+    assert "s_trim_accum += step" in body, "记账没用真正落地的量，夹位时会虚记"
+    assert "StepMotor_TrimRoom(MOTOR2)" in body, "没有按剩余脉冲削这次能落地的量"
+
+    # 撞上段内上限时必须"按上限落地 + 回报"，不能直接 return 2 —— 只回报不落地
+    # 的话，车头偏九度时一个脉冲都不纠，剩下的五米就这么歪着走完。
+    assert "capped = 1" in body, "到顶时没有削平落地"
+    assert "return 2;" not in body, "到顶直接返回了，这一拍什么都没落地"
+
+    # 而且 step 必须在削平之后再算，否则到顶那一拍会把超出的部分照样发出去。
+    assert body.index("capped = 1") < body.index("step = want - s_trim_accum;"), \
+        "step 用的是削平前的 want，到顶那一拍会超额落地"
+
 
 def test_stopping_the_tracking_loop_returns_the_firmware_to_wait():
     """撤相机发的必须是 'W'。
@@ -1797,6 +1813,45 @@ def test_gyro_bias_uses_the_same_sign_as_the_runtime():
     assert "HDG_Z_SIGN" in seg, "标定没乘 HDG_Z_SIGN"
 
 
+def test_frame_split_right_after_the_sof_is_recovered():
+    """帧头先到、尾巴 250ms 后才到：要拼回一整帧，不是当 9 条命令执行。
+
+    以前超时会把孤立帧头一起清掉：只剩一个 0x7B 时认为"它后面不可能有
+    尾巴"，后到的 9 个字节被逐条当单字节命令 —— STATUS 帧的 payload 里
+    出现 0x54 就被记成"紧急停止"、0x50 就是"画车位"，真帧丢了，日志和
+    状态栏还一起说谎。
+
+    拼回去要用 CRC 验：验得过才当帧。serial_manager 按 in_waiting 整批取，
+    卡顿之后的尾巴通常一次到齐，所以这里是 9 个字节一起到。
+    """
+    from core import frame
+
+    buf = bytearray()
+    f = frame.build_frame(frame.CMD_STATUS, 0, bytes([ord("W"), 0, 0, 0x13, 0x88]))
+
+    recs, last_rx, dropped, resync = frame.parse_stream(
+        buf, f[:1], last_rx=0.0, now=0.0)
+    assert recs == [], "只有帧头时就产出了记录"
+
+    recs, last_rx, dropped, resync = frame.parse_stream(
+        buf, f[1:], last_rx=last_rx, now=0.4)
+
+    assert len(recs) == 1, f"尾巴没拼回去，被当成了 {len(recs)} 条命令: {recs}"
+    assert recs[0]["kind"] == "frame"
+    assert recs[0]["cmd"] == frame.CMD_STATUS
+    assert buf == bytearray()
+
+    # 拼不成帧的就不是尾巴：照旧当字节流走（和改造前一致，别在这里做
+    # 更激进的丢弃 —— 噪声帧头后面紧跟一个真帧时，解析器还要靠这段字节
+    # 找到那个真帧）。
+    buf = bytearray()
+    recs, last_rx, dropped, resync = frame.parse_stream(
+        buf, b"\x7b", last_rx=0.0, now=0.0)
+    recs, last_rx, dropped, resync = frame.parse_stream(
+        buf, b"\x01\x02\x03\x04\x05\x06\x07\x08\x09", last_rx=last_rx, now=0.4)
+    assert all(r["kind"] == "byte" for r in recs), recs
+
+
 def test_truncated_frame_tail_is_not_executed():
     """残帧超时清掉之后，紧接着到的字节不能当命令执行。
 
@@ -1823,6 +1878,84 @@ def test_truncated_frame_tail_is_not_executed():
     recs, last_rx, dropped, resync = frame.parse_stream(
         buf, b"W", last_rx=last_rx, now=0.45)
     assert [r["char"] for r in recs] == ["W"], "丢尾巴把后面的正常命令也堵住了"
+
+
+def test_random_splits_never_leak_single_byte_commands():
+    """一帧被随便切成几段、段间隔都在超时以内：只能拼回那一帧。
+
+    这是拼帧和重同步那套逻辑的行为级检查。静态断言只能证明"源码里有这句话"，
+    这条至少能证明：任意切法下都不会把 payload 当成单字节命令执行 —— 这帧的
+    payload 里故意放了一个 0x54（'T'，急停）。
+    """
+    import random
+    from core import frame
+
+    rnd = random.Random(20261109)
+    f = frame.build_frame(frame.CMD_PAINT, 7, bytes([0x13, 0x88, 0x09, 0xC4, 0x54]))
+
+    for _ in range(300):
+        cuts = sorted(
+            rnd.sample(range(1, frame.FRAME_LEN), rnd.randint(0, frame.FRAME_LEN - 2))
+        )
+        parts = [f[a:b] for a, b in zip([0] + cuts, cuts + [frame.FRAME_LEN])]
+
+        buf = bytearray()
+        last = 0.0
+        now = 0.0
+        recs = []
+        for part in parts:
+            now += rnd.choice((0.001, 0.05, 0.2))      # 都小于 PARTIAL_TIMEOUT_S
+            got, last, _, _ = frame.parse_stream(buf, part, last_rx=last, now=now)
+            recs += got
+
+        assert all(r["kind"] == "frame" for r in recs), \
+            f"切法 {cuts} 漏出了字节命令: {[r.get('char') for r in recs]}"
+        assert len(recs) == 1, f"切法 {cuts} 得到 {len(recs)} 条记录: {recs}"
+        assert recs[0]["cmd"] == frame.CMD_PAINT
+        assert buf == bytearray()
+
+
+def test_trim_limit_is_reachable_from_the_clamp():
+    """累计上限的判据必须能被入参钳位触发，否则 return 2 永远不会发生。
+
+    want 是"半差"，limit 也必须是半差。以前 limit 按全差算：200mm 时 limit
+    算出来 999 个脉冲，而 want 最大只有 500 —— 判据永远不成立，段内累计到顶
+    只是被静默夹住，上层收不到"该重新对齐"的信号。
+
+    这里不查字符串，直接把两个系数和真实常量代进去算一遍。
+    """
+    import math
+    import re
+
+    src = (FIRMWARE_HW / "motion.c").read_text(encoding="gbk")
+    calib = (FIRMWARE_HW / "calib.h").read_text(encoding="gbk")
+    chassis = (FIRMWARE_HW / "chassis.h").read_text(encoding="gbk")
+
+    steps = float(re.search(r"#define\s+CALIB_STEPS_PER_REV\s+(\d+)", calib).group(1))
+    dia = float(re.search(r"#define\s+CALIB_WHEEL_DIA_MM\s+([\d.]+)f", calib).group(1))
+    ppm = steps / (math.pi * dia)
+
+    want_factor = float(
+        re.search(r"delta_mm \* ([\d.]+)f \* s_pulse_per_mm", src).group(1)
+    )
+    m = re.search(
+        r"MOTION_TRIM_ACCUM_MAX_MM \* (?:([\d.]+)f \* )?s_pulse_per_mm", src
+    )
+    limit_factor = float(m.group(1)) if m.group(1) else 1.0
+
+    accums = [
+        float(x) for x in
+        re.findall(r"#define\s+CHASSIS_TRIM_ACCUM_MAX_MM\s+([\d.]+)f", chassis)
+    ]
+    assert len(accums) == 2, f"chassis.h 里应该有每个车型一份，实际 {accums}"
+
+    for accum in accums:
+        want_max = int(accum * want_factor * ppm + 0.5)   # 入参钳位处的 want
+        limit = int(accum * limit_factor * ppm)
+        assert want_max >= limit, (
+            f"累计 {accum}mm：want 最大 {want_max} 脉冲 < limit {limit} —— "
+            f"return 2 永远不触发，段内累计到顶只会被静默夹住"
+        )
 
 
 if __name__ == "__main__":

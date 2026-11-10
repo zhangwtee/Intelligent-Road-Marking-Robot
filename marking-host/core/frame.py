@@ -283,10 +283,9 @@ def build_move(direction: int, left_mm: int, right_mm: int = None,
     """走一段。right_mm 省略时左右同距（普通直行）。
 
     左右不等就是差速 —— 视觉纠偏就靠它。为什么纠偏走"每段重设"而不是
-    "运动中加减"，见 core/lane_control.py 开头的说明：固件那边四个轮子共用
-    一个 ARR，左右不可能同时到，差速只能表现为"内侧轮先停"。这种偏差如果
-    在一条 5.3 米的线上一直累积，最后会横过来；每 200mm 重设一次，段尾
-    四轮计数归零，误差就锁在一段之内。
+    "运动中加减"，见 core/lane_control.py 开头的说明：四路各有自己的 ARR，
+    能按比例同步、走出圆弧，但段内累计差速撞上 chassis.h 的上限后就不再纠；
+    每 200mm 重设一次，段尾四轮计数归零，误差就锁在一段之内。
     """
     if right_mm is None:
         right_mm = left_mm
@@ -524,13 +523,15 @@ def parse_stream(buffer: bytearray, data: bytes = b"",
     # 到达的字节很可能就是它的尾巴，也要一起丢 —— 下面的分支处理这个。
     partial_timed_out = False
     partial_had_payload = False
+    stale_sof_only = False
 
     if (prev_rx is not None and buffer and buffer[0] == SOF
             and len(buffer) < FRAME_LEN
             and (now - prev_rx) > PARTIAL_TIMEOUT_S):
-        # 只有"帧头 + 至少一个字节"才算收到了 payload。孤立的 0x7B（长度 1）
-        # 后面不可能有它的尾巴，清掉就该正常往下走 —— 那是噪声，不是半帧。
+        # 只有"帧头 + 至少一个字节"才算收到了 payload。孤立 0x7B 记下来，
+        # 下面先试着把帧拼回去 —— 它也可能是"帧只到了帧头"。
         partial_had_payload = len(buffer) > 1
+        stale_sof_only = len(buffer) == 1
         dropped += len(buffer)
         buffer.clear()
         partial_timed_out = True
@@ -547,6 +548,29 @@ def parse_stream(buffer: bytearray, data: bytes = b"",
         last_rx = now
         data = b""
 
+    records = []
+
+    # 半帧只剩一个帧头就超时了：这一批字节很可能就是它的尾巴（主线程被
+    # 日志、弹窗卡住 300ms，串口那边其实早就收完了；serial_manager 是
+    # 按 in_waiting 取整批的，所以尾巴通常一次到齐）。拼回一整帧用 CRC
+    # 验一次 —— 验得过就按帧处理，验不过说明它不是尾巴，照旧当字节流走，
+    # 和改造前一样。
+    #
+    # 只丢不拼的代价是：真帧已经没了，而尾巴里的 0x54 会被记成"紧急停止"、
+    # 0x50 会被记成"画车位"—— 日志和状态栏一起说谎，比丢一帧更难查。
+    #
+    # 为什么不"留着帧头等它凑满 10 字节"：那会把后面最多 9 个字节扣住，
+    # 一条真实命令（含 'T'）就丢了。protocol_test 里有一条专门盯这个
+    # （test_lone_frame_header_does_not_block_the_port），不能为了拼帧
+    # 把它换掉。
+    if data and stale_sof_only and len(data) >= FRAME_LEN - 1:
+        candidate = bytes([SOF]) + data[:FRAME_LEN - 1]
+        if check_frame(candidate):
+            records.append(make_frame_record(candidate))
+            data = data[FRAME_LEN - 1:]
+            last_rx = now
+            resync = False
+
     if data:
         # 上一段数据之后空闲了很久，说明新数据是新的一次发送，不是坏帧的尾巴
         if resync and prev_rx is not None and (now - prev_rx) > RESYNC_IDLE_S:
@@ -556,8 +580,6 @@ def parse_stream(buffer: bytearray, data: bytes = b"",
 
     if last_rx is None:
         last_rx = now
-
-    records = []
 
     while buffer:
         if buffer[0] == SOF:

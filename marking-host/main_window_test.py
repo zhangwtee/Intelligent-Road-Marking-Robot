@@ -837,6 +837,30 @@ def test_closing_the_camera_window_releases_the_reference():
     assert w.camera_widget is None, "控件引用还留着"
 
 
+def test_camera_loss_unchecks_the_track_button():
+    """相机掉了之后，那个勾选框要跟着弹回来。
+
+    CameraWidget._camera_hiccup 会自己关泵、发 'W' 停车，但它够不着主窗口
+    这个勾。勾着而车不动，人会以为"巡线还在跑"，然后去查串口、查固件 ——
+    _tick 每 100ms 对一次状态。
+    """
+    w = make_window()
+
+    class FakeCam:
+        tracking = False
+
+    w.btn_track.setChecked(True)
+    w.camera_widget = FakeCam()
+    w._tick()
+    assert not w.btn_track.isChecked(), "车停了勾还亮着"
+
+    # 还在跑就别动它
+    w.btn_track.setChecked(True)
+    w.camera_widget.tracking = True
+    w._tick()
+    assert w.btn_track.isChecked(), "巡线还在跑，勾被弹掉了"
+
+
 if __name__ == "__main__":
     for name in sorted(n for n in globals() if n.startswith("test_")):
         globals()[name]()

@@ -560,7 +560,7 @@ void TIM1_Init(void) {
 
     /* 2. 配置定时器参数 */
     TIM_TimeBaseStructure.TIM_Prescaler = 7200 - 1;     // 预分频值（72MHz / 7200 = 10KHz）
-    TIM_TimeBaseStructure.TIM_Period = 10 - 1;       // 自动重装载值（10KHz / 10000 = 1秒中断一次）
+    TIM_TimeBaseStructure.TIM_Period = 10 - 1;       // 自动重装载值（10KHz / 10 = 1kHz，即 1ms 中断一次）
     TIM_TimeBaseStructure.TIM_CounterMode = TIM_CounterMode_Up;
     TIM_TimeBaseStructure.TIM_ClockDivision = TIM_CKD_DIV1;
     TIM_TimeBaseStructure.TIM_RepetitionCounter = 0;    // 高级定时器特有参数
@@ -787,10 +787,11 @@ static void PortDrop(uint8_t from, uint16_t n)
     }
 }
 
-/* 整帧发出去。9600 下 10 字节约 10.4ms 的阻塞 —— 状态帧 5Hz 的话占空比 5%，
- * 期间舵机插值和脉冲完成判断会晚 10ms。舵机是 1.5~2 秒的平滑插值，
- * 脉冲停止在 TIM3 中断里，都不受影响，所以这点阻塞可以接受。
- * 如果哪天要提到 50Hz，这里必须先改成 DMA 或中断发送。 */
+/* 整帧发出去。9600 下一帧 10.4ms 的线上时间改不了，但主循环不再等它：
+ * 字节进发送环（USART.c 的 Uart_TxPut），由 TXE 中断一个一个挪出去。
+ * 以前是阻塞发，状态帧 5Hz + 航向帧 5Hz，一秒有一百多毫秒在等 TXE；
+ * 现在这一圈只花几十微秒，舵机插值、串口收字节都不再被推后。
+ * 环深 64 字节，够放一轮里连着发的那几帧。 */
 static void SendFrame(uint8_t from, uint8_t cmd, uint8_t seq, const uint8_t *data)
 {
     uint8_t buf[PROTO_FRAME_LEN];
@@ -2149,6 +2150,7 @@ void System_StateMachine(void) {
                         move_mm         = next_move_left;
                         move_right_mm   = next_move_right;
                         next_move_valid = 0;
+                        move_trim_exhausted = 0;   /* 新的一段重新对齐，上一段打满的标志不能带过来 */
                         /* 超时是按"整条线"算的，续一段就重新计时，
                          * 否则连续伺服跑到 60 秒会被判卡死。 */
                         sys_ctrl.state_timestamp = current_time;

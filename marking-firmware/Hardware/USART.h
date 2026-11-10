@@ -3,28 +3,29 @@
 
 #include <stdio.h>
 
-/* Peek / Drop æ˜¯ç»™å¸§åè®®è§£æç”¨çš„ï¼šè§£æå™¨è¦å…ˆçœ‹é˜Ÿé¦–æ˜¯ä¸æ˜¯å¸§å¤´ï¼Œå†å†³å®š
- * ä¸¢ 1 ä¸ªå­—èŠ‚è¿˜æ˜¯ä¸¢ä¸€æ•´å¸§ã€‚Get åªèƒ½"å–å‡ºæ¥"ï¼Œå–å‡ºæ¥å†å¡å›å»ä¼šæ‰“ä¹±é¡ºåºã€‚ */
+/* Peek / Drop ÊÇ¸øÖ¡Ğ­Òé½âÎöÓÃµÄ£º½âÎöÆ÷ÒªÏÈ¿´¶ÓÊ×ÊÇ²»ÊÇÖ¡Í·£¬ÔÙ¾ö¶¨
+ * ¶ª 1 ¸ö×Ö½Ú»¹ÊÇ¶ªÒ»ÕûÖ¡¡£Get Ö»ÄÜ"È¡³öÀ´"£¬È¡³öÀ´ÔÙÈû»ØÈ¥»á´òÂÒË³Ğò¡£ */
 
-/* ä¸¤è·¯ä¸²å£å„æœ‰ç”¨é€”ï¼Œåˆ«åªæŒ‰å¼•è„šè®°åå­—ï¼š
- *   USART1 (PA9/PA10) = è“ç‰™æ‰‹æœºï¼ŒSOURCE_BT
- *   USART2 (PA2/PA3)  = æ ‘è“æ´¾ä¸Šä½æœºï¼ŒSOURCE_PI
- * è¿™ä¸ªå¯¹åº”å…³ç³»ä¸€æ—¦æåï¼Œ'+'/'-'ï¼ˆè“ç‰™ä¸“ç”¨è°ƒé€Ÿï¼‰çš„é—¨å°±å¼€åœ¨äº†é”™è¯¯çš„ä¸€ä¾§ã€‚ */
+/* Á½Â·´®¿Ú¸÷ÓĞÓÃÍ¾£¬±ğÖ»°´Òı½Å¼ÇÃû×Ö£º
+ *   USART1 (PA9/PA10) = À¶ÑÀÊÖ»ú£¬SOURCE_BT
+ *   USART2 (PA2/PA3)  = Ê÷İ®ÅÉÉÏÎ»»ú£¬SOURCE_PI
+ * Õâ¸ö¶ÔÓ¦¹ØÏµÒ»µ©¸ã·´£¬'+'/'-'£¨À¶ÑÀ×¨ÓÃµ÷ËÙ£©µÄÃÅ¾Í¿ªÔÚÁË´íÎóµÄÒ»²à¡£ */
 
-/* USART1 â€”â€” è“ç‰™ (PA9 / PA10) */
-uint8_t  Serial1_TakeRxData(uint8_t *out);   // ä»ç¯å½¢ç¼“å†²å–ä¸€ä¸ªå­—èŠ‚
+/* USART1 ¡ª¡ª À¶ÑÀ (PA9 / PA10) */
+uint8_t  Serial1_TakeRxData(uint8_t *out);   // ´Ó»·ĞÎ»º³åÈ¡Ò»¸ö×Ö½Ú
 void     Serial1_Init(void);
+/* ·¢ËÍ£º×Ö½Ú½ø·¢ËÍ»·£¬ÓÉ TXE ÖĞ¶ÏÅ²³öÈ¥ ¡ª¡ª ÕâÀï²»»áµÈ 10ms */
 void     Serial1_SendByte(uint8_t Byte);
 void     Serial1_SendNumber(uint32_t Number, uint8_t Length);
-uint16_t Serial1_RxCount(void);              // ç§¯å‹å­—èŠ‚æ•°ï¼ˆè°ƒè¯•ç”¨ï¼‰
-uint16_t Serial1_RxOverflow(void);           // å› æ»¡ä¸¢å¼ƒçš„å­—èŠ‚æ•°ï¼ˆæ­£å¸¸æ’ä¸º 0ï¼‰
-uint8_t  Serial1_Peek(uint16_t offset, uint8_t *out);  // çœ‹ç¬¬ offset ä¸ªå­—èŠ‚ï¼Œä¸æ¶ˆè´¹
-void     Serial1_Drop(uint16_t n);                     // ä¸¢å¼ƒ n ä¸ªå­—èŠ‚
+uint16_t Serial1_RxCount(void);              // »ıÑ¹×Ö½ÚÊı£¨µ÷ÊÔÓÃ£©
+uint16_t Serial1_RxOverflow(void);           // ÒòÂú¶ªÆúµÄ×Ö½ÚÊı£¨Õı³£ºãÎª 0£©
+uint8_t  Serial1_Peek(uint16_t offset, uint8_t *out);  // ¿´µÚ offset ¸ö×Ö½Ú£¬²»Ïû·Ñ
+void     Serial1_Drop(uint16_t n);                     // ¶ªÆú n ¸ö×Ö½Ú
 
-/* USART2 â€”â€” æ ‘è“æ´¾ (PA2 / PA3) */
+/* USART2 ¡ª¡ª Ê÷İ®ÅÉ (PA2 / PA3) */
 uint8_t  Serial2_TakeRxData(uint8_t *out);
 void     Serial2_Init(void);
-void     Serial2_SendByte(uint8_t Byte);
+void     Serial2_SendByte(uint8_t Byte);   // Í¬ÉÏ£¬·Ç×èÈû
 void     Serial2_SendNumber(uint32_t Number, uint8_t Length);
 uint16_t Serial2_RxCount(void);
 uint16_t Serial2_RxOverflow(void);

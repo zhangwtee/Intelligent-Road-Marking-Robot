@@ -154,6 +154,15 @@ uint32_t StepMotor_GetPulseOf(uint8_t motor);
  * 遥控点动（无限行程）返回 0x7FFFFFFF，调用方按"忽律比例"处理。 */
 int32_t  StepMotor_GetRemainOf(uint8_t motor);
 
+/* 这一路的目标还能往回减多少脉冲（0 = 减不动了）。
+ *
+ * 纠偏的差速靠"一侧多走、另一侧少走"实现，而少走的那一侧目标不能压到
+ * CNT+1 以下 —— 再往下就是让那个轮子当场停下，不是纠偏。这条上限和
+ * StepMotor_AdjustTarget 里的夹位是同一条规则，所以放在这个模块里：
+ * motion 层只取两侧的较小值，不再自己重算一遍。
+ *
+ * 空闲、遥控点动、参数非法都返回 0（本来就不该被纠偏改目标）。 */
+int32_t  StepMotor_TrimRoom(uint8_t motor);
 /* ---------- 运动中调整本段目标脉冲（不清进度） ----------
  *
  * 这是视觉纠偏能成立的前提，也是它和 StepMotor_SetPulse 的唯一区别。

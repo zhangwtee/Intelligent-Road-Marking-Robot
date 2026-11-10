@@ -631,6 +631,30 @@ int32_t StepMotor_GetRemainOf(uint8_t motor)
     return (int32_t)m->set - (int32_t)m->cnt;
 }
 
+/* 这一路的目标还能往回减多少脉冲。见头文件里的说明。
+ *
+ * 和 AdjustTarget 里的夹位是同一条规则（SET 必须严格大于 CNT），
+ * 所以两处写在一起：改一边的时候另一边就在几行之上。 */
+int32_t StepMotor_TrimRoom(uint8_t motor)
+{
+    MotorCh_t *m;
+    int32_t room;
+
+    if (motor < MOTOR1 || motor > MOTOR4) {
+        return 0;
+    }
+    m = &s_m[motor - 1];
+
+    __disable_irq();
+    if (m->set == 0 || m->set == JOG_PULSE_INFINITE) {
+        __enable_irq();
+        return 0;
+    }
+    room = (int32_t)m->set - (int32_t)m->cnt - 1;   /* SET 必须严格大于 CNT */
+    __enable_irq();
+
+    return (room > 0) ? room : 0;
+}
 /* ---------- 运动中调整本段目标脉冲 ----------
  * 要点只有两条：
  *   1) 不清 CNT —— 清了就是停机重来；
@@ -662,7 +686,8 @@ uint8_t StepMotor_AdjustTarget(uint8_t motor, int32_t delta)
 
     next = (int32_t)set + delta;
 
-    /* 至少留 1 个脉冲。CNT 是"已经发出的"，SET 必须比它大。 */
+    /* 至少留 1 个脉冲。CNT 是已经发出去的，SET 必须比它大 ——
+     * 这条规则和 StepMotor_TrimRoom 是同一个，改这里就要改那边。 */
     if (next <= (int32_t)cnt + 1) {
         next = (int32_t)cnt + 1;
     }
